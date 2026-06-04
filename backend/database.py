@@ -115,6 +115,33 @@ def init_db():
             total_upsets INTEGER DEFAULT 0
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS wallet (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            balance INTEGER NOT NULL DEFAULT 1000,
+            total_won INTEGER NOT NULL DEFAULT 0,
+            total_lost INTEGER NOT NULL DEFAULT 0,
+            total_bets INTEGER NOT NULL DEFAULT 0,
+            biggest_win INTEGER NOT NULL DEFAULT 0,
+            win_streak INTEGER NOT NULL DEFAULT 0,
+            best_streak INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            bet_type TEXT NOT NULL,
+            bet_on TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            odds REAL NOT NULL,
+            result TEXT,
+            payout INTEGER NOT NULL DEFAULT 0,
+            match_id INTEGER,
+            tournament_id INTEGER
+        )
+    """)
+    conn.execute("INSERT OR IGNORE INTO wallet (id, balance) VALUES (1, 1000)")
     # migrations
     match_cols = {r[1] for r in conn.execute("PRAGMA table_info(matches)").fetchall()}
     if "red_agent_id" not in match_cols:
@@ -505,6 +532,106 @@ def get_tournament(tid: int) -> dict | None:
         "total_moves": r["total_moves"],
         "total_upsets": r["total_upsets"],
     }
+
+
+# --- wallet and betting ---
+
+HOUSE_EDGE = 0.05
+DRAW_PROBABILITY = 0.06
+BANKRUPT_BONUS = 500
+MIN_BET = 10
+
+
+def calculate_match_odds(red_elo: float, black_elo: float) -> dict:
+    p_red_raw = 1 / (1 + 10 ** ((black_elo - red_elo) / 400))
+    p_black_raw = 1 - p_red_raw
+    p_red = p_red_raw * (1 - DRAW_PROBABILITY)
+    p_black = p_black_raw * (1 - DRAW_PROBABILITY)
+    p_draw = DRAW_PROBABILITY
+    return {
+        "red": round((1 / p_red) * (1 - HOUSE_EDGE), 2),
+        "black": round((1 / p_black) * (1 - HOUSE_EDGE), 2),
+        "draw": round((1 / p_draw) * (1 - HOUSE_EDGE), 2),
+    }
+
+
+def calculate_tournament_odds(agents: list[dict]) -> dict:
+    strengths = [10 ** (a["elo"] / 400) for a in agents]
+    total = sum(strengths)
+    return {
+        a["id"]: round((1 / (strengths[i] / total)) * (1 - HOUSE_EDGE), 2)
+        for i, a in enumerate(agents)
+    }
+
+
+def get_wallet() -> dict:
+    conn = get_db()
+    r = conn.execute("SELECT * FROM wallet WHERE id = 1").fetchone()
+    conn.close()
+    if not r:
+        return {"balance": 1000, "total_won": 0, "total_lost": 0, "total_bets": 0, "biggest_win": 0, "win_streak": 0, "best_streak": 0}
+    return {k: r[k] for k in ("balance", "total_won", "total_lost", "total_bets", "biggest_win", "win_streak", "best_streak")}
+
+
+def place_bet(bet_type: str, bet_on: str, amount: int, odds: float,
+              match_id: int | None = None, tournament_id: int | None = None) -> dict:
+    conn = get_db()
+    w = conn.execute("SELECT balance FROM wallet WHERE id = 1").fetchone()
+    bal = w["balance"] if w else 1000
+    if amount < MIN_BET:
+        conn.close()
+        raise ValueError(f"minimum bet is {MIN_BET}")
+    if amount > bal:
+        conn.close()
+        raise ValueError("insufficient balance")
+    conn.execute("UPDATE wallet SET balance = balance - ? WHERE id = 1", (amount,))
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        "INSERT INTO bets (created_at, bet_type, bet_on, amount, odds, match_id, tournament_id) VALUES (?,?,?,?,?,?,?)",
+        (now, bet_type, bet_on, amount, odds, match_id, tournament_id),
+    )
+    conn.commit()
+    bet_id = cursor.lastrowid
+    new_bal = conn.execute("SELECT balance FROM wallet WHERE id = 1").fetchone()["balance"]
+    conn.close()
+    return {"bet_id": bet_id, "balance": new_bal}
+
+
+def settle_bet(bet_id: int, result: str, payout: int) -> dict:
+    conn = get_db()
+    conn.execute("UPDATE bets SET result = ?, payout = ? WHERE id = ?", (result, payout, bet_id))
+    if result == "win" and payout > 0:
+        conn.execute("UPDATE wallet SET balance = balance + ?, total_won = total_won + ?, total_bets = total_bets + 1, win_streak = win_streak + 1 WHERE id = 1", (payout, payout))
+        w = conn.execute("SELECT * FROM wallet WHERE id = 1").fetchone()
+        best = max(w["best_streak"], w["win_streak"])
+        biggest = max(w["biggest_win"], payout)
+        conn.execute("UPDATE wallet SET best_streak = ?, biggest_win = ? WHERE id = 1", (best, biggest))
+    else:
+        bet_row = conn.execute("SELECT amount FROM bets WHERE id = ?", (bet_id,)).fetchone()
+        lost_amount = bet_row["amount"] if bet_row else 0
+        conn.execute("UPDATE wallet SET total_lost = total_lost + ?, total_bets = total_bets + 1, win_streak = 0 WHERE id = 1", (lost_amount,))
+    conn.commit()
+    w = conn.execute("SELECT * FROM wallet WHERE id = 1").fetchone()
+    bankrupt = False
+    if w["balance"] <= 0:
+        conn.execute("UPDATE wallet SET balance = ? WHERE id = 1", (BANKRUPT_BONUS,))
+        conn.commit()
+        bankrupt = True
+    final_w = conn.execute("SELECT balance FROM wallet WHERE id = 1").fetchone()
+    conn.close()
+    return {"balance": final_w["balance"], "bankrupt": bankrupt}
+
+
+def get_bet_history(limit: int = 50) -> list[dict]:
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM bets ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    conn.close()
+    return [{
+        "id": r["id"], "created_at": r["created_at"], "bet_type": r["bet_type"],
+        "bet_on": r["bet_on"], "amount": r["amount"], "odds": r["odds"],
+        "result": r["result"], "payout": r["payout"],
+        "net": (r["payout"] - r["amount"]) if r["result"] == "win" else -r["amount"] if r["result"] else 0,
+    } for r in rows]
 
 
 init_db()

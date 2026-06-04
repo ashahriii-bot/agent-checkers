@@ -670,6 +670,9 @@ function RosterPanel({ side, color, selectedAgent, onSelect, roster, disabled, m
 export default function App() {
   const [appMode, setAppMode] = useState("match");
   const [showHelp, setShowHelp] = useState(true);
+  const [wallet, setWallet] = useState({ balance: 1000 });
+  const [currentBet, setCurrentBet] = useState(null);
+  const [betOdds, setBetOdds] = useState(null);
   const [roster, setRoster] = useState([]);
   const [redAgent, setRedAgent] = useState(null);
   const [blackAgent, setBlackAgent] = useState(null);
@@ -695,21 +698,26 @@ export default function App() {
   const loadRoster = async () => { try { const res = await fetch(`${API}/agents`); if (res.ok) { const d = await res.json(); setRoster(d.agents); } } catch {} };
   const loadHistory = async () => { try { const res = await fetch(`${API}/history?limit=20`); if (res.ok) setHistory(await res.json()); } catch {} };
   const loadLeaderboard = async () => { try { const res = await fetch(`${API}/leaderboard?limit=15`); if (res.ok) { const d = await res.json(); setLeaderboard(d.agents || []); } } catch {} };
+  const loadWallet = async () => { try { const res = await fetch(`${API}/wallet`); if (res.ok) setWallet(await res.json()); } catch {} };
+  const loadOdds = async (rElo, bElo) => { try { const res = await fetch(`${API}/odds/match?red_elo=${rElo}&black_elo=${bElo}`); if (res.ok) setBetOdds(await res.json()); } catch {} };
 
-  useEffect(() => { loadRoster(); loadHistory(); loadLeaderboard(); }, []);
+  useEffect(() => { loadRoster(); loadHistory(); loadLeaderboard(); loadWallet(); }, []);
   useEffect(() => { if (roster.length >= 2 && !redAgent && !blackAgent && !boards) { setRedAgent(roster[0]); setBlackAgent(roster[1]); } }, [roster]);
+  useEffect(() => { if (redAgent && blackAgent) loadOdds(redAgent.elo, blackAgent.elo); }, [redAgent?.id, blackAgent?.id]);
 
   const startGame = async () => {
     if (!redAgent || !blackAgent) { setError("select agents for both sides"); return; }
     setError(null); setLoading(true); setResult(null); setBoards(null); setMoves(null); setEvents([]); setCurrentStep(0);
     try {
-      const res = await fetch(`${API}/game/simulate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ red_agent_id: redAgent.id, black_agent_id: blackAgent.id }) });
+      const body = { red_agent_id: redAgent.id, black_agent_id: blackAgent.id };
+      if (currentBet) body.bet = currentBet;
+      const res = await fetch(`${API}/game/simulate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       if (!res.ok) throw new Error(`API error: ${res.status}`);
       const data = await res.json();
       setBoards(data.boards); setMoves(data.moves); setEvents(data.events || []); setResult(data);
       maxStepRef.current = data.boards.length - 1; stepRef.current = 0; setCurrentStep(0);
       playingRef.current = true; setPlaying(true); playNext();
-      loadRoster(); loadHistory(); loadLeaderboard();
+      loadRoster(); loadHistory(); loadLeaderboard(); loadWallet();
     } catch (err) { setError(err.message); } finally { setLoading(false); }
   };
 
@@ -722,7 +730,7 @@ export default function App() {
 
   const pause = () => { playingRef.current = false; setPlaying(false); };
   const resume = () => { if (stepRef.current >= maxStepRef.current) return; playingRef.current = true; setPlaying(true); playNext(); };
-  const resetGame = () => { setBoards(null); setMoves(null); setResult(null); setEvents([]); setCurrentStep(0); loadRoster(); };
+  const resetGame = () => { setBoards(null); setMoves(null); setResult(null); setEvents([]); setCurrentStep(0); setCurrentBet(null); loadRoster(); loadWallet(); };
 
   const board = boards ? boards[currentStep] : null;
   const lastMove = moves && currentStep > 0 ? moves[currentStep - 1] : null;
@@ -759,7 +767,13 @@ export default function App() {
   return (
     <div style={{ minHeight: "100vh", padding: "16px 12px" }}>
       <div style={{ textAlign: "center", marginBottom: 16 }}>
-        <h1 style={{ fontSize: "clamp(16px, 4vw, 26px)", fontWeight: 800, letterSpacing: 6, textTransform: "uppercase", background: "linear-gradient(135deg, #e74c3c, #f39c12, #2ecc71)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>Agent Checkers</h1>
+        <div style={{ display: "flex", justifyContent: "center", alignItems: "center", gap: 16 }}>
+          <h1 style={{ fontSize: "clamp(16px, 4vw, 26px)", fontWeight: 800, letterSpacing: 6, textTransform: "uppercase", background: "linear-gradient(135deg, #e74c3c, #f39c12, #2ecc71)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>Agent Checkers</h1>
+          <div style={{ display: "flex", alignItems: "center", gap: 4, padding: "3px 10px", background: "#161b22", border: "1px solid #ffd70033", borderRadius: 4 }}>
+            <span style={{ fontSize: 14 }}>&#x1FA99;</span>
+            <span style={{ fontSize: 16, fontWeight: 800, color: "#ffd700" }}>{wallet.balance?.toLocaleString()}</span>
+          </div>
+        </div>
         <div style={{ display: "flex", justifyContent: "center", gap: 6, marginTop: 6 }}>
           <button onClick={() => setAppMode("match")} style={{ padding: "4px 16px", fontSize: 9, fontWeight: 700, letterSpacing: 2, fontFamily: "inherit", cursor: "pointer", background: "#161b22", border: "1px solid #2ecc71", color: "#2ecc71", borderRadius: 3, textTransform: "uppercase" }}>MATCH</button>
           <button onClick={() => setAppMode("tournament")} style={{ padding: "4px 16px", fontSize: 9, fontWeight: 700, letterSpacing: 2, fontFamily: "inherit", cursor: "pointer", background: "#0d1117", border: "1px solid #f39c1266", color: "#f39c12", borderRadius: 3, textTransform: "uppercase" }}>TOURNAMENT</button>
@@ -807,12 +821,78 @@ export default function App() {
 
           <BoardGrid board={board} lastMove={lastMove} />
 
-          <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 12, flexWrap: "wrap", justifyContent: "center" }}>
-            {canGo && <button onClick={startGame} style={{ padding: "10px 36px", borderRadius: 6, border: "none", background: "linear-gradient(135deg, #2ecc71, #27ae60)", color: "#fff", fontWeight: 800, fontSize: 14, letterSpacing: 4, textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit", boxShadow: "0 0 24px rgba(46,204,113,0.3)" }}>GO</button>}
+          {/* betting panel / bet indicator */}
+          {canGo && !currentBet && betOdds && (
+            <div style={{ width: "100%", padding: "8px 12px", background: "#0d1117", border: "1px solid #1a1f2b", borderRadius: 6, marginTop: 8 }}>
+              <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 2, textTransform: "uppercase", textAlign: "center", marginBottom: 6 }}>Place your bet</div>
+              <div style={{ display: "flex", justifyContent: "space-around", marginBottom: 6 }}>
+                <div style={{ textAlign: "center" }}>
+                  <div style={{ fontSize: 8, color: "#e74c3c" }}>RED</div>
+                  <div style={{ fontSize: 16, fontWeight: 800, color: "#e74c3c" }}>{betOdds.red}x</div>
+                </div>
+                <div style={{ textAlign: "center" }}>
+                  <div style={{ fontSize: 8, color: "#4a5568" }}>DRAW</div>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: "#4a5568" }}>{betOdds.draw}x</div>
+                </div>
+                <div style={{ textAlign: "center" }}>
+                  <div style={{ fontSize: 8, color: "#ecf0f1" }}>BLACK</div>
+                  <div style={{ fontSize: 16, fontWeight: 800, color: "#ecf0f1" }}>{betOdds.black}x</div>
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 4, justifyContent: "center", marginBottom: 6 }}>
+                {[10, 50, 100, 250].filter(a => a <= wallet.balance).map(amt => (
+                  <button key={amt} onClick={() => {
+                    setCurrentBet(prev => prev?.amount === amt ? { ...prev } : null);
+                    setCurrentBet(null);
+                  }} style={{ fontSize: 8, padding: "2px 8px", borderRadius: 3, background: "#161b22", border: "1px solid #21262d", color: "#8892a0", cursor: "pointer", fontFamily: "inherit" }}>{amt}</button>
+                ))}
+              </div>
+              <div style={{ display: "flex", gap: 4, justifyContent: "center" }}>
+                {["red", "black", "draw"].map(side => {
+                  const colors = { red: "#e74c3c", black: "#ecf0f1", draw: "#4a5568" };
+                  return [10, 50, 100, 250].filter(a => a <= wallet.balance).length > 0 ? (
+                    <button key={side} onClick={() => {
+                      const amt = Math.min(100, wallet.balance);
+                      setCurrentBet({ side, amount: amt });
+                    }} style={{ padding: "4px 12px", borderRadius: 3, border: `1px solid ${colors[side]}44`, background: "transparent", color: colors[side], fontSize: 8, fontWeight: 700, letterSpacing: 1, cursor: "pointer", fontFamily: "inherit", textTransform: "uppercase" }}>BET {side.toUpperCase()}</button>
+                  ) : null;
+                })}
+                <button onClick={startGame} style={{ padding: "4px 16px", borderRadius: 3, border: "1px solid #2ecc71", background: "transparent", color: "#2ecc71", fontSize: 8, fontWeight: 700, letterSpacing: 1, cursor: "pointer", fontFamily: "inherit" }}>SKIP</button>
+              </div>
+              <div style={{ textAlign: "center", fontSize: 7, color: "#3a4450", marginTop: 4 }}>Balance: {wallet.balance?.toLocaleString()}</div>
+            </div>
+          )}
+          {canGo && currentBet && (
+            <div style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, marginTop: 8, padding: "6px 12px", background: "#0d1117", border: "1px solid #ffd70033", borderRadius: 6 }}>
+              <span style={{ fontSize: 9, color: "#ffd700" }}>BET: {currentBet.amount} on {currentBet.side.toUpperCase()} ({betOdds?.[currentBet.side]}x)</span>
+              <span style={{ fontSize: 8, color: "#4a5568" }}>Potential: {Math.floor(currentBet.amount * (betOdds?.[currentBet.side] || 1))}</span>
+              <button onClick={() => setCurrentBet(null)} style={{ fontSize: 7, background: "none", border: "1px solid #21262d", color: "#4a5568", borderRadius: 3, padding: "1px 6px", cursor: "pointer", fontFamily: "inherit" }}>CANCEL</button>
+              <button onClick={startGame} style={{ padding: "6px 24px", borderRadius: 4, border: "none", background: "linear-gradient(135deg, #2ecc71, #27ae60)", color: "#fff", fontWeight: 800, fontSize: 12, letterSpacing: 3, cursor: "pointer", fontFamily: "inherit" }}>GO</button>
+            </div>
+          )}
+          {canGo && !betOdds && <button onClick={startGame} style={{ marginTop: 8, padding: "10px 36px", borderRadius: 6, border: "none", background: "linear-gradient(135deg, #2ecc71, #27ae60)", color: "#fff", fontWeight: 800, fontSize: 14, letterSpacing: 4, textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit", boxShadow: "0 0 24px rgba(46,204,113,0.3)" }}>GO</button>}
+
+          {/* bet indicator during match */}
+          {boards && result?.bet && (
+            <div style={{ width: "100%", padding: "3px 10px", background: result.bet.side === "red" ? "rgba(231,76,60,0.08)" : result.bet.side === "black" ? "rgba(236,240,241,0.06)" : "rgba(74,85,104,0.1)", borderRadius: 3, textAlign: "center", fontSize: 8, color: "#ffd700", marginTop: 4 }}>
+              &#x1FA99; {result.bet.amount} on {result.bet.side.toUpperCase()} ({result.bet.odds}x) = {Math.floor(result.bet.amount * result.bet.odds)} potential
+            </div>
+          )}
+
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 8, flexWrap: "wrap", justifyContent: "center" }}>
             {!boards && !loading && (!redAgent || !blackAgent) && <span style={{ fontSize: 10, color: "#4a5568", letterSpacing: 1 }}>SELECT BOTH AGENTS</span>}
             {loading && <span style={{ fontSize: 11, color: "#4a5568", letterSpacing: 2 }}>SIMULATING...</span>}
             {boards && playing && <button onClick={pause} style={{ padding: "7px 18px", borderRadius: 6, border: "1px solid #e67e22", background: "transparent", color: "#e67e22", fontWeight: 700, fontSize: 10, letterSpacing: 2, textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit" }}>PAUSE</button>}
             {boards && !playing && !isFinished && <button onClick={resume} style={{ padding: "7px 18px", borderRadius: 6, border: "1px solid #2ecc71", background: "transparent", color: "#2ecc71", fontWeight: 700, fontSize: 10, letterSpacing: 2, textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit" }}>RESUME</button>}
+            {isFinished && result?.bet && (
+              <div style={{ padding: "6px 16px", borderRadius: 6, textAlign: "center", background: result.bet.result === "win" ? "rgba(46,204,113,0.1)" : "rgba(231,76,60,0.1)", border: `1px solid ${result.bet.result === "win" ? "rgba(46,204,113,0.3)" : "rgba(231,76,60,0.3)"}` }}>
+                <div style={{ fontSize: 18, fontWeight: 800, color: result.bet.result === "win" ? "#2ecc71" : "#e74c3c" }}>
+                  {result.bet.result === "win" ? `+${result.bet.payout}` : `${result.bet.net}`}
+                </div>
+                <div style={{ fontSize: 9, color: "#8892a0" }}>{result.bet.amount} bet on {result.bet.side.toUpperCase()} at {result.bet.odds}x</div>
+                {result.bet.bankrupt && <div style={{ fontSize: 9, color: "#ffd700", marginTop: 2 }}>Bankrupt! Here's 500 coins to get back in the game.</div>}
+              </div>
+            )}
             {isFinished && (
               <>
                 <span style={{ fontSize: 14, fontWeight: 800, letterSpacing: 2, textTransform: "uppercase", color: result.winner === "red" ? "#e74c3c" : result.winner === "black" ? "#ecf0f1" : "#f39c12" }}>{result.winner === "draw" ? "DRAW" : `${result.winner === "red" ? (result.red_agent?.name || "RED") : (result.black_agent?.name || "BLACK")} wins`}</span>

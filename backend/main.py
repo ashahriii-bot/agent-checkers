@@ -23,6 +23,8 @@ from database import (
     create_agent, get_agents, get_agent, update_agent, delete_agent, update_agent_after_match,
     save_tournament, get_tournaments, get_tournament,
     set_agent_perk, VALID_PERKS,
+    get_wallet, place_bet, settle_bet, get_bet_history,
+    calculate_match_odds, calculate_tournament_odds,
 )
 
 app = FastAPI(title="Agent Checkers API", version="0.5.0")
@@ -81,17 +83,29 @@ class UpdateAgentRequest(BaseModel):
     trade_down: Optional[int] = Field(default=None, ge=0, le=100)
 
 
+class BetSchema(BaseModel):
+    side: str
+    amount: int = Field(ge=10)
+
+
+class ChampionBetSchema(BaseModel):
+    agent_id: int
+    amount: int = Field(ge=10)
+
+
 class SimulateRequest(BaseModel):
     red: Optional[AgentConfigSchema] = None
     black: Optional[AgentConfigSchema] = None
     red_agent_id: Optional[int] = None
     black_agent_id: Optional[int] = None
+    bet: Optional[BetSchema] = None
 
 
 class TournamentRequest(BaseModel):
     agent_ids: list[int]
     bracket_size: int = Field(default=8, ge=4, le=8)
     seeding: str = "elo"
+    champion_bet: Optional[ChampionBetSchema] = None
 
 
 # --- core game simulation (shared by single match and tournament) ---
@@ -415,6 +429,23 @@ def api_suggest_names_standalone(aggression: int = 50, risk_tolerance: int = 50,
     return {"suggestions": suggest_names(aggression, risk_tolerance, king_priority, edge_affinity, trade_down)}
 
 
+# --- wallet and betting ---
+
+@app.get("/api/wallet")
+def api_get_wallet():
+    return get_wallet()
+
+
+@app.get("/api/odds/match")
+def api_match_odds(red_elo: float = 1200, black_elo: float = 1200):
+    return calculate_match_odds(red_elo, black_elo)
+
+
+@app.get("/api/bets/history")
+def api_bet_history(limit: int = 20):
+    return {"bets": get_bet_history(limit)}
+
+
 # --- single match ---
 
 def _resolve_side(agent_id, config, label):
@@ -486,6 +517,28 @@ def simulate_game(req: SimulateRequest):
         black_agent_id=black_agent["id"] if black_agent else None,
     )
 
+    # --- betting ---
+    bet_result = None
+    if req.bet:
+        if req.bet.side not in ("red", "black", "draw"):
+            raise HTTPException(400, "bet side must be red, black, or draw")
+        odds = calculate_match_odds(red_elo_before, black_elo_before)
+        side_odds = odds[req.bet.side]
+        try:
+            bet_info = place_bet("match", req.bet.side, req.bet.amount, side_odds, match_id=match_id)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        won = game["winner"] == req.bet.side
+        payout = int(req.bet.amount * side_odds) if won else 0
+        settle_result = settle_bet(bet_info["bet_id"], "win" if won else "loss", payout)
+        bet_result = {
+            "bet_id": bet_info["bet_id"], "side": req.bet.side,
+            "amount": req.bet.amount, "odds": side_odds,
+            "result": "win" if won else "loss",
+            "payout": payout, "net": payout - req.bet.amount if won else -req.bet.amount,
+            "balance_after": settle_result["balance"], "bankrupt": settle_result["bankrupt"],
+        }
+
     resp = {
         "match_id": match_id, **game,
         "elo": {"red_before": red_elo_before, "red_after": red_elo_after,
@@ -497,6 +550,7 @@ def simulate_game(req: SimulateRequest):
         resp["black_agent"] = {"id": black_agent["id"], "name": black_agent["name"], "perk": black_perk}
     if level_ups:
         resp["level_ups"] = level_ups
+    resp["bet"] = bet_result
     return resp
 
 
@@ -665,7 +719,7 @@ def api_create_tournament(req: TournamentRequest):
             "tag": m["tag"],
         } for m in rd["matches"]]
 
-    return {
+    resp = {
         "tournament_id": tid,
         "bracket_size": req.bracket_size,
         "seeding": req.seeding,
@@ -689,7 +743,32 @@ def api_create_tournament(req: TournamentRequest):
         "champion": {"name": champion["name"], "agent_id": champion["agent_id"], "seed": champion["seed"]},
         "awards": awards,
         "elo_changes": elo_changes,
+        "champion_bet": None,
     }
+
+    # --- tournament champion bet ---
+    if req.champion_bet:
+        t_odds = calculate_tournament_odds(participants)
+        agent_odds = t_odds.get(req.champion_bet.agent_id)
+        if not agent_odds:
+            raise HTTPException(400, "bet agent not in tournament")
+        picked_name = next((p["name"] for p in participants if p.get("agent_id") == req.champion_bet.agent_id), "?")
+        try:
+            bet_info = place_bet("tournament", picked_name, req.champion_bet.amount, agent_odds, tournament_id=tid)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        won = champion["agent_id"] == req.champion_bet.agent_id
+        payout = int(req.champion_bet.amount * agent_odds) if won else 0
+        settle_result = settle_bet(bet_info["bet_id"], "win" if won else "loss", payout)
+        resp["champion_bet"] = {
+            "bet_id": bet_info["bet_id"], "agent_name": picked_name,
+            "amount": req.champion_bet.amount, "odds": agent_odds,
+            "result": "win" if won else "loss",
+            "payout": payout, "net": payout - req.champion_bet.amount if won else -req.champion_bet.amount,
+            "balance_after": settle_result["balance"], "bankrupt": settle_result["bankrupt"],
+        }
+
+    return resp
 
 
 @app.get("/api/tournaments")
