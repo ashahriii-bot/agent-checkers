@@ -18,6 +18,12 @@ const SLIDER_KEYS = [
 const TAG_COLORS = { UPSET: "#f39c12", COMEBACK: "#2ecc71", NAIL_BITER: "#3498db", DOMINANT: "#e74c3c", LAST_STAND: "#9b59b6" };
 const TAG_LABELS = { UPSET: "UPSET", COMEBACK: "COMEBACK", NAIL_BITER: "NAIL-BITER", DOMINANT: "DOMINANT", LAST_STAND: "LAST STAND" };
 
+const PERK_INFO = {
+  rope_a_dope: { name: "ROPE-A-DOPE", color: "#3498db", icon: "⛨", short: "Tightens defense after being attacked", tag: "Strong vs aggressive agents" },
+  press: { name: "PRESS", color: "#e67e22", icon: "▶", short: "Forces action during stalemates", tag: "Strong vs defensive agents" },
+  momentum: { name: "MOMENTUM", color: "#2ecc71", icon: "⚡", short: "Captures breed more captures", tag: "Strong vs mid-range agents" },
+};
+
 const ADJECTIVE_POOLS = {
   aggression: ["Reckless", "Savage", "Furious", "Relentless", "Vicious"],
   risk_tolerance: ["Bold", "Fearless", "Daring", "Wild", "Rogue"],
@@ -437,6 +443,85 @@ function Tournament({ roster, onBack, loadRoster }) {
 }
 
 
+function LevelBadge({ level }) {
+  const gold = level >= 5;
+  return (
+    <span style={{ fontSize: 7, fontWeight: 700, padding: "0 3px", borderRadius: 2, background: gold ? "#ffd70022" : "#1a1f2b", color: gold ? "#ffd700" : "#4a5568", border: `1px solid ${gold ? "#ffd70044" : "#21262d"}` }}>
+      Lv.{level}{gold ? " ★" : ""}
+    </span>
+  );
+}
+
+function XpBar({ xp, xpNext, level }) {
+  if (!xpNext) return <span style={{ fontSize: 7, color: "#ffd700" }}>MAX</span>;
+  const prevThreshold = { 1: 0, 2: 5, 3: 15, 4: 30, 5: 50 }[level] || 0;
+  const progress = (xp - prevThreshold) / (xpNext - prevThreshold);
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+      <div style={{ flex: 1, height: 3, background: "#1a1f2b", borderRadius: 2, overflow: "hidden" }}>
+        <div style={{ width: `${Math.min(100, progress * 100)}%`, height: "100%", background: "#4a5568", borderRadius: 2 }} />
+      </div>
+      <span style={{ fontSize: 6, color: "#3a4450", whiteSpace: "nowrap" }}>{xp}/{xpNext}</span>
+    </div>
+  );
+}
+
+function PerkBadge({ perk }) {
+  if (!perk) return null;
+  const info = PERK_INFO[perk];
+  if (!info) return null;
+  return (
+    <span style={{ fontSize: 7, padding: "0 4px", borderRadius: 2, background: info.color + "18", color: info.color, border: `1px solid ${info.color}33` }}>
+      {info.icon} {info.name}
+    </span>
+  );
+}
+
+function PerkSelector({ agentId, onSelect }) {
+  const [saving, setSaving] = useState(false);
+  const [chosen, setChosen] = useState(null);
+
+  const confirm = async () => {
+    if (!chosen) return;
+    setSaving(true);
+    try {
+      const res = await fetch(`${API}/agents/${agentId}/perk`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ perk: chosen }),
+      });
+      if (res.ok) { const d = await res.json(); onSelect(d); }
+    } finally { setSaving(false); }
+  };
+
+  return (
+    <div style={{ padding: 8, background: "#0a0c10", border: "1px solid #ffd70033", borderRadius: 6, marginTop: 6 }}>
+      <div style={{ fontSize: 8, fontWeight: 700, color: "#ffd700", letterSpacing: 1, marginBottom: 6, textTransform: "uppercase" }}>Choose a Perk</div>
+      {Object.entries(PERK_INFO).map(([key, info]) => (
+        <div key={key} onClick={() => setChosen(key)} style={{
+          padding: "6px 8px", marginBottom: 4, borderRadius: 4, cursor: "pointer",
+          background: chosen === key ? info.color + "15" : "#0d1117",
+          border: `1px solid ${chosen === key ? info.color + "66" : "#1a1f2b"}`,
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 2 }}>
+            <span style={{ fontSize: 12 }}>{info.icon}</span>
+            <span style={{ fontSize: 9, fontWeight: 700, color: info.color }}>{info.name}</span>
+          </div>
+          <div style={{ fontSize: 8, color: "#8892a0" }}>{info.short}</div>
+          <div style={{ fontSize: 7, color: "#4a5568", marginTop: 1 }}>{info.tag}</div>
+        </div>
+      ))}
+      <div style={{ display: "flex", gap: 4, marginTop: 4 }}>
+        <button onClick={confirm} disabled={!chosen || saving} style={{
+          flex: 1, padding: "4px 0", borderRadius: 3, border: "none", fontFamily: "inherit",
+          background: chosen ? "#ffd70033" : "#21262d", color: chosen ? "#ffd700" : "#4a5568",
+          fontSize: 8, fontWeight: 700, letterSpacing: 1, cursor: chosen ? "pointer" : "not-allowed",
+        }}>{saving ? "..." : "CONFIRM"}</button>
+      </div>
+      <div style={{ fontSize: 7, color: "#3a4450", marginTop: 3, textAlign: "center" }}>you can change your perk anytime</div>
+    </div>
+  );
+}
+
 // --- roster panel (match mode) ---
 
 function AgentCard({ agent, selected, onClick, compact }) {
@@ -447,13 +532,16 @@ function AgentCard({ agent, selected, onClick, compact }) {
       cursor: onClick ? "pointer" : "default", marginBottom: 3, transition: "border-color 0.2s",
     }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
-        <span style={{ fontSize: 10, fontWeight: 700, color: selected ? "#2ecc71" : "#c8d0da", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 120 }}>{agent.name}</span>
-        <span style={{ fontSize: 10, fontWeight: 700, color: "#8892a0" }}>{Math.round(agent.elo)}</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 4, overflow: "hidden" }}>
+          <LevelBadge level={agent.level || 1} />
+          <span style={{ fontSize: 10, fontWeight: 700, color: selected ? "#2ecc71" : "#c8d0da", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{agent.name}</span>
+        </div>
+        <span style={{ fontSize: 10, fontWeight: 700, color: "#8892a0", flexShrink: 0 }}>{Math.round(agent.elo)}</span>
       </div>
       <MiniBars config={agent} />
-      <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2 }}>
-        <span style={{ fontSize: 7, color: "#4a5568" }}>{SLIDER_KEYS.map(s => `${s.short}${agent[s.key]}`).join(" ")}</span>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 2 }}>
         <span style={{ fontSize: 7, color: "#4a5568" }}>{agent.wins}W {agent.losses}L {agent.draws}D</span>
+        {agent.perk && <PerkBadge perk={agent.perk} />}
       </div>
     </div>
   );
@@ -547,7 +635,10 @@ function RosterPanel({ side, color, selectedAgent, onSelect, roster, disabled, m
       {selectedAgent && (
         <div style={{ marginBottom: 6, padding: "6px 8px", background: "#161b22", border: `1px solid ${color}44`, borderRadius: 4 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <span style={{ fontSize: 12, fontWeight: 800, color: "#c8d0da" }}>{selectedAgent.name}</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <LevelBadge level={selectedAgent.level || 1} />
+              <span style={{ fontSize: 12, fontWeight: 800, color: "#c8d0da" }}>{selectedAgent.name}</span>
+            </div>
             <div style={{ display: "flex", gap: 4 }}>
               <button onClick={() => openEdit(selectedAgent)} style={{ fontSize: 7, background: "none", border: "1px solid #21262d", color: "#4a5568", borderRadius: 3, padding: "1px 5px", cursor: "pointer", fontFamily: "inherit" }}>EDIT</button>
               <button onClick={() => onSelect(null)} style={{ fontSize: 7, background: "none", border: "1px solid #21262d", color: "#4a5568", borderRadius: 3, padding: "1px 5px", cursor: "pointer", fontFamily: "inherit" }}>X</button>
@@ -557,7 +648,12 @@ function RosterPanel({ side, color, selectedAgent, onSelect, roster, disabled, m
             <span style={{ fontSize: 13, fontWeight: 800, color: "#8892a0" }}>{Math.round(selectedAgent.elo)} <span style={{ fontSize: 8, fontWeight: 400 }}>ELO</span></span>
             <span style={{ fontSize: 7, color: "#4a5568" }}>{selectedAgent.wins}W {selectedAgent.losses}L {selectedAgent.draws}D</span>
           </div>
+          <XpBar xp={selectedAgent.xp || 0} xpNext={selectedAgent.xp_next} level={selectedAgent.level || 1} />
           <MiniBars config={selectedAgent} /><OverextWarning config={selectedAgent} />
+          {selectedAgent.perk && <div style={{ marginTop: 3 }}><PerkBadge perk={selectedAgent.perk} /></div>}
+          {(selectedAgent.level || 1) >= 5 && !selectedAgent.perk && (
+            <PerkSelector agentId={selectedAgent.id} onSelect={(updated) => { onSelect(updated); onRosterChange(); }} />
+          )}
         </div>
       )}
       <div style={{ maxHeight: selectedAgent ? 140 : 240, overflowY: "auto", marginBottom: 6 }}>
@@ -633,6 +729,20 @@ export default function App() {
   const activeShrinkEvent = events.find(e => e.type === "shrink" && e.move === currentStep);
   const activeFatigueEvent = events.find(e => e.type === "fatigue" && e.move === currentStep);
   const activeOverextEvent = events.find(e => e.type === "overextension" && e.move === currentStep && e.pieces_lost >= 2);
+  const activePerkEvent = events.find(e => e.type === "perk_activate" && e.move === currentStep);
+  const activePerkStates = (() => {
+    const states = {};
+    for (const e of events) {
+      if (e.move > currentStep) break;
+      if (e.type === "perk_activate") states[e.side] = { perk: e.perk, remaining: e.duration - (currentStep - e.move) };
+      if (e.type === "perk_deactivate" && e.move <= currentStep) delete states[e.side];
+    }
+    const result = {};
+    for (const [side, s] of Object.entries(states)) {
+      if (s.remaining > 0) result[side] = s;
+    }
+    return result;
+  })();
   const currentPhase = (() => { if (!events.length) return null; const pc = events.filter(e => e.type === "phase_change" && e.move <= currentStep); return pc.length ? pc[pc.length - 1].phase : "opening"; })();
   const counts = board ? (() => { let r = 0, b = 0; for (let row of board) for (let cell of row) { if (cell === RED || cell === RED_KING) r++; if (cell === BLACK || cell === BLACK_KING) b++; } return { red: r, black: b }; })() : { red: 12, black: 12 };
   const isFinished = result && currentStep >= (boards?.length || 1) - 1;
@@ -681,6 +791,11 @@ export default function App() {
           {activeShrinkEvent && <div style={{ background: "rgba(231,76,60,0.15)", border: "1px solid rgba(231,76,60,0.3)", borderRadius: 4, padding: "4px 10px", marginBottom: 6, fontSize: 10, color: "#e74c3c", letterSpacing: 1, textTransform: "uppercase" }}>board shrinking: {activeShrinkEvent.killed.length} squares eliminated</div>}
           {activeFatigueEvent && <div style={{ background: "rgba(241,196,15,0.15)", border: "1px solid rgba(241,196,15,0.3)", borderRadius: 4, padding: "4px 10px", marginBottom: 6, fontSize: 10, color: "#f1c40f", letterSpacing: 1, textTransform: "uppercase" }}>king fatigue: idle kings demoted</div>}
           {activeOverextEvent && <div style={{ background: "rgba(230,126,34,0.15)", border: "1px solid rgba(230,126,34,0.3)", borderRadius: 4, padding: "4px 10px", marginBottom: 6, fontSize: 10, color: "#e67e22", letterSpacing: 1, textTransform: "uppercase" }}>overextension: {activeOverextEvent.side} lost {activeOverextEvent.pieces_lost} pieces on a bad trade</div>}
+          {activePerkEvent && (() => { const pi = PERK_INFO[activePerkEvent.perk]; return pi ? (
+            <div style={{ background: pi.color + "18", border: `1px solid ${pi.color}44`, borderRadius: 4, padding: "4px 10px", marginBottom: 6, fontSize: 10, color: pi.color, letterSpacing: 1, textTransform: "uppercase" }}>
+              {activePerkEvent.side}: {pi.name} ({activePerkEvent.duration} moves)
+            </div>
+          ) : null; })()}
 
           {!boards && redAgent && blackAgent && (
             <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
@@ -704,6 +819,11 @@ export default function App() {
                 <button onClick={resetGame} style={{ padding: "7px 18px", borderRadius: 6, border: "1px solid #2ecc71", background: "transparent", color: "#2ecc71", fontWeight: 700, fontSize: 10, letterSpacing: 2, textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit" }}>REMATCH</button>
               </>
             )}
+            {isFinished && result.level_ups && result.level_ups.map((lu, i) => (
+              <div key={i} style={{ padding: "4px 10px", borderRadius: 4, fontSize: 9, letterSpacing: 1, textTransform: "uppercase", background: lu.perk_unlocked ? "rgba(255,215,0,0.12)" : "rgba(46,204,113,0.12)", border: `1px solid ${lu.perk_unlocked ? "rgba(255,215,0,0.3)" : "rgba(46,204,113,0.3)"}`, color: lu.perk_unlocked ? "#ffd700" : "#2ecc71" }}>
+                {lu.name} reached Level {lu.new_level}{lu.perk_unlocked ? " -- Choose a perk!" : ""}
+              </div>
+            ))}
           </div>
 
           {error && <p style={{ color: "#e74c3c", fontSize: 10, marginTop: 6 }}>{error}</p>}
@@ -714,6 +834,9 @@ export default function App() {
             <span style={{ color: "#ecf0f1" }}>B {counts.black}</span>
             {currentPhase && currentStep > 0 && <span style={{ color: currentPhase === "opening" ? "#3498db" : currentPhase === "midgame" ? "#e67e22" : "#e74c3c", fontWeight: 700 }}>{currentPhase.toUpperCase()}</span>}
             {currentStep >= 60 && <span style={{ color: "#e74c3c", fontWeight: 700 }}>SHRINKING</span>}
+            {Object.entries(activePerkStates).map(([side, s]) => { const pi = PERK_INFO[s.perk]; return pi ? (
+              <span key={side} style={{ color: pi.color, fontSize: 8 }}>{side === "red" ? "R" : "B"}: {pi.name} ({s.remaining})</span>
+            ) : null; })}
             <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
               <span>SPD</span>
               <input type="range" min="50" max="800" value={850 - speed} onChange={(e) => setSpeed(850 - parseInt(e.target.value))} style={{ width: 50, background: "#1a1f2b", accentColor: "#2ecc71" }} />

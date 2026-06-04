@@ -16,12 +16,13 @@ from engine import (
     init_board, apply_move, get_all_moves, count_pieces,
     board_to_list, shrink_board, apply_king_fatigue, Piece, is_king,
 )
-from ai import AgentConfig, pick_move, detect_phase, calc_overextension_factor, suggest_names
+from ai import AgentConfig, pick_move, detect_phase, calc_overextension_factor, suggest_names, apply_perk_overrides
 from database import (
     save_match, get_matches, get_match, get_leaderboard, get_agent_leaderboard,
     get_elo, update_elo, update_elo_record,
     create_agent, get_agents, get_agent, update_agent, delete_agent, update_agent_after_match,
     save_tournament, get_tournaments, get_tournament,
+    set_agent_perk, VALID_PERKS,
 )
 
 app = FastAPI(title="Agent Checkers API", version="0.5.0")
@@ -95,7 +96,14 @@ class TournamentRequest(BaseModel):
 
 # --- core game simulation (shared by single match and tournament) ---
 
-def _run_game(red_cfg: AgentConfig, black_cfg: AgentConfig) -> dict:
+def _init_perk_state(perk: str | None) -> dict | None:
+    if not perk:
+        return None
+    return {"perk": perk, "active_moves": 0}
+
+
+def _run_game(red_cfg: AgentConfig, black_cfg: AgentConfig,
+              red_perk: str | None = None, black_perk: str | None = None) -> dict:
     board = init_board()
     turn = "black"
     moves = []
@@ -110,6 +118,10 @@ def _run_game(red_cfg: AgentConfig, black_cfg: AgentConfig) -> dict:
     red_overext = calc_overextension_factor(red_cfg.aggression, red_cfg.risk_tolerance)
     black_overext = calc_overextension_factor(black_cfg.aggression, black_cfg.risk_tolerance)
     pending_overext = None
+
+    # perk state
+    perk_state = {"red": _init_perk_state(red_perk), "black": _init_perk_state(black_perk)}
+    moves_since_capture = 0
 
     while move_count < MAX_MOVES:
         if move_count >= SHRINK_START and (move_count - SHRINK_START) % SHRINK_INTERVAL == 0:
@@ -136,8 +148,10 @@ def _run_game(red_cfg: AgentConfig, black_cfg: AgentConfig) -> dict:
             current_phase = new_phase
             events.append({"type": "phase_change", "move": move_count, "phase": new_phase})
 
-        cfg = red_cfg if turn == "red" else black_cfg
-        move = pick_move(board, turn, cfg, phase=current_phase)
+        # apply perk overrides for the current player
+        base_cfg = red_cfg if turn == "red" else black_cfg
+        effective_cfg = apply_perk_overrides(base_cfg, perk_state[turn])
+        move = pick_move(board, turn, effective_cfg, phase=current_phase)
         if move is None:
             winner = "red" if turn == "black" else "black"; break
 
@@ -147,6 +161,45 @@ def _run_game(red_cfg: AgentConfig, black_cfg: AgentConfig) -> dict:
         boards.append(board_to_list(board))
         move_count += 1
 
+        # --- perk state updates ---
+        opp = "black" if turn == "red" else "red"
+
+        # decrement active perk moves for the player who just moved
+        ps = perk_state[turn]
+        if ps and ps["active_moves"] > 0:
+            ps["active_moves"] -= 1
+            if ps["active_moves"] == 0:
+                events.append({"type": "perk_deactivate", "move": move_count, "side": turn, "perk": ps["perk"]})
+
+        # rope-a-dope: activates on the DEFENDER when opponent captures their piece
+        if had_capture and perk_state[opp] and perk_state[opp]["perk"] == "rope_a_dope":
+            perk_state[opp]["active_moves"] = 3
+            events.append({"type": "perk_activate", "move": move_count, "side": opp, "perk": "rope_a_dope", "duration": 3})
+
+        # momentum: activates on the player who just captured
+        if had_capture and ps and ps["perk"] == "momentum":
+            ps["active_moves"] = 2
+            events.append({"type": "perk_activate", "move": move_count, "side": turn, "perk": "momentum", "duration": 2})
+
+        # press: track moves since last capture by either side
+        if had_capture:
+            moves_since_capture = 0
+            # deactivate press immediately if a capture breaks the stalemate
+            for side_key in ("red", "black"):
+                sps = perk_state[side_key]
+                if sps and sps["perk"] == "press" and sps["active_moves"] > 0:
+                    sps["active_moves"] = 0
+                    events.append({"type": "perk_deactivate", "move": move_count, "side": side_key, "perk": "press"})
+        else:
+            moves_since_capture += 1
+            if moves_since_capture >= 5:
+                for side_key in ("red", "black"):
+                    sps = perk_state[side_key]
+                    if sps and sps["perk"] == "press" and sps["active_moves"] == 0:
+                        sps["active_moves"] = 4
+                        events.append({"type": "perk_activate", "move": move_count, "side": side_key, "perk": "press", "duration": 4})
+
+        # --- overextension tracking ---
         if pending_overext is not None and pending_overext["side"] != turn and had_capture:
             events.append({"type": "overextension", "move": pending_overext["move"],
                            "side": pending_overext["side"], "pieces_lost": len(move.captures)})
@@ -381,6 +434,17 @@ def _resolve_side(agent_id, config, label):
     raise HTTPException(400, f"provide either {label}_agent_id or {label} config")
 
 
+@app.post("/api/agents/{agent_id}/perk")
+def api_set_perk(agent_id: int, body: dict):
+    perk = body.get("perk")
+    if perk is not None and perk not in VALID_PERKS:
+        raise HTTPException(400, f"invalid perk, choose from: {', '.join(VALID_PERKS)}")
+    result = set_agent_perk(agent_id, perk)
+    if result is None:
+        raise HTTPException(400, "agent not found or must be level 5 to set a perk")
+    return result
+
+
 @app.post("/api/game/simulate")
 def simulate_game(req: SimulateRequest):
     red_cfg, red_agent = _resolve_side(req.red_agent_id, req.red, "red")
@@ -388,19 +452,26 @@ def simulate_game(req: SimulateRequest):
     red_elo_before = red_agent["elo"] if red_agent else get_elo(red_cfg.config_key())
     black_elo_before = black_agent["elo"] if black_agent else get_elo(black_cfg.config_key())
 
-    game = _run_game(red_cfg, black_cfg)
+    red_perk = red_agent["perk"] if red_agent else None
+    black_perk = black_agent["perk"] if black_agent else None
+    game = _run_game(red_cfg, black_cfg, red_perk=red_perk, black_perk=black_perk)
 
     result_red = 1.0 if game["winner"] == "red" else (0.0 if game["winner"] == "black" else 0.5)
     red_elo_after, black_elo_after = update_elo(red_elo_before, black_elo_before, result_red)
 
+    level_ups = []
     red_result = "win" if game["winner"] == "red" else ("loss" if game["winner"] == "black" else "draw")
     black_result = "win" if game["winner"] == "black" else ("loss" if game["winner"] == "red" else "draw")
     if red_agent:
-        update_agent_after_match(red_agent["id"], red_elo_after, red_result)
+        lu = update_agent_after_match(red_agent["id"], red_elo_after, red_result)
+        if lu:
+            level_ups.append(lu)
     else:
         update_elo_record(red_cfg.config_key(), red_cfg.to_dict(), red_elo_after, red_result)
     if black_agent:
-        update_agent_after_match(black_agent["id"], black_elo_after, black_result)
+        lu = update_agent_after_match(black_agent["id"], black_elo_after, black_result)
+        if lu:
+            level_ups.append(lu)
     else:
         update_elo_record(black_cfg.config_key(), black_cfg.to_dict(), black_elo_after, black_result)
 
@@ -421,9 +492,11 @@ def simulate_game(req: SimulateRequest):
                 "black_before": black_elo_before, "black_after": black_elo_after},
     }
     if red_agent:
-        resp["red_agent"] = {"id": red_agent["id"], "name": red_agent["name"]}
+        resp["red_agent"] = {"id": red_agent["id"], "name": red_agent["name"], "perk": red_perk}
     if black_agent:
-        resp["black_agent"] = {"id": black_agent["id"], "name": black_agent["name"]}
+        resp["black_agent"] = {"id": black_agent["id"], "name": black_agent["name"], "perk": black_perk}
+    if level_ups:
+        resp["level_ups"] = level_ups
     return resp
 
 
@@ -448,7 +521,7 @@ def api_create_tournament(req: TournamentRequest):
         participants.append({
             "name": a["name"], "agent_id": a["id"], "is_random": False,
             "config": {k: a[k] for k in ("aggression", "risk_tolerance", "king_priority", "edge_affinity", "trade_down")},
-            "elo": a["elo"],
+            "elo": a["elo"], "perk": a.get("perk"),
         })
         used_names.add(a["name"])
 
@@ -505,7 +578,8 @@ def api_create_tournament(req: TournamentRequest):
             red_elo = elo_snapshot[red_p["name"]]
             black_elo = elo_snapshot[black_p["name"]]
 
-            game = _run_game(red_cfg, black_cfg)
+            game = _run_game(red_cfg, black_cfg,
+                             red_perk=red_p.get("perk"), black_perk=black_p.get("perk"))
             tag = _detect_tag(game, red_elo, black_elo)
             if tag == "UPSET":
                 total_upsets += 1

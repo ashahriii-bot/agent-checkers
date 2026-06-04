@@ -14,6 +14,24 @@ DB_PATH = Path(os.environ.get("DB_PATH", str(Path(__file__).parent / "matches.db
 K_FACTOR = 32
 DEFAULT_ELO = 1200
 
+LEVEL_THRESHOLDS = {1: 0, 2: 5, 3: 15, 4: 30, 5: 50}
+VALID_PERKS = {"rope_a_dope", "press", "momentum"}
+
+
+def xp_to_level(xp: int) -> int:
+    level = 1
+    for lv in (5, 4, 3, 2):
+        if xp >= LEVEL_THRESHOLDS[lv]:
+            level = lv
+            break
+    return level
+
+
+def xp_for_next_level(level: int) -> int | None:
+    if level >= 5:
+        return None
+    return LEVEL_THRESHOLDS[level + 1]
+
 STARTER_AGENTS = [
     ("Berserker", 95, 90, 20, 20, 30),
     ("Turtle", 15, 10, 80, 70, 40),
@@ -97,12 +115,19 @@ def init_db():
             total_upsets INTEGER DEFAULT 0
         )
     """)
-    # migrate: add agent_id columns to matches if missing
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(matches)").fetchall()}
-    if "red_agent_id" not in cols:
+    # migrations
+    match_cols = {r[1] for r in conn.execute("PRAGMA table_info(matches)").fetchall()}
+    if "red_agent_id" not in match_cols:
         conn.execute("ALTER TABLE matches ADD COLUMN red_agent_id INTEGER")
-    if "black_agent_id" not in cols:
+    if "black_agent_id" not in match_cols:
         conn.execute("ALTER TABLE matches ADD COLUMN black_agent_id INTEGER")
+    agent_cols = {r[1] for r in conn.execute("PRAGMA table_info(agents)").fetchall()}
+    if "xp" not in agent_cols:
+        conn.execute("ALTER TABLE agents ADD COLUMN xp INTEGER NOT NULL DEFAULT 0")
+    if "level" not in agent_cols:
+        conn.execute("ALTER TABLE agents ADD COLUMN level INTEGER NOT NULL DEFAULT 1")
+    if "perk" not in agent_cols:
+        conn.execute("ALTER TABLE agents ADD COLUMN perk TEXT DEFAULT NULL")
     conn.commit()
     _seed_starter_agents(conn)
     conn.close()
@@ -124,6 +149,10 @@ def _seed_starter_agents(conn):
 # --- agents CRUD ---
 
 def _agent_row_to_dict(r) -> dict:
+    xp = r["xp"] if "xp" in r.keys() else 0
+    level = r["level"] if "level" in r.keys() else 1
+    perk = r["perk"] if "perk" in r.keys() else None
+    next_xp = xp_for_next_level(level)
     return {
         "id": r["id"],
         "name": r["name"],
@@ -138,6 +167,10 @@ def _agent_row_to_dict(r) -> dict:
         "draws": r["draws"],
         "matches": r["matches"],
         "win_rate": round(r["wins"] / r["matches"] * 100, 1) if r["matches"] > 0 else 0,
+        "xp": xp,
+        "level": level,
+        "perk": perk,
+        "xp_next": next_xp,
     }
 
 
@@ -221,18 +254,51 @@ def delete_agent(agent_id: int) -> bool:
     return cursor.rowcount > 0
 
 
-def update_agent_after_match(agent_id: int, new_elo: float, result: str):
+def update_agent_after_match(agent_id: int, new_elo: float, result: str) -> dict | None:
+    """Update elo, record, and XP. Returns level-up info if one occurred, else None."""
     conn = get_db()
     now = datetime.now(timezone.utc).isoformat()
     wins_inc = 1 if result == "win" else 0
     losses_inc = 1 if result == "loss" else 0
     draws_inc = 1 if result == "draw" else 0
+    row = conn.execute("SELECT xp, level, name FROM agents WHERE id=?", (agent_id,)).fetchone()
+    if not row:
+        conn.close()
+        return None
+    old_level = row["level"] if row["level"] else 1
+    old_xp = row["xp"] if row["xp"] else 0
+    new_xp = old_xp + 1
+    new_level = xp_to_level(new_xp)
     conn.execute("""
-        UPDATE agents SET elo=?, wins=wins+?, losses=losses+?, draws=draws+?, matches=matches+1, updated_at=?
-        WHERE id=?
-    """, (new_elo, wins_inc, losses_inc, draws_inc, now, agent_id))
+        UPDATE agents SET elo=?, wins=wins+?, losses=losses+?, draws=draws+?, matches=matches+1,
+        xp=?, level=?, updated_at=? WHERE id=?
+    """, (new_elo, wins_inc, losses_inc, draws_inc, new_xp, new_level, now, agent_id))
     conn.commit()
     conn.close()
+    if new_level > old_level:
+        return {"agent_id": agent_id, "name": row["name"], "old_level": old_level,
+                "new_level": new_level, "perk_unlocked": new_level >= 5}
+    return None
+
+
+def set_agent_perk(agent_id: int, perk: str | None) -> dict | None:
+    if perk is not None and perk not in VALID_PERKS:
+        return None
+    conn = get_db()
+    row = conn.execute("SELECT level FROM agents WHERE id=?", (agent_id,)).fetchone()
+    if not row:
+        conn.close()
+        return None
+    level = row["level"] if row["level"] else 1
+    if perk is not None and level < 5:
+        conn.close()
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE agents SET perk=?, updated_at=? WHERE id=?", (perk, now, agent_id))
+    conn.commit()
+    updated = conn.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+    conn.close()
+    return _agent_row_to_dict(updated)
 
 
 def get_agent_leaderboard(limit: int = 20) -> list[dict]:

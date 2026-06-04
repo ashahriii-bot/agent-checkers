@@ -108,6 +108,24 @@ def suggest_names(aggression: int, risk_tolerance: int, king_priority: int,
     return suggestions
 
 
+def apply_perk_overrides(config: AgentConfig, perk_state: dict | None) -> AgentConfig:
+    """Return a config with temporary perk slider overrides applied. Never mutates the original."""
+    if not perk_state or perk_state.get("active_moves", 0) <= 0:
+        return config
+    perk = perk_state["perk"]
+    c = AgentConfig(**config.to_dict())
+    if perk == "rope_a_dope":
+        c.risk_tolerance = max(0, config.risk_tolerance - 40)
+        c.edge_affinity = min(100, config.edge_affinity + 20)
+    elif perk == "press":
+        c.aggression = min(100, config.aggression + 40)
+        c.king_priority = min(100, config.king_priority + 20)
+    elif perk == "momentum":
+        c.aggression = min(100, config.aggression + 25)
+        c.risk_tolerance = min(100, config.risk_tolerance + 15)
+    return c
+
+
 def detect_phase(move_count: int, red_count: int, black_count: int) -> str:
     if red_count <= 4 or black_count <= 4:
         return "endgame"
