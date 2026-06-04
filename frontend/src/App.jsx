@@ -1324,6 +1324,16 @@ export default function App() {
                 <button onClick={resetGame} style={{ padding: "7px 18px", borderRadius: 6, border: "1px solid #2ecc71", background: "transparent", color: "#2ecc71", fontWeight: 700, fontSize: 10, letterSpacing: 2, textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit" }}>REMATCH</button>
               </>
             )}
+            {/* mirror-specific post-bout feedback */}
+            {isFinished && result.mirror_data && (
+              <div style={{ width: "100%", padding: "6px 10px", background: "#0a0610", border: "1px solid #9b59b633", borderRadius: 4, fontSize: 8, marginTop: 4 }}>
+                <div style={{ fontSize: 7, color: "#9b59b6", letterSpacing: 1, textTransform: "uppercase", marginBottom: 3 }}>🪞 Mirror Analysis</div>
+                <div style={{ color: "#8892a0", marginBottom: 2 }}>{result.mirror_data.mirror_strategy}</div>
+                {result.mirror_data.tendencies_exploited && <div style={{ color: "#6c5ce7", marginBottom: 2 }}>Exploited: {result.mirror_data.tendencies_exploited}</div>}
+                <div style={{ color: "#4a5568" }}>Bout #{result.mirror_data.bout_number} | {result.mirror_data.series_record} | Adaptation: {result.mirror_data.adaptation_level}%</div>
+                {result.mirror_data.milestone && <div style={{ color: "#9b59b6", fontStyle: "italic", marginTop: 2 }}>{result.mirror_data.milestone}</div>}
+              </div>
+            )}
             {isFinished && boards && moves && result.winner !== "draw" && (() => {
               // turning point analysis
               const balances = boards.map(b => {
@@ -1602,6 +1612,26 @@ export default function App() {
                       fontSize: 8, color: "#4a5568", letterSpacing: 1, textTransform: "uppercase",
                     }}>
                     🎲 RANDOM OPPONENT
+                  </div>
+                  {/* The Mirror - special adaptive opponent */}
+                  <div style={{ borderTop: "1px solid #1a1f2b", marginTop: 6, paddingTop: 6 }}>
+                    <div onClick={() => setSelectedCoach({ id: "mirror", name: "The Mirror", title: "I've been watching.", icon: "🪞" })}
+                      style={{
+                        padding: "8px 10px", borderRadius: 4, cursor: "pointer",
+                        background: selectedCoach?.id === "mirror" ? "#0f0a1a" : "#080610",
+                        border: `1px solid ${selectedCoach?.id === "mirror" ? "#9b59b666" : "#1a1a2e"}`,
+                      }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <span style={{ fontSize: 11, fontWeight: 800, color: selectedCoach?.id === "mirror" ? "#9b59b6" : "#8e7cc3" }}>🪞 THE MIRROR</span>
+                        <span style={{ fontSize: 7, fontWeight: 700, color: "#9b59b6", textTransform: "uppercase" }}>ADAPTIVE</span>
+                      </div>
+                      <div style={{ fontSize: 8, color: "#6c5ce7", fontStyle: "italic" }}>"I've been watching."</div>
+                      {selectedCoach?.id === "mirror" && (
+                        <div style={{ fontSize: 7, color: "#4a5568", marginTop: 3 }}>
+                          Learns from your entire match history. Adapts to counter your tendencies. Gets smarter with every bout.
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
               )}

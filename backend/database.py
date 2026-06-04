@@ -194,6 +194,32 @@ def init_db():
         )
     """)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS mirror_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            match_id INTEGER,
+            player_agent_id INTEGER,
+            player_config TEXT NOT NULL,
+            player_edge TEXT,
+            mirror_config TEXT NOT NULL,
+            mirror_edge TEXT,
+            winner TEXT NOT NULL,
+            player_archetype TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mirror_profile (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            total_bouts INTEGER NOT NULL DEFAULT 0,
+            player_wins INTEGER NOT NULL DEFAULT 0,
+            mirror_wins INTEGER NOT NULL DEFAULT 0,
+            draws INTEGER NOT NULL DEFAULT 0,
+            adaptation_level INTEGER NOT NULL DEFAULT 0,
+            current_read TEXT DEFAULT '{}',
+            updated_at TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS rivalries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             agent_id INTEGER NOT NULL,

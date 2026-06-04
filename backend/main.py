@@ -19,6 +19,7 @@ from engine import (
 from ai import AgentConfig, pick_move, detect_phase, calc_overextension_factor, suggest_names, apply_perk_overrides
 from auth import hash_password, verify_password, create_token, get_current_player_id, get_optional_player_id
 from coaches import COACHES, generate_bot_agent, get_coach_list
+from mirror import get_mirror_profile, get_mirror_history, generate_mirror_agent, record_mirror_bout
 from props import calculate_prop_odds, resolve_props
 from ws import router as ws_router
 from matchmaking import online
@@ -728,6 +729,18 @@ def api_online_players():
     return {"players": online.get_online(), "count": online.count}
 
 
+# --- the mirror ---
+
+@app.get("/api/mirror")
+def api_mirror_profile():
+    return get_mirror_profile()
+
+
+@app.get("/api/mirror/history")
+def api_mirror_history(limit: int = 20):
+    return {"history": get_mirror_history(limit)}
+
+
 # --- coaches ---
 
 @app.get("/api/coaches")
@@ -769,30 +782,56 @@ def api_set_perk(agent_id: int, body: dict):
 def simulate_game(req: SimulateRequest):
     bot_opponent = None
 
+    is_mirror = False
+    mirror_meta = None
+
     if req.vs_bot:
         coach_id = req.vs_bot.coach_id
         if coach_id == "random":
             coach_id = random.choice(list(COACHES.keys()))
-        coach = COACHES.get(coach_id)
-        if not coach:
-            raise HTTPException(400, f"unknown coach: {coach_id}")
+
         red_cfg, red_agent = _resolve_side(req.red_agent_id, req.red, "red")
         red_elo_before = red_agent["elo"] if red_agent else get_elo(red_cfg.config_key())
-        player_config = red_agent if red_agent else red_cfg.to_dict()
-        bot = generate_bot_agent(coach, red_elo_before, player_config=player_config)
-        black_cfg = AgentConfig(aggression=bot["aggression"], risk_tolerance=bot["risk_tolerance"],
-                                king_priority=bot["king_priority"], edge_affinity=bot["edge_affinity"],
-                                trade_down=bot["trade_down"])
-        black_agent = None
-        black_elo_before = bot["elo"]
-        black_perk = bot["perk"]
         red_perk = red_agent["perk"] if red_agent else None
-        bot_opponent = {
-            "name": bot["name"], "coach_id": bot["coach_id"], "coach_name": bot["coach_name"],
-            "aggression": bot["aggression"], "risk_tolerance": bot["risk_tolerance"],
-            "king_priority": bot["king_priority"], "edge_affinity": bot["edge_affinity"],
-            "trade_down": bot["trade_down"], "elo": bot["elo"], "perk": bot["perk"],
-        }
+        player_config = red_agent if red_agent else red_cfg.to_dict()
+
+        if coach_id == "mirror":
+            is_mirror = True
+            mirror_result = generate_mirror_agent(player_config, player_edge=red_perk)
+            mc = mirror_result["config"]
+            black_cfg = AgentConfig(**mc)
+            black_agent = None
+            black_elo_before = red_elo_before + random.randint(-30, 30)
+            black_perk = mirror_result["edge"]
+            bot_opponent = {
+                "name": mirror_result["name"], "coach_id": "mirror", "coach_name": "The Mirror",
+                **mc, "elo": black_elo_before, "perk": mirror_result["edge"],
+            }
+            mirror_meta = {
+                "adaptation_level": mirror_result["adaptation_level"],
+                "tendencies_exploited": mirror_result["tendencies_exploited"],
+                "mirror_strategy": mirror_result["strategy_description"],
+                "bout_number": mirror_result["bout_number"],
+                "milestone": mirror_result["milestone"],
+                "current_read": mirror_result["current_read"],
+            }
+        else:
+            coach = COACHES.get(coach_id)
+            if not coach:
+                raise HTTPException(400, f"unknown coach: {coach_id}")
+            bot = generate_bot_agent(coach, red_elo_before, player_config=player_config)
+            black_cfg = AgentConfig(aggression=bot["aggression"], risk_tolerance=bot["risk_tolerance"],
+                                    king_priority=bot["king_priority"], edge_affinity=bot["edge_affinity"],
+                                    trade_down=bot["trade_down"])
+            black_agent = None
+            black_elo_before = bot["elo"]
+            black_perk = bot["perk"]
+            bot_opponent = {
+                "name": bot["name"], "coach_id": bot["coach_id"], "coach_name": bot["coach_name"],
+                "aggression": bot["aggression"], "risk_tolerance": bot["risk_tolerance"],
+                "king_priority": bot["king_priority"], "edge_affinity": bot["edge_affinity"],
+                "trade_down": bot["trade_down"], "elo": bot["elo"], "perk": bot["perk"],
+            }
     else:
         red_cfg, red_agent = _resolve_side(req.red_agent_id, req.red, "red")
         black_cfg, black_agent = _resolve_side(req.black_agent_id, req.black, "black")
@@ -919,6 +958,19 @@ def simulate_game(req: SimulateRequest):
 
     if bot_opponent:
         resp["bot_opponent"] = bot_opponent
+        # mirror bout recording
+        if is_mirror and red_agent:
+            record_mirror_bout(
+                match_id=match_id, player_agent_id=red_agent["id"],
+                player_config=red_cfg.to_dict(), player_edge=red_perk,
+                mirror_config=bot_opponent, mirror_edge=bot_opponent.get("perk"),
+                winner=game["winner"],
+            )
+            mp = get_mirror_profile()
+            mirror_meta["series_record"] = f"You {mp['player_wins']} - {mp['mirror_wins']} Mirror"
+            if mp["draws"]:
+                mirror_meta["series_record"] += f" ({mp['draws']} draws)"
+            resp["mirror_data"] = mirror_meta
         # rivalry tracking for VS BOT
         if red_agent and bot_opponent.get("coach_id"):
             opp_type = f"coach:{bot_opponent['coach_id']}"
