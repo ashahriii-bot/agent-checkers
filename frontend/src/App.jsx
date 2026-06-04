@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import { gameAudio } from "./audio.js";
 
 const SIZE = 8;
 const EMPTY = 0, RED = 1, BLACK = 2, RED_KING = 3, BLACK_KING = 4, DEAD = -1;
@@ -38,6 +39,37 @@ const NOUN_POOLS = {
   edge_affinity: ["Sentinel", "Bastion", "Wall", "Keep", "Rampart"],
   trade_down: ["Grinder", "Vise", "Strangler", "Anvil", "Press"],
 };
+
+const SLIDER_DESCRIPTIONS = {
+  aggression: ["Avoids all conflict. Rarely captures.", "Cautious. Only captures when safe.", "Balanced. Takes good captures.", "Aggressive. Chases captures actively.", "Relentless. Captures at any cost."],
+  risk_tolerance: ["Extremely cautious. Never leaves pieces exposed.", "Conservative. Avoids danger.", "Moderate. Accepts some exposure.", "Bold. Advances despite threats.", "Reckless. Ignores danger completely."],
+  king_priority: ["Ignores promotion. Plays for material.", "Low promotion focus. Prefers captures.", "Balanced promotion and material play.", "Pushes for kings. Values promotion.", "Obsessed with promotion. Races for king row."],
+  edge_affinity: ["Avoids edges. Plays center board.", "Slight center preference.", "No positional bias.", "Gravitates toward edges. Builds walls.", "Hugs the edges. Full fortress mode."],
+  trade_down: ["Avoids trading. Preserves all pieces.", "Reluctant trader.", "Trades when favorable.", "Trades actively when ahead.", "Forces trades relentlessly when ahead."],
+};
+
+function getSliderDesc(key, value) {
+  const idx = value <= 20 ? 0 : value <= 40 ? 1 : value <= 60 ? 2 : value <= 80 ? 3 : 4;
+  return SLIDER_DESCRIPTIONS[key]?.[idx] || "";
+}
+
+const PRESETS_FOR_ARCHETYPE = {
+  berserker: { aggression: 95, risk_tolerance: 90, king_priority: 20, edge_affinity: 20, trade_down: 30 },
+  turtle: { aggression: 15, risk_tolerance: 10, king_priority: 80, edge_affinity: 70, trade_down: 40 },
+  balanced: { aggression: 50, risk_tolerance: 50, king_priority: 50, edge_affinity: 50, trade_down: 50 },
+  gambler: { aggression: 70, risk_tolerance: 95, king_priority: 40, edge_affinity: 30, trade_down: 60 },
+  wall: { aggression: 30, risk_tolerance: 15, king_priority: 60, edge_affinity: 95, trade_down: 80 },
+  shark: { aggression: 80, risk_tolerance: 40, king_priority: 50, edge_affinity: 30, trade_down: 95 },
+};
+
+function detectArchetype(config) {
+  let best = null, bestDist = Infinity;
+  for (const [name, preset] of Object.entries(PRESETS_FOR_ARCHETYPE)) {
+    const dist = SLIDER_KEYS.reduce((s, k) => s + Math.abs(config[k.key] - preset[k.key]), 0);
+    if (dist < bestDist) { bestDist = dist; best = name; }
+  }
+  return bestDist <= 150 ? best.toUpperCase() : "CUSTOM BUILD";
+}
 
 function localSuggestNames(config) {
   const entries = SLIDER_KEYS.map(s => ({ key: s.key, value: config[s.key] }));
@@ -128,7 +160,7 @@ function OverextWarning({ config }) {
   );
 }
 
-function Slider({ label, value, onChange, color, disabled }) {
+function Slider({ label, sliderKey, value, onChange, color, disabled, showDesc }) {
   return (
     <div style={{ marginBottom: 8 }}>
       <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
@@ -137,6 +169,7 @@ function Slider({ label, value, onChange, color, disabled }) {
       </div>
       <input type="range" min="0" max="100" value={value} disabled={disabled} onChange={(e) => onChange(parseInt(e.target.value))}
         style={{ width: "100%", background: `linear-gradient(to right, ${color} ${value}%, #1e2530 ${value}%)`, accentColor: color, opacity: disabled ? 0.5 : 1 }} />
+      {showDesc && sliderKey && <div style={{ fontSize: 7, color: "#4a5568", marginTop: 1, fontStyle: "italic" }}>{getSliderDesc(sliderKey, value)}</div>}
     </div>
   );
 }
@@ -614,7 +647,8 @@ function RosterPanel({ side, color, selectedAgent, onSelect, roster, disabled, m
             ))}
           </div>
         )}
-        {SLIDER_KEYS.map(s => <Slider key={s.key} label={s.key.replace("_", " ")} value={editConfig[s.key]} color={color} onChange={(v) => handleSliderChange(s.key, v)} disabled={false} />)}
+        {SLIDER_KEYS.map(s => <Slider key={s.key} sliderKey={s.key} label={s.key.replace("_", " ")} value={editConfig[s.key]} color={color} onChange={(v) => handleSliderChange(s.key, v)} disabled={false} showDesc={true} />)}
+        <div style={{ fontSize: 8, color: "#8892a0", marginTop: 2, padding: "2px 0" }}>ARCHETYPE: <span style={{ fontWeight: 700 }}>{detectArchetype(editConfig)}</span></div>
         <OverextWarning config={editConfig} />
         <button onClick={handleSave} disabled={saving || !editName.trim()} style={{
           width: "100%", marginTop: 8, padding: "6px 0", borderRadius: 4, border: "none",
@@ -671,6 +705,8 @@ export default function App() {
   const [appMode, setAppMode] = useState("match");
   const [matchMode, setMatchMode] = useState("vsbot");
   const [showHelp, setShowHelp] = useState(true);
+  const [muted, setMuted] = useState(false);
+  useEffect(() => { gameAudio.ensureInit(); }, []);
   const [wallet, setWallet] = useState({ balance: 1000 });
   const [currentBet, setCurrentBet] = useState(null);
   const [betOdds, setBetOdds] = useState(null);
@@ -749,6 +785,30 @@ export default function App() {
 
   const board = boards ? boards[currentStep] : null;
   const lastMove = moves && currentStep > 0 ? moves[currentStep - 1] : null;
+
+  // sound effects on step change
+  const prevStepRef = useRef(-1);
+  useEffect(() => {
+    if (!boards || !moves || currentStep === prevStepRef.current || currentStep === 0) { prevStepRef.current = currentStep; return; }
+    prevStepRef.current = currentStep;
+    const mv = moves[currentStep - 1];
+    if (!mv) return;
+    const isFast = speed < 150;
+    if (mv.captures && mv.captures.length > 0) {
+      if (mv.captures.length > 1) gameAudio.playCaptureChain(mv.captures.length);
+      else gameAudio.playCapture();
+    } else if (!isFast) {
+      gameAudio.playMove();
+    }
+    // check for shrink event
+    if (events.some(e => e.type === "shrink" && e.move === currentStep)) gameAudio.playShrink();
+    // check for king promotion (compare boards)
+    if (boards[currentStep] && boards[currentStep - 1]) {
+      const prevKings = boards[currentStep - 1].flat().filter(c => c === RED_KING || c === BLACK_KING).length;
+      const curKings = boards[currentStep].flat().filter(c => c === RED_KING || c === BLACK_KING).length;
+      if (curKings > prevKings) gameAudio.playKingPromotion();
+    }
+  }, [currentStep]);
   const activeShrinkEvent = events.find(e => e.type === "shrink" && e.move === currentStep);
   const activeFatigueEvent = events.find(e => e.type === "fatigue" && e.move === currentStep);
   const activeOverextEvent = events.find(e => e.type === "overextension" && e.move === currentStep && e.pieces_lost >= 2);
@@ -788,6 +848,9 @@ export default function App() {
             <span style={{ fontSize: 14 }}>&#x1FA99;</span>
             <span style={{ fontSize: 16, fontWeight: 800, color: "#ffd700" }}>{wallet.balance?.toLocaleString()}</span>
           </div>
+          <button onClick={() => { const next = !muted; setMuted(next); gameAudio.setMuted(next); }} style={{ padding: "3px 8px", background: "#0d1117", border: "1px solid #21262d", borderRadius: 4, color: muted ? "#4a5568" : "#8892a0", cursor: "pointer", fontFamily: "inherit", fontSize: 12 }}>
+            {muted ? "🔇" : "🔊"}
+          </button>
         </div>
         <div style={{ display: "flex", justifyContent: "center", gap: 6, marginTop: 6 }}>
           <button onClick={() => setAppMode("match")} style={{ padding: "4px 16px", fontSize: 9, fontWeight: 700, letterSpacing: 2, fontFamily: "inherit", cursor: "pointer", background: "#161b22", border: "1px solid #2ecc71", color: "#2ecc71", borderRadius: 3, textTransform: "uppercase" }}>MATCH</button>
@@ -844,6 +907,18 @@ export default function App() {
               <span style={{ fontSize: 11, fontWeight: 800, color: matchMode === "vsbot" ? "#e67e22" : "#ecf0f1" }}>
                 {matchMode === "vsbot" ? selectedCoach?.name : blackAgent?.name}
               </span>
+            </div>
+          )}
+
+          {/* material advantage bar */}
+          {boards && (
+            <div style={{ width: "100%", maxWidth: 380, display: "flex", alignItems: "center", gap: 4, marginBottom: 2 }}>
+              <span style={{ fontSize: 8, fontWeight: 700, color: "#e74c3c", width: 14, textAlign: "right" }}>{counts.red}</span>
+              <div style={{ flex: 1, height: 6, background: "#1a1f2b", borderRadius: 3, overflow: "hidden", display: "flex" }}>
+                <div style={{ width: `${(counts.red / Math.max(counts.red + counts.black, 1)) * 100}%`, background: counts.red > counts.black + 1 ? "#e74c3c" : "#c0392b88", transition: "width 0.3s ease", borderRadius: "3px 0 0 3px" }} />
+                <div style={{ flex: 1, background: counts.black > counts.red + 1 ? "#bdc3c7" : "#95a5a688", transition: "width 0.3s ease", borderRadius: "0 3px 3px 0" }} />
+              </div>
+              <span style={{ fontSize: 8, fontWeight: 700, color: "#ecf0f1", width: 14 }}>{counts.black}</span>
             </div>
           )}
 
@@ -927,6 +1002,61 @@ export default function App() {
                 <button onClick={resetGame} style={{ padding: "7px 18px", borderRadius: 6, border: "1px solid #2ecc71", background: "transparent", color: "#2ecc71", fontWeight: 700, fontSize: 10, letterSpacing: 2, textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit" }}>REMATCH</button>
               </>
             )}
+            {isFinished && boards && moves && result.winner !== "draw" && (() => {
+              // turning point analysis
+              const balances = boards.map(b => {
+                let r = 0, bl = 0;
+                for (const row of b) for (const c of row) { if (c === RED || c === RED_KING) r++; if (c === BLACK || c === BLACK_KING) bl++; }
+                return r - bl;
+              });
+              const w = result.winner;
+              let turningMove = -1;
+              for (let i = 0; i < balances.length; i++) {
+                const adv = w === "red" ? balances[i] : -balances[i];
+                if (adv >= 1) {
+                  let held = true;
+                  for (let j = i; j < balances.length; j++) { if ((w === "red" ? balances[j] : -balances[j]) < 1) { held = false; break; } }
+                  if (held) { turningMove = i; break; }
+                }
+              }
+              const leadChanges = balances.reduce((c, b, i) => i > 0 && Math.sign(b) !== Math.sign(balances[i - 1]) && balances[i - 1] !== 0 ? c + 1 : c, 0);
+              let tpText = "";
+              if (turningMove >= 0 && turningMove < balances.length - 5) {
+                const mv = moves[Math.max(0, turningMove - 1)];
+                const caps = mv?.captures?.length || 0;
+                const rp = w === "red" ? balances[turningMove] + (balances[turningMove] < 0 ? 12 : 12 - balances[turningMove]) : 12;
+                tpText = `Move ${turningMove}${caps > 0 ? `: ${caps > 1 ? caps + "x capture" : "capture"}` : ""}. ${w === "red" ? "Red" : "Black"} took the lead and held it.`;
+              } else {
+                tpText = leadChanges > 2 ? `Close match. Lead changed ${leadChanges} times. Decided in the final moves.` : `Gradual advantage. No single turning point.`;
+              }
+              // perk impact
+              const perkActs = events.filter(e => e.type === "perk_activate");
+              const perkLines = [];
+              for (const side of ["red", "black"]) {
+                const acts = perkActs.filter(e => e.side === side);
+                if (acts.length > 0) {
+                  const perkName = PERK_INFO[acts[0].perk]?.name || acts[0].perk;
+                  perkLines.push(`${side === "red" ? "Red" : "Black"}'s ${perkName} activated ${acts.length} time${acts.length > 1 ? "s" : ""}`);
+                }
+              }
+              // suggestion for the loser
+              const loser = w === "red" ? "black" : "red";
+              const loserAgent = loser === "red" ? result.red_agent : result.black_agent;
+              const loserCfg = loserAgent || {};
+              let suggestion = "Tough loss. Try a different perk or adjust sliders for this matchup.";
+              if ((loserCfg.aggression || 50) > 70 && result.move_count < 60) suggestion = "Your agent overextended. Consider lowering risk tolerance or adding Rope-a-Dope.";
+              else if ((loserCfg.aggression || 50) < 30) suggestion = "Your agent was too passive. Consider raising aggression or adding Press.";
+              else if (turningMove > 0 && turningMove < result.move_count * 0.4) suggestion = "Your agent fell behind early. Consider a more aggressive opening config.";
+              else if (result.move_count > 80) suggestion = "Long match. Consider raising king priority for better endgame play.";
+              return (
+                <div style={{ width: "100%", padding: "6px 10px", background: "#0a0c10", border: "1px solid #1a1f2b", borderRadius: 4, fontSize: 8, marginTop: 4 }}>
+                  <div style={{ fontSize: 7, color: "#4a5568", letterSpacing: 1, textTransform: "uppercase", marginBottom: 3 }}>Post-match breakdown</div>
+                  <div style={{ color: "#8892a0", marginBottom: 2 }}><span style={{ color: "#4a5568" }}>TURNING POINT:</span> {tpText}</div>
+                  {perkLines.length > 0 && <div style={{ color: "#8892a0", marginBottom: 2 }}><span style={{ color: "#4a5568" }}>PERKS:</span> {perkLines.join(". ")}</div>}
+                  <div style={{ color: "#e67e22" }}><span style={{ color: "#4a5568" }}>TIP:</span> {suggestion}</div>
+                </div>
+              );
+            })()}
             {isFinished && result.level_ups && result.level_ups.map((lu, i) => (
               <div key={i} style={{ padding: "4px 10px", borderRadius: 4, fontSize: 9, letterSpacing: 1, textTransform: "uppercase", background: lu.perk_unlocked ? "rgba(255,215,0,0.12)" : "rgba(46,204,113,0.12)", border: `1px solid ${lu.perk_unlocked ? "rgba(255,215,0,0.3)" : "rgba(46,204,113,0.3)"}`, color: lu.perk_unlocked ? "#ffd700" : "#2ecc71" }}>
                 {lu.name} reached Level {lu.new_level}{lu.perk_unlocked ? " -- Choose a perk!" : ""}
@@ -936,30 +1066,57 @@ export default function App() {
 
           {error && <p style={{ color: "#e74c3c", fontSize: 10, marginTop: 6 }}>{error}</p>}
 
-          <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 8, flexWrap: "wrap", justifyContent: "center", fontSize: 9, color: "#4a5568", textTransform: "uppercase", letterSpacing: 1 }}>
-            <span>MOVE {currentStep}/{boards ? boards.length - 1 : 0}</span>
-            <span style={{ color: "#e74c3c" }}>R {counts.red}</span>
-            <span style={{ color: "#ecf0f1" }}>B {counts.black}</span>
-            {currentPhase && currentStep > 0 && <span style={{ color: currentPhase === "opening" ? "#3498db" : currentPhase === "midgame" ? "#e67e22" : "#e74c3c", fontWeight: 700 }}>{currentPhase.toUpperCase()}</span>}
-            {currentStep >= 60 && <span style={{ color: "#e74c3c", fontWeight: 700 }}>SHRINKING</span>}
-            {Object.entries(activePerkStates).map(([side, s]) => { const pi = PERK_INFO[s.perk]; return pi ? (
-              <span key={side} style={{ color: pi.color, fontSize: 8 }}>{side === "red" ? "R" : "B"}: {pi.name} ({s.remaining})</span>
-            ) : null; })}
-            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-              <span>SPD</span>
-              <input type="range" min="50" max="800" value={850 - speed} onChange={(e) => setSpeed(850 - parseInt(e.target.value))} style={{ width: 50, background: "#1a1f2b", accentColor: "#2ecc71" }} />
-            </div>
-          </div>
-
-          {moves && currentStep > 0 && (
-            <div style={{ marginTop: 8, width: "100%", background: "#0d1117", border: "1px solid #1a1f2b", borderRadius: 6, padding: "4px 8px", maxHeight: 70, overflowY: "auto" }}>
-              {moves.slice(0, currentStep).reverse().slice(0, 6).map((m, i) => {
-                const dest = m.path[m.path.length - 1];
-                const label = `${m.side === "red" ? "RED" : "BLK"} ${String.fromCharCode(65 + m.from.col)}${SIZE - m.from.row} > ${String.fromCharCode(65 + dest.col)}${SIZE - dest.row}${m.captures.length > 0 ? ` x${m.captures.length}` : ""}`;
-                return <div key={i} style={{ fontSize: 8, padding: "1px 0", color: i === 0 ? "#c8d0da" : "#3a4450" }}>{label}</div>;
-              })}
-            </div>
-          )}
+          {/* playback controls + scrubber */}
+          {boards && (() => {
+            const maxStep = boards.length - 1;
+            const stepBack = () => { if (currentStep > 0) { playingRef.current = false; setPlaying(false); stepRef.current = currentStep - 1; setCurrentStep(currentStep - 1); } };
+            const stepFwd = () => { if (currentStep < maxStep) { playingRef.current = false; setPlaying(false); stepRef.current = currentStep + 1; setCurrentStep(currentStep + 1); } };
+            const jumpStart = () => { playingRef.current = false; setPlaying(false); stepRef.current = 0; setCurrentStep(0); };
+            const jumpEnd = () => { playingRef.current = false; setPlaying(false); stepRef.current = maxStep; setCurrentStep(maxStep); };
+            const onScrub = (e) => { const v = parseInt(e.target.value); playingRef.current = false; setPlaying(false); stepRef.current = v; setCurrentStep(v); };
+            const ctrlBtn = (label, fn) => <button onClick={fn} style={{ padding: "2px 6px", borderRadius: 3, border: "1px solid #21262d", background: "#0d1117", color: "#8892a0", fontSize: 9, cursor: "pointer", fontFamily: "inherit" }}>{label}</button>;
+            return (
+              <div style={{ width: "100%", maxWidth: 380, marginTop: 6 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 4, justifyContent: "center", marginBottom: 4 }}>
+                  {ctrlBtn("|<", jumpStart)} {ctrlBtn("<", stepBack)}
+                  {playing ? ctrlBtn("||", pause) : ctrlBtn("▶", resume)}
+                  {ctrlBtn(">", stepFwd)} {ctrlBtn(">|", jumpEnd)}
+                  <span style={{ fontSize: 8, color: "#4a5568", marginLeft: 6 }}>Move {currentStep}/{maxStep}</span>
+                  {currentPhase && currentStep > 0 && <span style={{ fontSize: 7, fontWeight: 700, color: currentPhase === "opening" ? "#3498db" : currentPhase === "midgame" ? "#e67e22" : "#e74c3c", marginLeft: 4 }}>{currentPhase.toUpperCase()}</span>}
+                  <div style={{ display: "flex", alignItems: "center", gap: 2, marginLeft: "auto" }}>
+                    <span style={{ fontSize: 7, color: "#4a5568" }}>SPD</span>
+                    <input type="range" min="50" max="800" value={850 - speed} onChange={(e) => setSpeed(850 - parseInt(e.target.value))} style={{ width: 40, background: "#1a1f2b", accentColor: "#2ecc71" }} />
+                  </div>
+                </div>
+                {/* scrubber bar with event markers */}
+                <div style={{ position: "relative", width: "100%", height: 12 }}>
+                  <input type="range" min={0} max={maxStep} value={currentStep} onChange={onScrub}
+                    style={{ width: "100%", height: 4, position: "absolute", top: 4, accentColor: "#2ecc71", background: "#1a1f2b", cursor: "pointer" }} />
+                  {maxStep > 0 && events.filter(e => e.type === "shrink" || (e.type === "perk_activate")).map((e, i) => (
+                    <div key={i} onClick={() => { stepRef.current = e.move; setCurrentStep(e.move); }} style={{
+                      position: "absolute", top: 1, width: 4, height: 4, borderRadius: "50%", cursor: "pointer",
+                      left: `${(e.move / maxStep) * 100}%`,
+                      background: e.type === "shrink" ? "#8b0000" : "#e67e22",
+                    }} />
+                  ))}
+                  {maxStep > 0 && moves && moves.map((m, i) => m.captures.length > 0 ? (
+                    <div key={`c${i}`} onClick={() => { stepRef.current = i + 1; setCurrentStep(i + 1); }} style={{
+                      position: "absolute", top: 2, width: 3, height: 3, borderRadius: "50%", cursor: "pointer",
+                      left: `${((i + 1) / maxStep) * 100}%`, background: "#e74c3c44",
+                    }} />
+                  ) : null)}
+                </div>
+                {/* perk states */}
+                {Object.keys(activePerkStates).length > 0 && (
+                  <div style={{ display: "flex", gap: 6, justifyContent: "center", marginTop: 2 }}>
+                    {Object.entries(activePerkStates).map(([side, s]) => { const pi = PERK_INFO[s.perk]; return pi ? (
+                      <span key={side} style={{ color: pi.color, fontSize: 7 }}>{side === "red" ? "R" : "B"}: {pi.name} ({s.remaining})</span>
+                    ) : null; })}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
 
           <div style={{ width: "100%", marginTop: 10 }}>
             <div style={{ display: "flex", gap: 0 }}>
