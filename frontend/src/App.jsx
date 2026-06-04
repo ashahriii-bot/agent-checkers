@@ -699,6 +699,194 @@ function RosterPanel({ side, color, selectedAgent, onSelect, roster, disabled, m
 }
 
 
+// --- multiplayer ---
+
+function MultiplayerLobby({ roster, onBack }) {
+  const [authToken, setAuthToken] = useState(null);
+  const [player, setPlayer] = useState(null);
+  const [username, setUsername] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [password, setPassword] = useState("");
+  const [authMode, setAuthMode] = useState("login");
+  const [authError, setAuthError] = useState(null);
+  const [selectedAgent, setSelectedAgent] = useState(null);
+  const [betAmount, setBetAmount] = useState(0);
+  const [wsStatus, setWsStatus] = useState("disconnected");
+  const [queueStatus, setQueueStatus] = useState(null);
+  const [matchResult, setMatchResult] = useState(null);
+  const [matchFound, setMatchFound] = useState(null);
+  const [onlineCount, setOnlineCount] = useState(0);
+  const wsRef = useRef(null);
+
+  // poll online count
+  useEffect(() => {
+    const poll = () => fetch(`${API}/players/online`).then(r => r.json()).then(d => setOnlineCount(d.count)).catch(() => {});
+    poll();
+    const iv = setInterval(poll, 10000);
+    return () => clearInterval(iv);
+  }, []);
+
+  const doAuth = async (mode) => {
+    setAuthError(null);
+    const url = mode === "register" ? `${API}/auth/register` : `${API}/auth/login`;
+    const body = mode === "register" ? { username, display_name: displayName || username, password } : { username, password };
+    try {
+      const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      if (!res.ok) { const e = await res.json(); setAuthError(e.detail || "failed"); return; }
+      const d = await res.json();
+      setAuthToken(d.token); setPlayer(d);
+    } catch { setAuthError("connection failed"); }
+  };
+
+  const connectWs = () => {
+    if (!authToken) return;
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(`${proto}//${window.location.host}/ws/play?token=${authToken}`);
+    wsRef.current = ws;
+    ws.onopen = () => setWsStatus("connected");
+    ws.onclose = () => { setWsStatus("disconnected"); setQueueStatus(null); };
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      if (msg.type === "connected") setWsStatus("connected");
+      if (msg.type === "queue_status") setQueueStatus(msg);
+      if (msg.type === "match_found") setMatchFound(msg);
+      if (msg.type === "match_result") { setMatchResult(msg); setMatchFound(null); setQueueStatus(null); }
+      if (msg.type === "bot_fallback") setQueueStatus({ ...queueStatus, bot_fallback: true });
+      if (msg.type === "queue_cancelled") setQueueStatus(null);
+    };
+  };
+
+  useEffect(() => { if (authToken) connectWs(); return () => wsRef.current?.close(); }, [authToken]);
+
+  const joinQueue = () => {
+    if (!selectedAgent || !wsRef.current) return;
+    wsRef.current.send(JSON.stringify({ type: "queue_join", agent_id: selectedAgent.id, bet_amount: betAmount }));
+    setQueueStatus({ wait_time: 0 });
+  };
+  const cancelQueue = () => { wsRef.current?.send(JSON.stringify({ type: "queue_cancel" })); setQueueStatus(null); };
+
+  // auth screen
+  if (!authToken) {
+    return (
+      <div style={{ maxWidth: 400, margin: "40px auto", padding: "20px 16px" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <h2 style={{ fontSize: 16, fontWeight: 800, letterSpacing: 4, color: "#9b59b6", textTransform: "uppercase" }}>Multiplayer</h2>
+          <button onClick={onBack} style={{ fontSize: 8, background: "none", border: "1px solid #21262d", color: "#4a5568", borderRadius: 3, padding: "3px 10px", cursor: "pointer", fontFamily: "inherit" }}>BACK</button>
+        </div>
+        <div style={{ display: "flex", gap: 4, marginBottom: 12 }}>
+          <button onClick={() => setAuthMode("login")} style={{ flex: 1, padding: "4px 0", fontSize: 9, fontFamily: "inherit", cursor: "pointer", borderRadius: 3, background: authMode === "login" ? "#161b22" : "#0d1117", border: `1px solid ${authMode === "login" ? "#9b59b6" : "#21262d"}`, color: authMode === "login" ? "#9b59b6" : "#4a5568", letterSpacing: 1 }}>LOGIN</button>
+          <button onClick={() => setAuthMode("register")} style={{ flex: 1, padding: "4px 0", fontSize: 9, fontFamily: "inherit", cursor: "pointer", borderRadius: 3, background: authMode === "register" ? "#161b22" : "#0d1117", border: `1px solid ${authMode === "register" ? "#9b59b6" : "#21262d"}`, color: authMode === "register" ? "#9b59b6" : "#4a5568", letterSpacing: 1 }}>REGISTER</button>
+        </div>
+        <input value={username} onChange={e => setUsername(e.target.value)} placeholder="Username" style={{ width: "100%", padding: "6px 10px", fontSize: 11, background: "#161b22", border: "1px solid #21262d", borderRadius: 4, color: "#c8d0da", fontFamily: "inherit", marginBottom: 6, boxSizing: "border-box" }} />
+        {authMode === "register" && <input value={displayName} onChange={e => setDisplayName(e.target.value)} placeholder="Display name" style={{ width: "100%", padding: "6px 10px", fontSize: 11, background: "#161b22", border: "1px solid #21262d", borderRadius: 4, color: "#c8d0da", fontFamily: "inherit", marginBottom: 6, boxSizing: "border-box" }} />}
+        <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Password" style={{ width: "100%", padding: "6px 10px", fontSize: 11, background: "#161b22", border: "1px solid #21262d", borderRadius: 4, color: "#c8d0da", fontFamily: "inherit", marginBottom: 8, boxSizing: "border-box" }} />
+        {authError && <div style={{ fontSize: 9, color: "#e74c3c", marginBottom: 6 }}>{authError}</div>}
+        <button onClick={() => doAuth(authMode)} style={{ width: "100%", padding: "8px 0", borderRadius: 4, border: "none", background: "linear-gradient(135deg, #9b59b6, #8e44ad)", color: "#fff", fontWeight: 700, fontSize: 11, letterSpacing: 2, cursor: "pointer", fontFamily: "inherit" }}>
+          {authMode === "register" ? "CREATE ACCOUNT" : "LOGIN"}
+        </button>
+      </div>
+    );
+  }
+
+  // match result screen
+  if (matchResult) {
+    const won = matchResult.winner === matchResult.your_side;
+    const opp = matchResult.opponent_reveal;
+    return (
+      <div style={{ maxWidth: 500, margin: "20px auto", padding: "16px" }}>
+        <h2 style={{ fontSize: 16, fontWeight: 800, letterSpacing: 4, color: won ? "#2ecc71" : "#e74c3c", textTransform: "uppercase", textAlign: "center", marginBottom: 8 }}>
+          {won ? "YOU WIN" : "YOU LOSE"}
+        </h2>
+        {matchResult.bet_result && (
+          <div style={{ textAlign: "center", fontSize: 16, fontWeight: 800, color: matchResult.bet_result.result === "win" ? "#2ecc71" : "#e74c3c", marginBottom: 8 }}>
+            {matchResult.bet_result.result === "win" ? `+${matchResult.bet_result.payout}` : `${matchResult.bet_result.net}`} coins
+          </div>
+        )}
+        <div style={{ textAlign: "center", fontSize: 9, color: "#8892a0", marginBottom: 12 }}>
+          Elo: {matchResult.elo_change.before} -> {matchResult.elo_change.after} ({matchResult.elo_change.delta > 0 ? "+" : ""}{matchResult.elo_change.delta})
+        </div>
+        <div style={{ padding: "8px 12px", background: "#0d1117", border: "1px solid #1a1f2b", borderRadius: 6, marginBottom: 12 }}>
+          <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 1, marginBottom: 4, textTransform: "uppercase" }}>Opponent revealed</div>
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#e67e22" }}>{opp.agent_name}</div>
+          <MiniBars config={opp} />
+          <div style={{ fontSize: 7, color: "#8892a0", marginTop: 2 }}>A{opp.aggression} R{opp.risk_tolerance} K{opp.king_priority} E{opp.edge_affinity} T{opp.trade_down}</div>
+          {opp.perk && <div style={{ marginTop: 2 }}><PerkBadge perk={opp.perk} /></div>}
+        </div>
+        <div style={{ maxWidth: 320, margin: "0 auto" }}>
+          <BoardGrid board={matchResult.boards[matchResult.boards.length - 1]} lastMove={null} maxWidth={320} />
+        </div>
+        <div style={{ display: "flex", gap: 8, justifyContent: "center", marginTop: 12 }}>
+          <button onClick={() => { setMatchResult(null); setMatchFound(null); }} style={{ padding: "6px 16px", borderRadius: 4, border: "1px solid #9b59b6", background: "transparent", color: "#9b59b6", fontFamily: "inherit", fontSize: 9, letterSpacing: 1, cursor: "pointer" }}>PLAY AGAIN</button>
+          <button onClick={onBack} style={{ padding: "6px 16px", borderRadius: 4, border: "1px solid #21262d", background: "transparent", color: "#4a5568", fontFamily: "inherit", fontSize: 9, letterSpacing: 1, cursor: "pointer" }}>BACK</button>
+        </div>
+      </div>
+    );
+  }
+
+  // match found countdown
+  if (matchFound) {
+    return (
+      <div style={{ maxWidth: 500, margin: "40px auto", padding: "20px 16px", textAlign: "center" }}>
+        <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 4, color: "#9b59b6", textTransform: "uppercase", marginBottom: 12 }}>Match Found</h2>
+        <div style={{ display: "flex", justifyContent: "center", alignItems: "center", gap: 20, marginBottom: 16 }}>
+          <div><div style={{ fontSize: 12, fontWeight: 700, color: "#e74c3c" }}>{selectedAgent?.name}</div><div style={{ fontSize: 9, color: "#4a5568" }}>{selectedAgent?.elo} elo</div></div>
+          <span style={{ fontSize: 11, color: "#4a5568" }}>vs</span>
+          <div><div style={{ fontSize: 12, fontWeight: 700, color: "#ecf0f1" }}>{matchFound.opponent.agent_name}</div><div style={{ fontSize: 9, color: "#4a5568" }}>{matchFound.opponent.agent_elo} elo</div></div>
+        </div>
+        {matchFound.bet_amount > 0 && <div style={{ fontSize: 9, color: "#ffd700" }}>Bet: {matchFound.bet_amount} coins at {matchFound.odds}x</div>}
+        <div style={{ fontSize: 11, color: "#4a5568", marginTop: 8 }}>Simulating...</div>
+      </div>
+    );
+  }
+
+  // lobby
+  return (
+    <div style={{ maxWidth: 500, margin: "20px auto", padding: "16px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+        <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 4, color: "#9b59b6", textTransform: "uppercase" }}>Multiplayer</h2>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <span style={{ fontSize: 8, color: "#4a5568" }}>Online: {onlineCount}</span>
+          <span style={{ fontSize: 8, color: wsStatus === "connected" ? "#2ecc71" : "#e74c3c" }}>{wsStatus === "connected" ? "CONNECTED" : "OFFLINE"}</span>
+          <button onClick={onBack} style={{ fontSize: 8, background: "none", border: "1px solid #21262d", color: "#4a5568", borderRadius: 3, padding: "3px 10px", cursor: "pointer", fontFamily: "inherit" }}>BACK</button>
+        </div>
+      </div>
+      <div style={{ fontSize: 9, color: "#8892a0", marginBottom: 4 }}>Logged in as {player?.display_name}</div>
+
+      <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 1, marginBottom: 4, marginTop: 12, textTransform: "uppercase" }}>Your agent</div>
+      <div style={{ maxHeight: 200, overflowY: "auto", marginBottom: 12 }}>
+        {roster.map(a => <AgentCard key={a.id} agent={a} selected={selectedAgent?.id === a.id} onClick={() => setSelectedAgent(a)} compact />)}
+      </div>
+
+      {selectedAgent && !queueStatus && (
+        <>
+          <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 1, marginBottom: 4, textTransform: "uppercase" }}>Bet on yourself</div>
+          <div style={{ display: "flex", gap: 4, marginBottom: 8 }}>
+            {[0, 10, 50, 100, 250].map(amt => (
+              <button key={amt} onClick={() => setBetAmount(amt)} style={{
+                padding: "3px 10px", borderRadius: 3, fontSize: 8, fontFamily: "inherit", cursor: "pointer",
+                background: betAmount === amt ? "#9b59b622" : "#161b22",
+                border: `1px solid ${betAmount === amt ? "#9b59b6" : "#21262d"}`,
+                color: betAmount === amt ? "#9b59b6" : "#8892a0",
+              }}>{amt === 0 ? "SKIP" : amt}</button>
+            ))}
+          </div>
+          <button onClick={joinQueue} style={{ width: "100%", padding: "10px 0", borderRadius: 6, border: "none", background: "linear-gradient(135deg, #9b59b6, #8e44ad)", color: "#fff", fontWeight: 800, fontSize: 12, letterSpacing: 4, cursor: "pointer", fontFamily: "inherit" }}>FIND MATCH</button>
+        </>
+      )}
+
+      {queueStatus && (
+        <div style={{ textAlign: "center", padding: "12px", background: "#0d1117", border: "1px solid #9b59b633", borderRadius: 6, marginTop: 8 }}>
+          <div style={{ fontSize: 11, color: "#9b59b6", letterSpacing: 2, marginBottom: 4 }}>SEARCHING...</div>
+          <div style={{ fontSize: 9, color: "#4a5568" }}>Wait: {queueStatus.wait_time}s | Elo range: {queueStatus.elo_range || 200}</div>
+          {queueStatus.bot_fallback && <div style={{ fontSize: 9, color: "#e67e22", marginTop: 4 }}>No opponent found. Try VS BOT from the main menu.</div>}
+          <button onClick={cancelQueue} style={{ marginTop: 8, padding: "4px 16px", borderRadius: 3, border: "1px solid #e74c3c44", background: "transparent", color: "#e74c3c", fontSize: 8, cursor: "pointer", fontFamily: "inherit", letterSpacing: 1 }}>CANCEL</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 // --- main app ---
 
 export default function App() {
@@ -838,6 +1026,9 @@ export default function App() {
   if (appMode === "tournament") {
     return <Tournament roster={roster} onBack={() => { setAppMode("match"); loadRoster(); }} loadRoster={loadRoster} />;
   }
+  if (appMode === "multiplayer") {
+    return <MultiplayerLobby roster={roster} onBack={() => { setAppMode("match"); loadRoster(); }} />;
+  }
 
   return (
     <div style={{ minHeight: "100vh", padding: "16px 12px" }}>
@@ -855,6 +1046,7 @@ export default function App() {
         <div style={{ display: "flex", justifyContent: "center", gap: 6, marginTop: 6 }}>
           <button onClick={() => setAppMode("match")} style={{ padding: "4px 16px", fontSize: 9, fontWeight: 700, letterSpacing: 2, fontFamily: "inherit", cursor: "pointer", background: "#161b22", border: "1px solid #2ecc71", color: "#2ecc71", borderRadius: 3, textTransform: "uppercase" }}>MATCH</button>
           <button onClick={() => setAppMode("tournament")} style={{ padding: "4px 16px", fontSize: 9, fontWeight: 700, letterSpacing: 2, fontFamily: "inherit", cursor: "pointer", background: "#0d1117", border: "1px solid #f39c1266", color: "#f39c12", borderRadius: 3, textTransform: "uppercase" }}>TOURNAMENT</button>
+          <button onClick={() => setAppMode("multiplayer")} style={{ padding: "4px 16px", fontSize: 9, fontWeight: 700, letterSpacing: 2, fontFamily: "inherit", cursor: "pointer", background: "#0d1117", border: "1px solid #9b59b666", color: "#9b59b6", borderRadius: 3, textTransform: "uppercase" }}>MULTIPLAYER</button>
         </div>
       </div>
 

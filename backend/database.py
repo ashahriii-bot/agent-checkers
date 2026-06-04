@@ -102,6 +102,20 @@ def init_db():
         )
     """)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS players (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            coin_balance INTEGER NOT NULL DEFAULT 1000,
+            total_wins INTEGER NOT NULL DEFAULT 0,
+            total_losses INTEGER NOT NULL DEFAULT 0,
+            total_draws INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS tournaments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,
@@ -155,6 +169,8 @@ def init_db():
         conn.execute("ALTER TABLE agents ADD COLUMN level INTEGER NOT NULL DEFAULT 1")
     if "perk" not in agent_cols:
         conn.execute("ALTER TABLE agents ADD COLUMN perk TEXT DEFAULT NULL")
+    if "player_id" not in agent_cols:
+        conn.execute("ALTER TABLE agents ADD COLUMN player_id INTEGER")
     conn.commit()
     _seed_starter_agents(conn)
     conn.close()
@@ -532,6 +548,71 @@ def get_tournament(tid: int) -> dict | None:
         "total_moves": r["total_moves"],
         "total_upsets": r["total_upsets"],
     }
+
+
+# --- players ---
+
+def create_player(username: str, display_name: str, password_hash: str) -> dict | None:
+    conn = get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO players (username, display_name, password_hash, created_at, last_seen) VALUES (?,?,?,?,?)",
+            (username, display_name, password_hash, now, now),
+        )
+        conn.commit()
+        pid = cursor.lastrowid
+    except sqlite3.IntegrityError:
+        conn.close()
+        return None
+    row = conn.execute("SELECT * FROM players WHERE id = ?", (pid,)).fetchone()
+    conn.close()
+    return _player_row_to_dict(row)
+
+
+def get_player(player_id: int) -> dict | None:
+    conn = get_db()
+    row = conn.execute("SELECT * FROM players WHERE id = ?", (player_id,)).fetchone()
+    conn.close()
+    return _player_row_to_dict(row) if row else None
+
+
+def get_player_by_username(username: str) -> dict | None:
+    conn = get_db()
+    row = conn.execute("SELECT * FROM players WHERE username = ?", (username,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    d = _player_row_to_dict(row)
+    d["password_hash"] = row["password_hash"]
+    return d
+
+
+def _player_row_to_dict(r) -> dict:
+    return {
+        "id": r["id"], "username": r["username"], "display_name": r["display_name"],
+        "coin_balance": r["coin_balance"],
+        "total_wins": r["total_wins"], "total_losses": r["total_losses"], "total_draws": r["total_draws"],
+    }
+
+
+def update_player_coins(player_id: int, delta: int):
+    conn = get_db()
+    conn.execute("UPDATE players SET coin_balance = MAX(0, coin_balance + ?) WHERE id = ?", (delta, player_id))
+    conn.commit()
+    conn.close()
+
+
+def update_player_stats(player_id: int, result: str):
+    conn = get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    w = 1 if result == "win" else 0
+    l = 1 if result == "loss" else 0
+    d = 1 if result == "draw" else 0
+    conn.execute("UPDATE players SET total_wins=total_wins+?, total_losses=total_losses+?, total_draws=total_draws+?, last_seen=? WHERE id=?",
+                 (w, l, d, now, player_id))
+    conn.commit()
+    conn.close()
 
 
 # --- wallet and betting ---

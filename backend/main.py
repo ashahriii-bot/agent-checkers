@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -17,7 +17,10 @@ from engine import (
     board_to_list, shrink_board, apply_king_fatigue, Piece, is_king,
 )
 from ai import AgentConfig, pick_move, detect_phase, calc_overextension_factor, suggest_names, apply_perk_overrides
+from auth import hash_password, verify_password, create_token, get_current_player_id, get_optional_player_id
 from coaches import COACHES, generate_bot_agent, get_coach_list
+from ws import router as ws_router
+from matchmaking import online
 from database import (
     save_match, get_matches, get_match, get_leaderboard, get_agent_leaderboard,
     get_elo, update_elo, update_elo_record,
@@ -26,9 +29,11 @@ from database import (
     set_agent_perk, VALID_PERKS,
     get_wallet, place_bet, settle_bet, get_bet_history,
     calculate_match_odds, calculate_tournament_odds,
+    create_player, get_player, get_player_by_username, update_player_coins,
 )
 
-app = FastAPI(title="Agent Checkers API", version="0.5.0")
+app = FastAPI(title="Agent Checkers API", version="0.6.0")
+app.include_router(ws_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -451,6 +456,55 @@ def api_match_odds(red_elo: float = 1200, black_elo: float = 1200):
 @app.get("/api/bets/history")
 def api_bet_history(limit: int = 20):
     return {"bets": get_bet_history(limit)}
+
+
+# --- auth ---
+
+class RegisterRequest(BaseModel):
+    username: str
+    display_name: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/auth/register")
+def api_register(req: RegisterRequest):
+    if len(req.username) < 3 or len(req.username) > 20:
+        raise HTTPException(400, "username must be 3-20 characters")
+    if len(req.password) < 4:
+        raise HTTPException(400, "password must be at least 4 characters")
+    hashed = hash_password(req.password)
+    player = create_player(req.username, req.display_name, hashed)
+    if not player:
+        raise HTTPException(400, "username already taken")
+    token = create_token(player["id"])
+    return {"player_id": player["id"], "display_name": player["display_name"], "token": token, "coin_balance": player["coin_balance"]}
+
+
+@app.post("/api/auth/login")
+def api_login(req: LoginRequest):
+    player = get_player_by_username(req.username)
+    if not player or not verify_password(req.password, player["password_hash"]):
+        raise HTTPException(401, "invalid username or password")
+    token = create_token(player["id"])
+    return {"player_id": player["id"], "display_name": player["display_name"], "token": token, "coin_balance": player["coin_balance"]}
+
+
+@app.get("/api/auth/me")
+def api_me(player_id: int = Depends(get_current_player_id)):
+    player = get_player(player_id)
+    if not player:
+        raise HTTPException(404, "player not found")
+    return player
+
+
+@app.get("/api/players/online")
+def api_online_players():
+    return {"players": online.get_online(), "count": online.count}
 
 
 # --- coaches ---
