@@ -558,8 +558,8 @@ function PerkSelector({ agentId, onSelect }) {
 // --- roster panel (match mode) ---
 
 function FormBadge({ form }) {
-  if (form === "hot") return <span style={{ fontSize: 9 }} title="Hot: 4+ wins in last 5">🔥</span>;
-  if (form === "cold") return <span style={{ fontSize: 9, opacity: 0.6 }} title="Cold: 4+ losses in last 5">🧊</span>;
+  if (form === "hot") return <span style={{ fontSize: 9 }} title="On Fire: 4+ wins in last 5">🔥</span>;
+  if (form === "cold") return <span style={{ fontSize: 9, opacity: 0.6 }} title="Ice Cold: 4+ losses in last 5">🧊</span>;
   return null;
 }
 
@@ -651,7 +651,7 @@ function RosterPanel({ side, color, selectedAgent, onSelect, roster, disabled, m
         })()}
         {selectedAgent.form && selectedAgent.form !== "neutral" && (
           <div style={{ marginTop: 3, fontSize: 7, color: selectedAgent.form === "hot" ? "#e67e22" : "#3498db" }}>
-            {selectedAgent.form === "hot" ? "🔥 HOT" : "🧊 COLD"}
+            {selectedAgent.form === "hot" ? "🔥 ON FIRE" : "🧊 ICE COLD"}
           </div>
         )}
       </div>
@@ -1075,7 +1075,7 @@ export default function App() {
           {wallet.win_streak >= 3 && (
             <span style={{ fontSize: 11, padding: "2px 6px", background: "#161b22", border: "1px solid #e67e2233", borderRadius: 4 }}>
               {wallet.win_streak >= 10 ? "💎" : wallet.win_streak >= 7 ? "🔥🔥🔥" : wallet.win_streak >= 5 ? "🔥🔥" : "🔥"}
-              <span style={{ fontSize: 9, color: "#e67e22", marginLeft: 2 }}>{wallet.win_streak} ({wallet.win_streak >= 10 ? "5" : wallet.win_streak >= 7 ? "3" : wallet.win_streak >= 5 ? "2" : "1.5"}x)</span>
+              <span style={{ fontSize: 8, color: "#e67e22", marginLeft: 2 }}>HOT STREAK {wallet.win_streak} ({wallet.win_streak >= 10 ? "5" : wallet.win_streak >= 7 ? "3" : wallet.win_streak >= 5 ? "2" : "1.5"}x HEAT)</span>
             </span>
           )}
           {jackpotPool > 0 && (
@@ -1188,7 +1188,7 @@ export default function App() {
           {canGo && !currentBet && betOdds && (
             <div style={{ width: "100%", padding: "8px 12px", background: "#0d1117", border: "1px solid #1a1f2b", borderRadius: 6, marginTop: 8 }}>
               <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 2, textTransform: "uppercase", textAlign: "center", marginBottom: 4 }}>Place your bet</div>
-              {wallet.win_streak >= 3 && <div style={{ fontSize: 8, color: "#e67e22", textAlign: "center", marginBottom: 4 }}>🔥 Streak bonus: {wallet.win_streak >= 10 ? "5" : wallet.win_streak >= 7 ? "3" : wallet.win_streak >= 5 ? "2" : "1.5"}x on all payouts</div>}
+              {wallet.win_streak >= 3 && <div style={{ fontSize: 8, color: "#e67e22", textAlign: "center", marginBottom: 4 }}>🔥 HEAT BONUS: {wallet.win_streak >= 10 ? "5" : wallet.win_streak >= 7 ? "3" : wallet.win_streak >= 5 ? "2" : "1.5"}x on all payouts</div>}
               <div style={{ display: "flex", justifyContent: "space-around", marginBottom: 6 }}>
                 <div style={{ textAlign: "center" }}>
                   <div style={{ fontSize: 8, color: "#e74c3c" }}>RED</div>
@@ -1290,9 +1290,9 @@ export default function App() {
                 </div>
                 <div style={{ fontSize: 9, color: "#8892a0" }}>{result.bet.amount} bet on {result.bet.side.toUpperCase()} at {result.bet.odds}x</div>
                 {result.bet.bankrupt && <div style={{ fontSize: 9, color: "#ffd700", marginTop: 2 }}>Bankrupt! Here's 500 coins to get back in the game.</div>}
-                {result.bet.streak && <div style={{ fontSize: 8, color: "#e67e22", marginTop: 2 }}>{result.bet.result === "win" ? `🔥 Streak: ${result.bet.streak.streak}` : "Streak broken"}</div>}
+                {result.bet.streak && <div style={{ fontSize: 8, color: "#e67e22", marginTop: 2 }}>{result.bet.result === "win" ? `🔥 HOT STREAK: ${result.bet.streak.streak}` : "HOT STREAK broken"}</div>}
                 {result.bet.effective_odds && result.bet.effective_odds !== result.bet.odds && (
-                  <div style={{ fontSize: 8, color: "#4a5568", marginTop: 1 }}>Streak boosted: {result.bet.odds}x * {result.bet.streak_mult}x = {result.bet.effective_odds}x</div>
+                  <div style={{ fontSize: 8, color: "#4a5568", marginTop: 1 }}>HEAT BONUS: {result.bet.odds}x * {result.bet.streak_mult}x = {result.bet.effective_odds}x</div>
                 )}
               </div>
             )}
@@ -1439,15 +1439,15 @@ export default function App() {
             {/* revenge offer */}
             {isFinished && result.revenge_available && (
               <div style={{ padding: "6px 10px", background: "rgba(230,126,34,0.08)", border: "1px solid rgba(230,126,34,0.25)", borderRadius: 4, textAlign: "center" }}>
-                <div style={{ fontSize: 9, color: "#e67e22", fontWeight: 700, letterSpacing: 1, marginBottom: 2 }}>⚔ REVENGE MATCH</div>
-                <div style={{ fontSize: 8, color: "#8892a0", marginBottom: 4 }}>Same opponent. Odds boosted 1.5x.</div>
+                <div style={{ fontSize: 9, color: "#e67e22", fontWeight: 700, letterSpacing: 1, marginBottom: 2 }}>⚔ RUNBACK</div>
+                <div style={{ fontSize: 8, color: "#8892a0", marginBottom: 4 }}>Same opponent. 1.5x odds boost.</div>
                 <button onClick={async () => {
                   const body = { agent_id: redAgent.id, opponent_config: result.revenge_available.opponent_config, opponent_perk: result.revenge_available.opponent_perk };
                   try {
                     const res = await fetch(`${API}/game/revenge`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
                     if (res.ok) { const d = await res.json(); setBoards(d.boards); setMoves(d.moves); setEvents(d.events || []); setResult(d); maxStepRef.current = d.boards.length - 1; stepRef.current = 0; setCurrentStep(0); playingRef.current = true; setPlaying(true); playNext(); loadWallet(); loadJackpot(); }
                   } catch {}
-                }} style={{ padding: "4px 16px", borderRadius: 3, border: "none", background: "#e67e22", color: "#fff", fontWeight: 700, fontSize: 9, letterSpacing: 1, cursor: "pointer", fontFamily: "inherit" }}>ACCEPT REVENGE</button>
+                }} style={{ padding: "4px 16px", borderRadius: 3, border: "none", background: "#e67e22", color: "#fff", fontWeight: 700, fontSize: 9, letterSpacing: 1, cursor: "pointer", fontFamily: "inherit" }}>ACCEPT RUNBACK</button>
               </div>
             )}
           </div>

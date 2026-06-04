@@ -3,14 +3,14 @@
 from database import HOUSE_EDGE
 
 PROP_TYPES = {
-    "first_blood": {"label": "First Blood", "icon": "⚔", "desc": "Which side captures first?"},
-    "king_race": {"label": "King Race", "icon": "👑", "desc": "Which side promotes a king first?"},
-    "total_moves_ou": {"label": "Total Moves", "icon": "📊", "desc": "Over or under {line} moves?"},
-    "total_captures_ou": {"label": "Total Captures", "icon": "💥", "desc": "Over or under {line} total captures?"},
-    "clean_sweep": {"label": "Clean Sweep", "icon": "🧹", "desc": "Will the winner have 5+ pieces left?"},
-    "shrink_casualty": {"label": "Shrink Casualty", "icon": "💀", "desc": "Will board shrink eliminate a piece?"},
-    "comeback": {"label": "Comeback", "icon": "🔄", "desc": "Will either side overcome a 3+ piece deficit to win?"},
-    "perk_frenzy": {"label": "Perk Frenzy", "icon": "⚡", "desc": "Will perks activate 8+ times total?"},
+    "first_blood": {"label": "FIRST BLOOD", "icon": "⚔", "desc": "Which side draws first blood?"},
+    "king_race": {"label": "CROWN RACE", "icon": "👑", "desc": "Which side crowns a king first?"},
+    "total_moves_ou": {"label": "THE DISTANCE", "icon": "📊", "desc": "Will it go the distance? Over or under {line} moves"},
+    "total_captures_ou": {"label": "BODY COUNT", "icon": "💥", "desc": "How many pieces fall? Over or under {line} captures"},
+    "clean_sweep": {"label": "BLOWOUT", "icon": "🧹", "desc": "Will the winner have 5+ pieces standing?"},
+    "shrink_casualty": {"label": "HAZARD KILL", "icon": "💀", "desc": "Will the shrinking board claim a piece?"},
+    "comeback": {"label": "THE COMEBACK", "icon": "🔄", "desc": "Will either side overcome a 3+ piece deficit?"},
+    "perk_frenzy": {"label": "POWER SURGE", "icon": "⚡", "desc": "Will perks activate 8+ times combined?"},
 }
 
 
