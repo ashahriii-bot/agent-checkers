@@ -190,15 +190,17 @@ function TournamentSetup({ roster, onStart, onBack, loading }) {
   const defaultBS = roster.length >= 5 ? 8 : 4;
   const [bracketSize, setBracketSize] = useState(defaultBS);
   const [seeding, setSeeding] = useState("elo");
+  const [opponent, setOpponent] = useState("open");
 
   const toggle = (id) => {
     const next = new Set(selected);
     if (next.has(id)) next.delete(id);
-    else if (next.size < bracketSize) next.add(id);
+    else if (next.size < (opponent === "mirror" ? Math.floor(bracketSize / 2) : bracketSize)) next.add(id);
     setSelected(next);
   };
 
-  const randomFill = bracketSize - selected.size;
+  const maxAgents = opponent === "mirror" ? Math.floor(bracketSize / 2) : bracketSize;
+  const randomFill = opponent === "mirror" ? 0 : bracketSize - selected.size;
   const btnStyle = (active) => ({
     padding: "4px 12px", fontSize: 9, fontWeight: 700, letterSpacing: 2, fontFamily: "inherit", cursor: "pointer",
     background: active ? "#161b22" : "#0d1117", border: `1px solid ${active ? "#2ecc71" : "#21262d"}`,
@@ -229,7 +231,20 @@ function TournamentSetup({ roster, onStart, onBack, loading }) {
         </div>
       </div>
 
-      <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 1, marginBottom: 6 }}>SELECT AGENTS ({selected.size}/{bracketSize})</div>
+      <div style={{ display: "flex", gap: 12, marginBottom: 12 }}>
+        <div>
+          <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 1, marginBottom: 4 }}>OPPONENT</div>
+          <div style={{ display: "flex", gap: 4 }}>
+            <button onClick={() => { setOpponent("open"); }} style={btnStyle(opponent === "open")}>OPEN</button>
+            <button onClick={() => { setOpponent("mirror"); setSelected(s => { const n = new Set(s); while (n.size > Math.floor(bracketSize / 2)) n.delete([...n].pop()); return n; }); }}
+              style={{ ...btnStyle(opponent === "mirror"), color: opponent === "mirror" ? "#9b59b6" : "#4a5568", borderColor: opponent === "mirror" ? "#9b59b6" : "#21262d" }}>🪞 MIRROR</button>
+          </div>
+        </div>
+      </div>
+
+      {opponent === "mirror" && <div style={{ fontSize: 9, color: "#9b59b6", marginBottom: 8 }}>Pick up to {maxAgents} agents. The Mirror will generate {maxAgents} counter-agents to fill the bracket.</div>}
+
+      <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 1, marginBottom: 6 }}>SELECT AGENTS ({selected.size}/{maxAgents})</div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))", gap: 6, marginBottom: 12 }}>
         {roster.map(a => {
           const sel = selected.has(a.id);
@@ -249,11 +264,11 @@ function TournamentSetup({ roster, onStart, onBack, loading }) {
         })}
       </div>
 
-      {randomFill > 0 && selected.size >= 2 && (
+      {randomFill > 0 && selected.size >= 2 && opponent === "open" && (
         <div style={{ fontSize: 9, color: "#4a5568", marginBottom: 12 }}>{randomFill} random agent{randomFill > 1 ? "s" : ""} will fill remaining slots</div>
       )}
 
-      <button onClick={() => onStart([...selected], bracketSize, seeding)} disabled={selected.size < 2 || loading}
+      <button onClick={() => onStart([...selected], bracketSize, seeding, opponent === "mirror" ? "mirror" : null)} disabled={selected.size < 2 || loading}
         style={{
           padding: "10px 36px", borderRadius: 6, border: "none", fontFamily: "inherit",
           background: selected.size >= 2 ? "linear-gradient(135deg, #f39c12, #e67e22)" : "#21262d",
@@ -457,12 +472,14 @@ function Tournament({ roster, onBack, loadRoster }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
 
-  const startTournament = async (agentIds, bracketSize, seeding) => {
+  const startTournament = async (agentIds, bracketSize, seeding, mirrorCoach) => {
     setLoading(true);
     try {
+      const body = { agent_ids: agentIds, bracket_size: bracketSize, seeding };
+      if (mirrorCoach) body.vs_bot = { coach_id: mirrorCoach };
       const res = await fetch(`${API}/tournaments`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ agent_ids: agentIds, bracket_size: bracketSize, seeding }),
+        body: JSON.stringify(body),
       });
       if (!res.ok) throw new Error(`API error: ${res.status}`);
       const d = await res.json();

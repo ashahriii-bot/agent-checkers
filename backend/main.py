@@ -1023,21 +1023,44 @@ def api_create_tournament(req: TournamentRequest):
 
     # fill remaining slots
     bot_coach = None
+    is_mirror_tournament = False
     if req.vs_bot:
         coach_id = req.vs_bot.coach_id
         if coach_id == "random":
             coach_id = random.choice(list(COACHES.keys()))
-        bot_coach = COACHES.get(coach_id)
-        if not bot_coach:
-            raise HTTPException(400, f"unknown coach: {coach_id}")
-        player_avg_elo = sum(p["elo"] for p in participants) / len(participants) if participants else 1200
-        while len(participants) < req.bracket_size:
-            bot = generate_bot_agent(bot_coach, player_avg_elo, used_names=used_names)
-            participants.append({
-                "name": bot["name"], "agent_id": None, "is_random": True, "is_bot": True,
-                "config": {k: bot[k] for k in ("aggression", "risk_tolerance", "king_priority", "edge_affinity", "trade_down")},
-                "elo": bot["elo"], "perk": bot["perk"], "coach_id": bot_coach.id, "coach_name": bot_coach.name,
-            })
+
+        if coach_id == "mirror":
+            is_mirror_tournament = True
+            player_avg_elo = sum(p["elo"] for p in participants) / len(participants) if participants else 1200
+            # generate mirror counter-agents, each targeting a different player agent
+            mirror_idx = 0
+            while len(participants) < req.bracket_size:
+                # cycle through player agents to target
+                target = participants[mirror_idx % len(participants)] if participants else None
+                target_config = target["config"] if target else None
+                target_edge = target.get("perk") if target else None
+                mirror_agent = generate_mirror_agent(target_config or {}, player_edge=target_edge)
+                mc = mirror_agent["config"]
+                elo = player_avg_elo + random.randint(-30, 30)
+                participants.append({
+                    "name": mirror_agent["name"], "agent_id": None, "is_random": True, "is_bot": True,
+                    "config": mc, "elo": round(elo, 1), "perk": mirror_agent["edge"],
+                    "coach_id": "mirror", "coach_name": "The Mirror",
+                })
+                used_names.add(mirror_agent["name"])
+                mirror_idx += 1
+        else:
+            bot_coach = COACHES.get(coach_id)
+            if not bot_coach:
+                raise HTTPException(400, f"unknown coach: {coach_id}")
+            player_avg_elo = sum(p["elo"] for p in participants) / len(participants) if participants else 1200
+            while len(participants) < req.bracket_size:
+                bot = generate_bot_agent(bot_coach, player_avg_elo, used_names=used_names)
+                participants.append({
+                    "name": bot["name"], "agent_id": None, "is_random": True, "is_bot": True,
+                    "config": {k: bot[k] for k in ("aggression", "risk_tolerance", "king_priority", "edge_affinity", "trade_down")},
+                    "elo": bot["elo"], "perk": bot["perk"], "coach_id": bot_coach.id, "coach_name": bot_coach.name,
+                })
     else:
         while len(participants) < req.bracket_size:
             participants.append(_generate_random_agent(used_names))
@@ -1227,12 +1250,14 @@ def api_create_tournament(req: TournamentRequest):
             "balance_after": settle_result["balance"], "bankrupt": settle_result["bankrupt"],
         }
 
-    if bot_coach:
+    if bot_coach or is_mirror_tournament:
         player_wins = sum(1 for m in all_match_data if not bracket_agents[m["winner_slot"]].get("is_bot"))
         bot_wins = sum(1 for m in all_match_data if bracket_agents[m["winner_slot"]].get("is_bot"))
+        coach_label = "The Mirror" if is_mirror_tournament else bot_coach.name
+        coach_id_label = "mirror" if is_mirror_tournament else bot_coach.id
         resp["teams"] = {
             "player": {"wins": player_wins},
-            "bot": {"coach_id": bot_coach.id, "coach_name": bot_coach.name, "wins": bot_wins},
+            "bot": {"coach_id": coach_id_label, "coach_name": coach_label, "wins": bot_wins},
             "team_result": "player" if player_wins > bot_wins else "bot" if bot_wins > player_wins else "split",
         }
 
