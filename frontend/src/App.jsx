@@ -588,7 +588,7 @@ function AgentCard({ agent, selected, onClick, compact }) {
   );
 }
 
-function RosterPanel({ side, color, selectedAgent, onSelect, roster, disabled, matchElo, matchEloDelta, onRosterChange }) {
+function RosterPanel({ side, color, selectedAgent, onSelect, roster, disabled, matchElo, matchEloDelta, onRosterChange, perkStatus }) {
   const [mode, setMode] = useState("roster");
   const [editConfig, setEditConfig] = useState({ ...defaultConfig });
   const [editName, setEditName] = useState("");
@@ -633,7 +633,27 @@ function RosterPanel({ side, color, selectedAgent, onSelect, roster, disabled, m
           </div>
         )}
         <MiniBars config={selectedAgent} /><OverextWarning config={selectedAgent} />
-        <div style={{ marginTop: 6, fontSize: 7, color: "#4a5568" }}>{SLIDER_KEYS.map(s => `${s.short}${selectedAgent[s.key]}`).join("  ")}</div>
+        <div style={{ marginTop: 4, fontSize: 7, color: "#4a5568" }}>{SLIDER_KEYS.map(s => `${s.short}${selectedAgent[s.key]}`).join("  ")}</div>
+        {selectedAgent.perk && <div style={{ marginTop: 2 }}><PerkBadge perk={selectedAgent.perk} /></div>}
+        {perkStatus && perkStatus.remaining > 0 && (() => {
+          const pi = PERK_INFO[perkStatus.perk];
+          return pi ? (
+            <div style={{ marginTop: 4, padding: "3px 6px", borderRadius: 3, background: pi.color + "15", border: `1px solid ${pi.color}33`, transition: "all 0.2s" }}>
+              <div style={{ fontSize: 8, fontWeight: 700, color: pi.color }}>{pi.icon} {pi.name} ACTIVE</div>
+              <div style={{ display: "flex", alignItems: "center", gap: 4, marginTop: 2 }}>
+                <div style={{ flex: 1, height: 3, background: "#1a1f2b", borderRadius: 2, overflow: "hidden" }}>
+                  <div style={{ width: `${(perkStatus.remaining / (perkStatus.perk === "press" ? 4 : perkStatus.perk === "rope_a_dope" ? 3 : 2)) * 100}%`, height: "100%", background: pi.color, borderRadius: 2, transition: "width 0.3s" }} />
+                </div>
+                <span style={{ fontSize: 7, color: pi.color }}>{perkStatus.remaining}</span>
+              </div>
+            </div>
+          ) : null;
+        })()}
+        {selectedAgent.form && selectedAgent.form !== "neutral" && (
+          <div style={{ marginTop: 3, fontSize: 7, color: selectedAgent.form === "hot" ? "#e67e22" : "#3498db" }}>
+            {selectedAgent.form === "hot" ? "🔥 HOT" : "🧊 COLD"}
+          </div>
+        )}
       </div>
     );
   }
@@ -1100,19 +1120,10 @@ export default function App() {
 
       <div style={{ display: "flex", gap: 12, maxWidth: 1060, margin: "0 auto", alignItems: "flex-start", flexWrap: "wrap", justifyContent: "center" }}>
         <div style={{ width: 220, flexShrink: 0 }}>
-          <RosterPanel side="red" color="#e74c3c" selectedAgent={redAgent} onSelect={setRedAgent} roster={roster} disabled={playing || loading || !!boards} onRosterChange={loadRoster} matchElo={isFinished ? redElo : null} matchEloDelta={isFinished ? redEloDelta : null} />
+          <RosterPanel side="red" color="#e74c3c" selectedAgent={redAgent} onSelect={setRedAgent} roster={roster} disabled={playing || loading || !!boards} onRosterChange={loadRoster} matchElo={isFinished ? redElo : null} matchEloDelta={isFinished ? redEloDelta : null} perkStatus={activePerkStates?.red} />
         </div>
 
         <div style={{ display: "flex", flexDirection: "column", alignItems: "center", flex: 1, minWidth: 280, maxWidth: 400 }}>
-          {activeShrinkEvent && <div style={{ background: "rgba(231,76,60,0.15)", border: "1px solid rgba(231,76,60,0.3)", borderRadius: 4, padding: "4px 10px", marginBottom: 6, fontSize: 10, color: "#e74c3c", letterSpacing: 1, textTransform: "uppercase" }}>board shrinking: {activeShrinkEvent.killed.length} squares eliminated</div>}
-          {activeFatigueEvent && <div style={{ background: "rgba(241,196,15,0.15)", border: "1px solid rgba(241,196,15,0.3)", borderRadius: 4, padding: "4px 10px", marginBottom: 6, fontSize: 10, color: "#f1c40f", letterSpacing: 1, textTransform: "uppercase" }}>king fatigue: idle kings demoted</div>}
-          {activeOverextEvent && <div style={{ background: "rgba(230,126,34,0.15)", border: "1px solid rgba(230,126,34,0.3)", borderRadius: 4, padding: "4px 10px", marginBottom: 6, fontSize: 10, color: "#e67e22", letterSpacing: 1, textTransform: "uppercase" }}>overextension: {activeOverextEvent.side} lost {activeOverextEvent.pieces_lost} pieces on a bad trade</div>}
-          {activePerkEvent && (() => { const pi = PERK_INFO[activePerkEvent.perk]; return pi ? (
-            <div style={{ background: pi.color + "18", border: `1px solid ${pi.color}44`, borderRadius: 4, padding: "4px 10px", marginBottom: 6, fontSize: 10, color: pi.color, letterSpacing: 1, textTransform: "uppercase" }}>
-              {activePerkEvent.side}: {pi.name} ({activePerkEvent.duration} moves)
-            </div>
-          ) : null; })()}
-
           {!boards && redAgent && (matchMode === "sandbox" ? blackAgent : selectedCoach) && (
             <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
               <span style={{ fontSize: 11, fontWeight: 800, color: "#e74c3c" }}>{redAgent.name}</span>
@@ -1123,37 +1134,52 @@ export default function App() {
             </div>
           )}
 
-          {/* win probability meter */}
-          {boards && result?.win_probability && (() => {
-            const wp = result.win_probability[currentStep] || 0.5;
-            const redPct = Math.round(wp * 100);
-            const blackPct = 100 - redPct;
-            return (
-              <div style={{ width: "100%", maxWidth: 380, marginBottom: 2 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 1 }}>
-                  <span style={{ fontSize: redPct >= 50 ? 10 : 8, fontWeight: redPct >= 50 ? 800 : 400, color: "#e74c3c" }}>{redPct}%</span>
-                  <span style={{ fontSize: blackPct >= 50 ? 10 : 8, fontWeight: blackPct >= 50 ? 800 : 400, color: "#ecf0f1" }}>{blackPct}%</span>
+          {/* stable board container: NEVER shifts position */}
+          <div style={{ position: "relative", width: "100%", maxWidth: 380 }}>
+            {/* win probability meter - inside stable container */}
+            {boards && result?.win_probability && (() => {
+              const wp = result.win_probability[currentStep] || 0.5;
+              const redPct = Math.round(wp * 100);
+              const blackPct = 100 - redPct;
+              return (
+                <div style={{ marginBottom: 2 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 1 }}>
+                    <span style={{ fontSize: redPct >= 50 ? 10 : 8, fontWeight: redPct >= 50 ? 800 : 400, color: "#e74c3c" }}>{redPct}%</span>
+                    <span style={{ fontSize: blackPct >= 50 ? 10 : 8, fontWeight: blackPct >= 50 ? 800 : 400, color: "#ecf0f1" }}>{blackPct}%</span>
+                  </div>
+                  <div style={{ display: "flex", height: 6, borderRadius: 3, overflow: "hidden", background: "#1a1f2b" }}>
+                    <div style={{ width: `${redPct}%`, background: redPct > 60 ? "#e74c3c" : "#c0392b88", transition: "width 0.2s ease" }} />
+                    <div style={{ flex: 1, background: blackPct > 60 ? "#bdc3c7" : "#95a5a688", transition: "width 0.2s ease" }} />
+                  </div>
                 </div>
-                <div style={{ display: "flex", height: 6, borderRadius: 3, overflow: "hidden", background: "#1a1f2b" }}>
-                  <div style={{ width: `${redPct}%`, background: redPct > 60 ? "#e74c3c" : "#c0392b88", transition: "width 0.2s ease" }} />
-                  <div style={{ flex: 1, background: blackPct > 60 ? "#bdc3c7" : "#95a5a688", transition: "width 0.2s ease" }} />
+              );
+            })()}
+            {/* material bar */}
+            {boards && (
+              <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 2 }}>
+                <span style={{ fontSize: 8, fontWeight: 700, color: "#e74c3c", width: 14, textAlign: "right" }}>{counts.red}</span>
+                <div style={{ flex: 1, height: 4, background: "#1a1f2b", borderRadius: 2, overflow: "hidden", display: "flex" }}>
+                  <div style={{ width: `${(counts.red / Math.max(counts.red + counts.black, 1)) * 100}%`, background: counts.red > counts.black + 1 ? "#e74c3c" : "#c0392b88", transition: "width 0.3s ease" }} />
+                  <div style={{ flex: 1, background: counts.black > counts.red + 1 ? "#bdc3c7" : "#95a5a688", transition: "width 0.3s ease" }} />
                 </div>
+                <span style={{ fontSize: 8, fontWeight: 700, color: "#ecf0f1", width: 14 }}>{counts.black}</span>
               </div>
-            );
-          })()}
-          {/* material advantage bar */}
-          {boards && (
-            <div style={{ width: "100%", maxWidth: 380, display: "flex", alignItems: "center", gap: 4, marginBottom: 2 }}>
-              <span style={{ fontSize: 8, fontWeight: 700, color: "#e74c3c", width: 14, textAlign: "right" }}>{counts.red}</span>
-              <div style={{ flex: 1, height: 4, background: "#1a1f2b", borderRadius: 2, overflow: "hidden", display: "flex" }}>
-                <div style={{ width: `${(counts.red / Math.max(counts.red + counts.black, 1)) * 100}%`, background: counts.red > counts.black + 1 ? "#e74c3c" : "#c0392b88", transition: "width 0.3s ease" }} />
-                <div style={{ flex: 1, background: counts.black > counts.red + 1 ? "#bdc3c7" : "#95a5a688", transition: "width 0.3s ease" }} />
-              </div>
-              <span style={{ fontSize: 8, fontWeight: 700, color: "#ecf0f1", width: 14 }}>{counts.black}</span>
-            </div>
-          )}
+            )}
 
-          <BoardGrid board={board} lastMove={lastMove} />
+            {/* board with overlaid event banners */}
+            <div style={{ position: "relative" }}>
+              <BoardGrid board={board} lastMove={lastMove} />
+              {/* overlay banners: position absolute, no layout shift */}
+              {activeShrinkEvent && <div style={{ position: "absolute", top: 0, left: 0, right: 0, padding: "6px 12px", background: "rgba(231,76,60,0.88)", borderRadius: "6px 6px 0 0", fontSize: 10, color: "#fff", letterSpacing: 1, textTransform: "uppercase", textAlign: "center", zIndex: 10 }}>board shrinking: {activeShrinkEvent.killed.length} squares eliminated</div>}
+              {activeFatigueEvent && <div style={{ position: "absolute", top: 0, left: 0, right: 0, padding: "6px 12px", background: "rgba(241,196,15,0.88)", borderRadius: "6px 6px 0 0", fontSize: 10, color: "#0d1117", letterSpacing: 1, textTransform: "uppercase", textAlign: "center", zIndex: 10 }}>king fatigue: idle kings demoted</div>}
+              {activeOverextEvent && <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, padding: "6px 12px", background: "rgba(230,126,34,0.88)", borderRadius: "0 0 6px 6px", fontSize: 10, color: "#fff", letterSpacing: 1, textTransform: "uppercase", textAlign: "center", zIndex: 10 }}>overextension: {activeOverextEvent.side} lost {activeOverextEvent.pieces_lost} pieces</div>}
+              {activePerkEvent && (() => { const pi = PERK_INFO[activePerkEvent.perk]; return pi ? (
+                <div style={{ position: "absolute", top: 0, left: 0, right: 0, padding: "4px 12px", background: pi.color + "dd", borderRadius: "6px 6px 0 0", fontSize: 9, color: "#fff", letterSpacing: 1, textTransform: "uppercase", textAlign: "center", zIndex: 10 }}>
+                  {activePerkEvent.side}: {pi.name} ({activePerkEvent.duration} moves)
+                </div>
+              ) : null; })()}
+            </div>
+          </div>
 
           {/* betting panel / bet indicator */}
           {canGo && !currentBet && betOdds && (
