@@ -926,6 +926,8 @@ export default function App() {
   const [wallet, setWallet] = useState({ balance: 1000, win_streak: 0 });
   const [jackpotPool, setJackpotPool] = useState(0);
   const [currentBet, setCurrentBet] = useState(null);
+  const [propBets, setPropBets] = useState([]);
+  const [propOdds, setPropOdds] = useState(null);
   const [betOdds, setBetOdds] = useState(null);
   const [coaches, setCoaches] = useState([]);
   const [selectedCoach, setSelectedCoach] = useState(null);
@@ -962,9 +964,9 @@ export default function App() {
   useEffect(() => { loadRoster(); loadHistory(); loadLeaderboard(); loadWallet(); loadCoaches(); loadJackpot(); }, []);
   useEffect(() => { if (roster.length >= 2 && !redAgent && !blackAgent && !boards) { setRedAgent(roster[0]); setBlackAgent(roster[1]); } }, [roster]);
   useEffect(() => {
-    if (matchMode === "vsbot" && redAgent && selectedCoach) loadOdds(redAgent.elo, redAgent.elo);
-    else if (matchMode === "sandbox" && redAgent && blackAgent) loadOdds(redAgent.elo, blackAgent.elo);
-    else setBetOdds(null);
+    if (matchMode === "vsbot" && redAgent && selectedCoach) { loadOdds(redAgent.elo, redAgent.elo); fetch(`${API}/odds/props?red_agent_id=${redAgent.id}`).then(r => r.json()).then(d => setPropOdds(d.props)).catch(() => {}); }
+    else if (matchMode === "sandbox" && redAgent && blackAgent) { loadOdds(redAgent.elo, blackAgent.elo); fetch(`${API}/odds/props?red_agent_id=${redAgent.id}&black_agent_id=${blackAgent.id}`).then(r => r.json()).then(d => setPropOdds(d.props)).catch(() => {}); }
+    else { setBetOdds(null); setPropOdds(null); }
   }, [redAgent?.id, blackAgent?.id, selectedCoach?.id, matchMode]);
 
   const startGame = async () => {
@@ -980,6 +982,7 @@ export default function App() {
         body.black_agent_id = blackAgent.id;
       }
       if (currentBet) body.bet = currentBet;
+      if (propBets.length > 0) body.prop_bets = propBets;
       const res = await fetch(`${API}/game/simulate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       if (!res.ok) throw new Error(`API error: ${res.status}`);
       const data = await res.json();
@@ -999,7 +1002,7 @@ export default function App() {
 
   const pause = () => { playingRef.current = false; setPlaying(false); };
   const resume = () => { if (stepRef.current >= maxStepRef.current) return; playingRef.current = true; setPlaying(true); playNext(); };
-  const resetGame = () => { setBoards(null); setMoves(null); setResult(null); setEvents([]); setCurrentStep(0); setCurrentBet(null); loadRoster(); loadWallet(); };
+  const resetGame = () => { setBoards(null); setMoves(null); setResult(null); setEvents([]); setCurrentStep(0); setCurrentBet(null); setPropBets([]); loadRoster(); loadWallet(); loadJackpot(); };
 
   const board = boards ? boards[currentStep] : null;
   const lastMove = moves && currentStep > 0 ? moves[currentStep - 1] : null;
@@ -1233,6 +1236,41 @@ export default function App() {
           )}
           {canGo && !betOdds && <button onClick={startGame} style={{ marginTop: 8, padding: "10px 36px", borderRadius: 6, border: "none", background: "linear-gradient(135deg, #2ecc71, #27ae60)", color: "#fff", fontWeight: 800, fontSize: 14, letterSpacing: 4, textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit", boxShadow: "0 0 24px rgba(46,204,113,0.3)" }}>GO</button>}
 
+          {/* prop bets panel */}
+          {canGo && propOdds && propOdds.length > 0 && (
+            <div style={{ width: "100%", marginTop: 6, padding: "6px 10px", background: "#0d1117", border: "1px solid #1a1f2b", borderRadius: 6 }}>
+              <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 1, textTransform: "uppercase", marginBottom: 4, textAlign: "center" }}>Prop bets (up to 4)</div>
+              <div style={{ maxHeight: 160, overflowY: "auto" }}>
+                {propOdds.map(p => {
+                  const existing = propBets.find(b => b.type === p.type);
+                  return (
+                    <div key={p.type} style={{ padding: "4px 6px", marginBottom: 3, background: existing ? "#161b22" : "#0a0c10", border: `1px solid ${existing ? "#2ecc7144" : "#1a1f2b"}`, borderRadius: 3 }}>
+                      <div style={{ fontSize: 8, fontWeight: 700, color: "#8892a0" }}>{p.icon} {p.label}</div>
+                      <div style={{ display: "flex", gap: 3, marginTop: 2 }}>
+                        {p.options.map(o => (
+                          <button key={o.selection} onClick={() => {
+                            if (propBets.length >= 4 && !existing) return;
+                            setPropBets(prev => {
+                              const filtered = prev.filter(b => b.type !== p.type);
+                              if (existing?.selection === o.selection) return filtered;
+                              return [...filtered, { type: p.type, selection: o.selection, amount: 20 }];
+                            });
+                          }} style={{
+                            padding: "1px 6px", borderRadius: 2, fontSize: 7, fontFamily: "inherit", cursor: "pointer",
+                            background: existing?.selection === o.selection ? "#2ecc7122" : "#0d1117",
+                            border: `1px solid ${existing?.selection === o.selection ? "#2ecc71" : "#21262d"}`,
+                            color: existing?.selection === o.selection ? "#2ecc71" : "#4a5568",
+                          }}>{o.label} {o.odds}x</button>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              {propBets.length > 0 && <div style={{ fontSize: 7, color: "#4a5568", textAlign: "center", marginTop: 3 }}>Props: {propBets.length}/4 | Cost: {propBets.reduce((s, b) => s + b.amount, 0)}</div>}
+            </div>
+          )}
+
           {/* bet indicator during match */}
           {boards && result?.bet && (
             <div style={{ width: "100%", padding: "3px 10px", background: result.bet.side === "red" ? "rgba(231,76,60,0.08)" : result.bet.side === "black" ? "rgba(236,240,241,0.06)" : "rgba(74,85,104,0.1)", borderRadius: 3, textAlign: "center", fontSize: 8, color: "#ffd700", marginTop: 4 }}>
@@ -1346,6 +1384,37 @@ export default function App() {
                 {lu.name} reached Level {lu.new_level}{lu.perk_unlocked ? " -- Choose a perk!" : ""}
               </div>
             ))}
+            {/* prop bet results */}
+            {isFinished && result.prop_results && result.prop_results.length > 0 && (
+              <div style={{ width: "100%", padding: "4px 8px", background: "#0a0c10", border: "1px solid #1a1f2b", borderRadius: 4, fontSize: 8, marginTop: 4 }}>
+                <div style={{ fontSize: 7, color: "#4a5568", letterSpacing: 1, textTransform: "uppercase", marginBottom: 2 }}>Prop results</div>
+                {result.prop_results.map((pr, i) => (
+                  <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "1px 0", color: pr.result === "win" ? "#2ecc71" : pr.result === "push" ? "#f39c12" : "#e74c3c" }}>
+                    <span>{pr.result === "win" ? "✅" : pr.result === "push" ? "↩" : "❌"} {pr.label}: {pr.selection}{pr.resolved_at_move ? ` (move ${pr.resolved_at_move})` : ""}</span>
+                    <span style={{ fontWeight: 700 }}>{pr.result === "win" ? `+${pr.payout}` : pr.result === "push" ? `↩${pr.payout}` : `-${pr.amount}`}</span>
+                  </div>
+                ))}
+                <div style={{ borderTop: "1px solid #1a1f2b", marginTop: 2, paddingTop: 2, display: "flex", justifyContent: "space-between", color: "#8892a0" }}>
+                  <span>Props net:</span>
+                  <span style={{ fontWeight: 700, color: result.prop_results.reduce((s, p) => s + (p.result === "win" || p.result === "push" ? p.payout : 0) - p.amount, 0) >= 0 ? "#2ecc71" : "#e74c3c" }}>
+                    {result.prop_results.reduce((s, p) => s + (p.result === "win" || p.result === "push" ? p.payout : 0) - p.amount, 0) >= 0 ? "+" : ""}{result.prop_results.reduce((s, p) => s + (p.result === "win" || p.result === "push" ? p.payout : 0) - p.amount, 0)}
+                  </span>
+                </div>
+              </div>
+            )}
+            {/* live prop tracker during match */}
+            {boards && !isFinished && result?.prop_results && result.prop_results.length > 0 && (
+              <div style={{ display: "flex", gap: 4, flexWrap: "wrap", justifyContent: "center", marginTop: 2 }}>
+                {result.prop_results.map((pr, i) => {
+                  const resolved = pr.resolved_at_move != null && pr.resolved_at_move <= currentStep;
+                  return (
+                    <span key={i} style={{ fontSize: 7, padding: "1px 4px", borderRadius: 2, background: resolved ? (pr.result === "win" ? "#2ecc7122" : "#e74c3c22") : "#161b22", border: `1px solid ${resolved ? (pr.result === "win" ? "#2ecc71" : "#e74c3c") : "#21262d"}`, color: resolved ? (pr.result === "win" ? "#2ecc71" : "#e74c3c") : "#4a5568" }}>
+                      {pr.label}: {pr.selection} {resolved ? (pr.result === "win" ? "✅" : "❌") : "..."}
+                    </span>
+                  );
+                })}
+              </div>
+            )}
             {/* new personal bests */}
             {isFinished && result.new_records && result.new_records.length > 0 && (
               <div style={{ padding: "4px 10px", background: "rgba(255,215,0,0.06)", border: "1px solid rgba(255,215,0,0.15)", borderRadius: 4, fontSize: 8 }}>

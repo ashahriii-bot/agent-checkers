@@ -19,6 +19,7 @@ from engine import (
 from ai import AgentConfig, pick_move, detect_phase, calc_overextension_factor, suggest_names, apply_perk_overrides
 from auth import hash_password, verify_password, create_token, get_current_player_id, get_optional_player_id
 from coaches import COACHES, generate_bot_agent, get_coach_list
+from props import calculate_prop_odds, resolve_props
 from ws import router as ws_router
 from matchmaking import online
 from database import (
@@ -108,6 +109,12 @@ class VsBotSchema(BaseModel):
     coach_id: str
 
 
+class PropBetInput(BaseModel):
+    type: str
+    selection: str
+    amount: int = Field(ge=10)
+
+
 class SimulateRequest(BaseModel):
     red: Optional[AgentConfigSchema] = None
     black: Optional[AgentConfigSchema] = None
@@ -115,6 +122,7 @@ class SimulateRequest(BaseModel):
     black_agent_id: Optional[int] = None
     bet: Optional[BetSchema] = None
     vs_bot: Optional[VsBotSchema] = None
+    prop_bets: Optional[list[PropBetInput]] = None
 
 
 class ParlayPrediction(BaseModel):
@@ -491,6 +499,17 @@ def api_match_odds(red_elo: float = 1200, black_elo: float = 1200):
     return calculate_match_odds(red_elo, black_elo)
 
 
+@app.get("/api/odds/props")
+def api_prop_odds(red_agent_id: int = 0, black_agent_id: int = 0):
+    red_a = get_agent(red_agent_id) if red_agent_id else None
+    black_a = get_agent(black_agent_id) if black_agent_id else None
+    rc = {k: (red_a or {}).get(k, 50) for k in ("aggression", "risk_tolerance", "king_priority", "edge_affinity", "trade_down")}
+    bc = {k: (black_a or {}).get(k, 50) for k in ("aggression", "risk_tolerance", "king_priority", "edge_affinity", "trade_down")}
+    rp = red_a.get("perk") if red_a else None
+    bp = black_a.get("perk") if black_a else None
+    return {"props": calculate_prop_odds(rc, bc, rp, bp)}
+
+
 @app.get("/api/bets/history")
 def api_bet_history(limit: int = 20):
     return {"bets": get_bet_history(limit)}
@@ -861,6 +880,43 @@ def simulate_game(req: SimulateRequest):
     if level_ups:
         resp["level_ups"] = level_ups
     resp["bet"] = bet_result
+
+    # --- prop bets ---
+    if req.prop_bets and len(req.prop_bets) > 0:
+        if len(req.prop_bets) > 4:
+            raise HTTPException(400, "maximum 4 prop bets per match")
+        # deduct all prop bet amounts
+        prop_inputs = []
+        for pb in req.prop_bets:
+            # find the odds for this prop
+            rc = red_cfg.to_dict()
+            bc = black_cfg.to_dict()
+            all_props = calculate_prop_odds(rc, bc, red_perk if 'red_perk' in dir() else None, black_perk if 'black_perk' in dir() else None)
+            prop_def = next((p for p in all_props if p["type"] == pb.type), None)
+            if not prop_def:
+                continue
+            opt = next((o for o in prop_def.get("options", []) if o["selection"] == pb.selection), None)
+            if not opt:
+                continue
+            try:
+                place_bet("prop", f"{pb.type}:{pb.selection}", pb.amount, opt["odds"], match_id=match_id)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            add_to_jackpot(pb.amount)
+            prop_inputs.append({"type": pb.type, "selection": pb.selection, "amount": pb.amount,
+                                "odds": opt["odds"], "line": prop_def.get("line")})
+
+        prop_results = resolve_props(game["boards"], game["moves"], game["events"], prop_inputs, game["winner"])
+
+        # settle each prop
+        for pr in prop_results:
+            if pr["result"] == "win":
+                settle_bet(0, "win", pr["payout"])  # uses wallet directly
+            elif pr["result"] == "push":
+                settle_bet(0, "win", pr["payout"])  # refund on push
+
+        resp["prop_results"] = prop_results
+
     if bot_opponent:
         resp["bot_opponent"] = bot_opponent
         # rivalry tracking for VS BOT

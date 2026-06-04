@@ -179,6 +179,21 @@ def init_db():
         )
     """)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS prop_bets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            match_id INTEGER NOT NULL,
+            prop_type TEXT NOT NULL,
+            selection TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            odds REAL NOT NULL,
+            line REAL,
+            result TEXT,
+            payout INTEGER NOT NULL DEFAULT 0,
+            resolved_at_move INTEGER
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS rivalries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             agent_id INTEGER NOT NULL,
