@@ -23,6 +23,8 @@ from mirror import get_mirror_profile, get_mirror_history, generate_mirror_agent
 from props import calculate_prop_odds, resolve_props
 from ws import router as ws_router
 from matchmaking import online
+from crypto import crypto_service, micros_to_usdc, usdc_to_micros
+from privy_auth import privy_service
 from database import (
     save_match, get_matches, get_match, get_leaderboard, get_agent_leaderboard,
     get_elo, update_elo, update_elo_record,
@@ -37,7 +39,13 @@ from database import (
     save_parlay, calc_parlay_payout,
     update_rivalry, get_rivalry, get_agent_rivalries,
     check_and_update_records, get_agent_records,
+    set_player_wallet, get_player_usdc, adjust_player_usdc, record_crypto_tx, get_crypto_txs,
 )
+
+REAL_PLAY_MIN_BET_MICROS = 10_000      # $0.01
+REAL_PLAY_MAX_BET_MICROS = 10_000_000  # $10.00
+REAL_PLAY_MIN_WITHDRAW_MICROS = 1_000_000  # $1.00
+MOONPAY_API_KEY = __import__("os").environ.get("MOONPAY_API_KEY", "")
 
 app = FastAPI(title="Agent Checkers API", version="0.6.0")
 app.include_router(ws_router)
@@ -727,6 +735,119 @@ def api_me(player_id: int = Depends(get_current_player_id)):
 @app.get("/api/players/online")
 def api_online_players():
     return {"players": online.get_online(), "count": online.count}
+
+
+# --- real play (USDC) ---
+
+REAL_BET_TIERS = [10_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 5_000_000, 10_000_000]
+
+
+@app.get("/api/crypto/status")
+def api_crypto_status():
+    """Public. Tells the frontend whether real-play is available. Free play always works."""
+    return {
+        "enabled": crypto_service.available,
+        "privy_enabled": privy_service.available,
+        "min_bet_usdc": micros_to_usdc(REAL_PLAY_MIN_BET_MICROS),
+        "max_bet_usdc": micros_to_usdc(REAL_PLAY_MAX_BET_MICROS),
+        "bet_tiers_usdc": [micros_to_usdc(t) for t in REAL_BET_TIERS],
+        "usdc_address": crypto_service.usdc_address,
+        "chain": "base",
+    }
+
+
+def _ensure_wallet(player: dict) -> str | None:
+    """Return the player's wallet address, provisioning via Privy if needed."""
+    if player.get("wallet_address"):
+        return player["wallet_address"]
+    if not privy_service.available:
+        return None
+    # Provision via Privy using the player's id as the external user key.
+    addr = privy_service.get_wallet_address(str(player["id"])) or privy_service.create_embedded_wallet(str(player["id"]))
+    if addr:
+        set_player_wallet(player["id"], addr)
+    return addr
+
+
+@app.get("/api/wallet/balance")
+def api_wallet_balance(player_id: int = Depends(get_current_player_id)):
+    player = get_player(player_id)
+    if not player:
+        raise HTTPException(404, "player not found")
+    real = None
+    if crypto_service.available:
+        addr = _ensure_wallet(player)
+        real = {"usdc": micros_to_usdc(player.get("usdc_micros", 0)), "wallet_address": addr}
+    return {
+        "free_play": {"chips": player["coin_balance"]},
+        "real_play": real,  # null when real play is disabled on this server
+    }
+
+
+class DepositRequest(BaseModel):
+    amount: float = Field(gt=0)
+
+
+@app.post("/api/wallet/deposit")
+def api_wallet_deposit(req: DepositRequest, player_id: int = Depends(get_current_player_id)):
+    if not crypto_service.available:
+        raise HTTPException(503, "real play is not available on this server")
+    player = get_player(player_id)
+    if not player:
+        raise HTTPException(404, "player not found")
+    addr = _ensure_wallet(player)
+    if not addr:
+        raise HTTPException(503, "could not provision a wallet")
+    onramp = None
+    if MOONPAY_API_KEY:
+        onramp = (
+            f"https://buy.moonpay.com?apiKey={MOONPAY_API_KEY}"
+            f"&currencyCode=usdc_base&walletAddress={addr}&baseCurrencyCode=usd"
+        )
+    return {
+        "deposit_address": addr,
+        "amount_usdc": req.amount,
+        "instructions": "Send USDC on the Base network to this address.",
+        "onramp_url": onramp,
+    }
+
+
+class WithdrawRequest(BaseModel):
+    amount: float = Field(gt=0)
+    to_address: str
+
+
+@app.post("/api/wallet/withdraw")
+def api_wallet_withdraw(req: WithdrawRequest, player_id: int = Depends(get_current_player_id)):
+    if not crypto_service.available:
+        raise HTTPException(503, "real play is not available on this server")
+    if not (req.to_address.startswith("0x") and len(req.to_address) == 42):
+        raise HTTPException(400, "invalid destination address")
+    micros = usdc_to_micros(req.amount)
+    if micros < REAL_PLAY_MIN_WITHDRAW_MICROS:
+        raise HTTPException(400, f"minimum withdrawal is {micros_to_usdc(REAL_PLAY_MIN_WITHDRAW_MICROS)} USDC")
+    bal = get_player_usdc(player_id)
+    if micros > bal:
+        raise HTTPException(400, "insufficient balance")
+    # Reserve first, then send on-chain; refund the ledger if the transfer fails.
+    adjust_player_usdc(player_id, -micros)
+    try:
+        tx_hash = crypto_service.withdraw_usdc(req.to_address, micros)
+    except Exception as e:
+        adjust_player_usdc(player_id, micros)  # refund reservation
+        raise HTTPException(502, f"withdrawal failed: {e}")
+    record_crypto_tx(player_id, "withdraw", -micros, tx_hash=tx_hash, detail=req.to_address)
+    return {"tx_hash": tx_hash, "amount": req.amount, "status": "pending"}
+
+
+@app.get("/api/wallet/transactions")
+def api_wallet_transactions(player_id: int = Depends(get_current_player_id)):
+    txs = get_crypto_txs(player_id)
+    return {"transactions": [{
+        "id": t["id"], "kind": t["kind"], "amount_usdc": micros_to_usdc(t["amount_micros"]),
+        "tx_hash": t["tx_hash"], "match_id": t["match_id"], "status": t["status"],
+        "created_at": t["created_at"], "detail": t["detail"],
+    } for t in txs]}
 
 
 # --- the mirror ---

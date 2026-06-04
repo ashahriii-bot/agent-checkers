@@ -969,6 +969,61 @@ function RosterPanel({ side, color, selectedAgent, onSelect, roster, disabled, m
 
 // --- multiplayer ---
 
+function CryptoModal({ kind, balance, onClose, doDeposit, doWithdraw }) {
+  const [info, setInfo] = useState(null);
+  const [amount, setAmount] = useState("");
+  const [toAddr, setToAddr] = useState("");
+  const [msg, setMsg] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (kind === "deposit") { doDeposit(5).then(d => setInfo(d)); }
+  }, [kind]);
+
+  const submitWithdraw = async () => {
+    setBusy(true); setMsg(null);
+    const r = await doWithdraw(parseFloat(amount), toAddr.trim());
+    setBusy(false);
+    if (r.ok) setMsg({ ok: true, text: `Sent. tx: ${r.tx_hash?.slice(0, 14)}…` });
+    else setMsg({ ok: false, text: r.error });
+  };
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+      <div onClick={e => e.stopPropagation()} style={{ width: 360, maxWidth: "90vw", padding: 16, background: "#0d1117", border: "1px solid #2ecc7144", borderRadius: 8 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+          <span style={{ fontSize: 11, fontWeight: 800, letterSpacing: 2, color: "#2ecc71", textTransform: "uppercase" }}>{kind === "deposit" ? "Add Funds" : "Withdraw"}</span>
+          <button onClick={onClose} style={{ fontSize: 9, background: "none", border: "1px solid #21262d", color: "#4a5568", borderRadius: 3, padding: "2px 8px", cursor: "pointer", fontFamily: "inherit" }}>X</button>
+        </div>
+
+        {kind === "deposit" && (
+          <div>
+            <div style={{ fontSize: 9, color: "#8892a0", marginBottom: 6 }}>Send USDC (Base network) to your game wallet:</div>
+            <div style={{ display: "flex", gap: 4, marginBottom: 8 }}>
+              <input readOnly value={info?.deposit_address || "loading…"} style={{ flex: 1, fontSize: 9, padding: "4px 6px", background: "#161b22", border: "1px solid #21262d", borderRadius: 3, color: "#c8d0da", fontFamily: "inherit" }} />
+              <button onClick={() => info?.deposit_address && navigator.clipboard?.writeText(info.deposit_address)} style={{ fontSize: 8, padding: "2px 8px", borderRadius: 3, background: "#161b22", border: "1px solid #2ecc7144", color: "#2ecc71", cursor: "pointer", fontFamily: "inherit" }}>COPY</button>
+            </div>
+            {info?.onramp_url && <a href={info.onramp_url} target="_blank" rel="noreferrer" style={{ display: "block", textAlign: "center", fontSize: 9, padding: "6px 0", borderRadius: 4, background: "#161b22", border: "1px solid #2ecc7144", color: "#2ecc71", textDecoration: "none", marginBottom: 6 }}>BUY WITH CARD (MoonPay)</a>}
+            <div style={{ fontSize: 8, color: "#4a5568" }}>Balance: ${(balance?.usdc ?? 0).toFixed(2)} USDC · minimum deposit $1.00</div>
+          </div>
+        )}
+
+        {kind === "withdraw" && (
+          <div>
+            <div style={{ fontSize: 8, color: "#4a5568", marginBottom: 2 }}>Amount (USDC)</div>
+            <input value={amount} onChange={e => setAmount(e.target.value)} placeholder="0.00" inputMode="decimal" style={{ width: "100%", fontSize: 11, padding: "5px 8px", background: "#161b22", border: "1px solid #21262d", borderRadius: 4, color: "#c8d0da", fontFamily: "inherit", marginBottom: 8, boxSizing: "border-box" }} />
+            <div style={{ fontSize: 8, color: "#4a5568", marginBottom: 2 }}>To address (Base)</div>
+            <input value={toAddr} onChange={e => setToAddr(e.target.value)} placeholder="0x…" style={{ width: "100%", fontSize: 9, padding: "5px 8px", background: "#161b22", border: "1px solid #21262d", borderRadius: 4, color: "#c8d0da", fontFamily: "inherit", marginBottom: 8, boxSizing: "border-box" }} />
+            <div style={{ fontSize: 8, color: "#4a5568", marginBottom: 8 }}>Available: ${(balance?.usdc ?? 0).toFixed(2)} · minimum $1.00 · gas sponsored</div>
+            <button onClick={submitWithdraw} disabled={busy || !amount || !toAddr} style={{ width: "100%", padding: "8px 0", borderRadius: 4, border: "none", background: (busy || !amount || !toAddr) ? "#21262d" : "linear-gradient(135deg, #2ecc71, #27ae60)", color: (busy || !amount || !toAddr) ? "#4a5568" : "#fff", fontWeight: 700, fontSize: 10, letterSpacing: 2, cursor: (busy || !amount || !toAddr) ? "not-allowed" : "pointer", fontFamily: "inherit" }}>{busy ? "SENDING…" : "WITHDRAW"}</button>
+            {msg && <div style={{ fontSize: 9, marginTop: 6, color: msg.ok ? "#2ecc71" : "#e74c3c" }}>{msg.text}</div>}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function MultiplayerLobby({ roster, onBack }) {
   const [authToken, setAuthToken] = useState(null);
   const [player, setPlayer] = useState(null);
@@ -984,7 +1039,21 @@ function MultiplayerLobby({ roster, onBack }) {
   const [matchResult, setMatchResult] = useState(null);
   const [matchFound, setMatchFound] = useState(null);
   const [onlineCount, setOnlineCount] = useState(0);
+  const [crypto, setCrypto] = useState({ enabled: false, bet_tiers_usdc: [], min_bet_usdc: 0.01, max_bet_usdc: 10 });
+  const [playMode, setPlayMode] = useState("free");  // "free" | "real"
+  const [realBal, setRealBal] = useState(null);       // { usdc, wallet_address } or null
+  const [realBet, setRealBet] = useState(0);          // USDC stake
+  const [modal, setModal] = useState(null);           // "deposit" | "withdraw" | "txs" | null
   const wsRef = useRef(null);
+
+  useEffect(() => { fetch(`${API}/crypto/status`).then(r => r.json()).then(setCrypto).catch(() => {}); }, []);
+
+  const loadRealBalance = () => {
+    if (!authToken) return;
+    fetch(`${API}/wallet/balance`, { headers: { Authorization: `Bearer ${authToken}` } })
+      .then(r => r.json()).then(d => setRealBal(d.real_play)).catch(() => {});
+  };
+  useEffect(() => { if (authToken && crypto.enabled) loadRealBalance(); }, [authToken, crypto.enabled]);
 
   // poll online count
   useEffect(() => {
@@ -1018,7 +1087,7 @@ function MultiplayerLobby({ roster, onBack }) {
       if (msg.type === "connected") setWsStatus("connected");
       if (msg.type === "queue_status") setQueueStatus(msg);
       if (msg.type === "match_found") setMatchFound(msg);
-      if (msg.type === "match_result") { setMatchResult(msg); setMatchFound(null); setQueueStatus(null); }
+      if (msg.type === "match_result") { setMatchResult(msg); setMatchFound(null); setQueueStatus(null); if (msg.mode === "real") loadRealBalance(); }
       if (msg.type === "bot_fallback") setQueueStatus({ ...queueStatus, bot_fallback: true });
       if (msg.type === "queue_cancelled") setQueueStatus(null);
     };
@@ -1028,8 +1097,23 @@ function MultiplayerLobby({ roster, onBack }) {
 
   const joinQueue = () => {
     if (!selectedAgent || !wsRef.current) return;
-    wsRef.current.send(JSON.stringify({ type: "queue_join", agent_id: selectedAgent.id, bet_amount: betAmount }));
+    const join = playMode === "real"
+      ? { type: "queue_join", agent_id: selectedAgent.id, bet_amount: realBet, mode: "real" }
+      : { type: "queue_join", agent_id: selectedAgent.id, bet_amount: betAmount, mode: "free" };
+    wsRef.current.send(JSON.stringify(join));
     setQueueStatus({ wait_time: 0 });
+  };
+
+  const doDeposit = async (amount) => {
+    const res = await fetch(`${API}/wallet/deposit`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` }, body: JSON.stringify({ amount }) });
+    if (res.ok) return res.json();
+    return null;
+  };
+  const doWithdraw = async (amount, toAddress) => {
+    const res = await fetch(`${API}/wallet/withdraw`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` }, body: JSON.stringify({ amount, to_address: toAddress }) });
+    const d = await res.json();
+    if (res.ok) { loadRealBalance(); return { ok: true, ...d }; }
+    return { ok: false, error: d.detail || "withdrawal failed" };
   };
   const cancelQueue = () => { wsRef.current?.send(JSON.stringify({ type: "queue_cancel" })); setQueueStatus(null); };
 
@@ -1070,6 +1154,14 @@ function MultiplayerLobby({ roster, onBack }) {
             {matchResult.bet_result.result === "win" ? `+${matchResult.bet_result.payout}` : `${matchResult.bet_result.net}`} coins
           </div>
         )}
+        {matchResult.real_result && (
+          <div style={{ textAlign: "center", marginBottom: 8 }}>
+            <div style={{ fontSize: 18, fontWeight: 800, color: matchResult.real_result.net_usdc >= 0 ? "#2ecc71" : "#e74c3c" }}>
+              {matchResult.real_result.net_usdc >= 0 ? "💰 +" : "💸 "}${Math.abs(matchResult.real_result.net_usdc).toFixed(2)}
+            </div>
+            <div style={{ fontSize: 8, color: "#4a5568" }}>${matchResult.real_result.stake_usdc.toFixed(2)} staked · balance ${matchResult.real_result.balance_usdc.toFixed(2)}</div>
+          </div>
+        )}
         <div style={{ textAlign: "center", fontSize: 9, color: "#8892a0", marginBottom: 12 }}>
           Elo: {matchResult.elo_change.before} -> {matchResult.elo_change.after} ({matchResult.elo_change.delta > 0 ? "+" : ""}{matchResult.elo_change.delta})
         </div>
@@ -1101,15 +1193,18 @@ function MultiplayerLobby({ roster, onBack }) {
           <span style={{ fontSize: 11, color: "#4a5568" }}>vs</span>
           <div><div style={{ fontSize: 12, fontWeight: 700, color: "#ecf0f1" }}>{matchFound.opponent.agent_name}</div><div style={{ fontSize: 9, color: "#4a5568" }}>{matchFound.opponent.agent_elo} elo</div></div>
         </div>
-        {matchFound.bet_amount > 0 && <div style={{ fontSize: 9, color: "#ffd700" }}>Bet: {matchFound.bet_amount} coins at {matchFound.odds}x</div>}
+        {matchFound.bet_amount > 0 && (playMode === "real"
+          ? <div style={{ fontSize: 9, color: "#2ecc71" }}>💰 Staking ${Number(matchFound.bet_amount).toFixed(2)} · winner takes 95% of pot</div>
+          : <div style={{ fontSize: 9, color: "#ffd700" }}>Bet: {matchFound.bet_amount} coins at {matchFound.odds}x</div>)}
         <div style={{ fontSize: 11, color: "#4a5568", marginTop: 8 }}>Simulating...</div>
       </div>
     );
   }
 
   // lobby
+  const isReal = playMode === "real";
   return (
-    <div style={{ maxWidth: 500, margin: "20px auto", padding: "16px" }}>
+    <div style={{ maxWidth: 500, margin: "20px auto", padding: "16px", border: isReal ? "1px solid #2ecc7155" : "none", borderRadius: isReal ? 10 : 0, boxShadow: isReal ? "0 0 24px rgba(46,204,113,0.12) inset" : "none" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
         <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 4, color: "#9b59b6", textTransform: "uppercase" }}>Multiplayer</h2>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -1118,14 +1213,39 @@ function MultiplayerLobby({ roster, onBack }) {
           <button onClick={onBack} style={{ fontSize: 8, background: "none", border: "1px solid #21262d", color: "#4a5568", borderRadius: 3, padding: "3px 10px", cursor: "pointer", fontFamily: "inherit" }}>BACK</button>
         </div>
       </div>
-      <div style={{ fontSize: 9, color: "#8892a0", marginBottom: 4 }}>Logged in as {player?.display_name}</div>
+      <div style={{ fontSize: 9, color: "#8892a0", marginBottom: 8 }}>Logged in as {player?.display_name}</div>
 
-      <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 1, marginBottom: 4, marginTop: 12, textTransform: "uppercase" }}>Your agent</div>
+      {/* mode toggle: REAL only appears when the server has real play configured */}
+      {crypto.enabled && (
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ display: "flex", gap: 4, marginBottom: 6 }}>
+            <button onClick={() => setPlayMode("free")} style={{ flex: 1, padding: "5px 0", fontSize: 9, fontWeight: 700, letterSpacing: 1, fontFamily: "inherit", cursor: "pointer", borderRadius: 4, background: !isReal ? "#161b22" : "#0d1117", border: `1px solid ${!isReal ? "#9b59b6" : "#21262d"}`, color: !isReal ? "#9b59b6" : "#4a5568" }}>🎮 FREE PLAY</button>
+            <button onClick={() => setPlayMode("real")} style={{ flex: 1, padding: "5px 0", fontSize: 9, fontWeight: 700, letterSpacing: 1, fontFamily: "inherit", cursor: "pointer", borderRadius: 4, background: isReal ? "#0e1a12" : "#0d1117", border: `1px solid ${isReal ? "#2ecc71" : "#21262d"}`, color: isReal ? "#2ecc71" : "#4a5568" }}>💰 REAL PLAY</button>
+          </div>
+          {isReal && (
+            <div style={{ padding: "6px 10px", background: "#0d1117", border: "1px solid #2ecc7133", borderRadius: 4, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div>
+                <span style={{ fontSize: 12, fontWeight: 800, color: "#2ecc71" }}>${(realBal?.usdc ?? 0).toFixed(2)}</span>
+                <span style={{ fontSize: 7, color: "#4a5568", marginLeft: 4 }}>USDC</span>
+                {realBal?.wallet_address && <span style={{ fontSize: 7, color: "#3a4450", marginLeft: 6 }}>{realBal.wallet_address.slice(0, 6)}…{realBal.wallet_address.slice(-4)}</span>}
+              </div>
+              <div style={{ display: "flex", gap: 4 }}>
+                <button onClick={() => setModal("deposit")} style={{ fontSize: 7, padding: "2px 8px", borderRadius: 3, background: "#161b22", border: "1px solid #2ecc7144", color: "#2ecc71", cursor: "pointer", fontFamily: "inherit" }}>DEPOSIT</button>
+                <button onClick={() => setModal("withdraw")} style={{ fontSize: 7, padding: "2px 8px", borderRadius: 3, background: "#161b22", border: "1px solid #21262d", color: "#8892a0", cursor: "pointer", fontFamily: "inherit" }}>WITHDRAW</button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {modal && <CryptoModal kind={modal} balance={realBal} onClose={() => { setModal(null); loadRealBalance(); }} doDeposit={doDeposit} doWithdraw={doWithdraw} />}
+
+      <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 1, marginBottom: 4, marginTop: 12, textTransform: "uppercase" }}>Your agent {isReal && <span style={{ color: "#2ecc71" }}>(level 3+, 10+ matches)</span>}</div>
       <div style={{ maxHeight: 200, overflowY: "auto", marginBottom: 12 }}>
         {roster.map(a => <AgentCard key={a.id} agent={a} selected={selectedAgent?.id === a.id} onClick={() => setSelectedAgent(a)} compact />)}
       </div>
 
-      {selectedAgent && !queueStatus && (
+      {selectedAgent && !queueStatus && !isReal && (
         <>
           <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 1, marginBottom: 4, textTransform: "uppercase" }}>Bet on yourself</div>
           <div style={{ display: "flex", gap: 4, marginBottom: 8 }}>
@@ -1139,6 +1259,27 @@ function MultiplayerLobby({ roster, onBack }) {
             ))}
           </div>
           <button onClick={joinQueue} style={{ width: "100%", padding: "10px 0", borderRadius: 6, border: "none", background: "linear-gradient(135deg, #9b59b6, #8e44ad)", color: "#fff", fontWeight: 800, fontSize: 12, letterSpacing: 4, cursor: "pointer", fontFamily: "inherit" }}>FIND MATCH</button>
+        </>
+      )}
+
+      {selectedAgent && !queueStatus && isReal && (
+        <>
+          <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 1, marginBottom: 4, textTransform: "uppercase" }}>Stake (USDC) — winner takes 95% of pot</div>
+          <div style={{ display: "flex", gap: 4, marginBottom: 8, flexWrap: "wrap" }}>
+            {crypto.bet_tiers_usdc.map(amt => (
+              <button key={amt} disabled={amt > (realBal?.usdc ?? 0)} onClick={() => setRealBet(amt)} style={{
+                padding: "3px 8px", borderRadius: 3, fontSize: 8, fontFamily: "inherit",
+                cursor: amt > (realBal?.usdc ?? 0) ? "not-allowed" : "pointer",
+                opacity: amt > (realBal?.usdc ?? 0) ? 0.35 : 1,
+                background: realBet === amt ? "#0e1a12" : "#161b22",
+                border: `1px solid ${realBet === amt ? "#2ecc71" : "#21262d"}`,
+                color: realBet === amt ? "#2ecc71" : "#8892a0",
+              }}>${amt.toFixed(2)}</button>
+            ))}
+          </div>
+          {realBet > 0
+            ? <button onClick={joinQueue} style={{ width: "100%", padding: "10px 0", borderRadius: 6, border: "none", background: "linear-gradient(135deg, #2ecc71, #27ae60)", color: "#fff", fontWeight: 800, fontSize: 12, letterSpacing: 3, cursor: "pointer", fontFamily: "inherit" }}>FIND MATCH · ${realBet.toFixed(2)}</button>
+            : <div style={{ fontSize: 8, color: "#4a5568", textAlign: "center" }}>{(realBal?.usdc ?? 0) <= 0 ? "Deposit USDC to play for real" : "Select a stake"}</div>}
         </>
       )}
 

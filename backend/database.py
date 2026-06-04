@@ -277,6 +277,25 @@ def init_db():
         conn.execute("ALTER TABLE agents ADD COLUMN player_id INTEGER")
     if "recent_results" not in agent_cols:
         conn.execute("ALTER TABLE agents ADD COLUMN recent_results TEXT DEFAULT '[]'")
+    # real-play (USDC) columns on players. usdc_micros = integer micro-USDC (1 USDC = 1_000_000)
+    player_cols = {r[1] for r in conn.execute("PRAGMA table_info(players)").fetchall()}
+    if "wallet_address" not in player_cols:
+        conn.execute("ALTER TABLE players ADD COLUMN wallet_address TEXT")
+    if "usdc_micros" not in player_cols:
+        conn.execute("ALTER TABLE players ADD COLUMN usdc_micros INTEGER NOT NULL DEFAULT 0")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS crypto_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            player_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            amount_micros INTEGER NOT NULL,
+            tx_hash TEXT,
+            match_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'confirmed',
+            detail TEXT
+        )
+    """)
     conn.commit()
     _seed_starter_agents(conn)
     conn.close()
@@ -722,10 +741,13 @@ def get_player_by_username(username: str) -> dict | None:
 
 
 def _player_row_to_dict(r) -> dict:
+    keys = r.keys()
     return {
         "id": r["id"], "username": r["username"], "display_name": r["display_name"],
         "coin_balance": r["coin_balance"],
         "total_wins": r["total_wins"], "total_losses": r["total_losses"], "total_draws": r["total_draws"],
+        "wallet_address": r["wallet_address"] if "wallet_address" in keys else None,
+        "usdc_micros": r["usdc_micros"] if "usdc_micros" in keys else 0,
     }
 
 
@@ -746,6 +768,56 @@ def update_player_stats(player_id: int, result: str):
                  (w, l, d, now, player_id))
     conn.commit()
     conn.close()
+
+
+# --- real play (USDC) balance, stored as integer micro-USDC ---
+
+def set_player_wallet(player_id: int, wallet_address: str):
+    conn = get_db()
+    conn.execute("UPDATE players SET wallet_address=? WHERE id=?", (wallet_address, player_id))
+    conn.commit()
+    conn.close()
+
+
+def get_player_usdc(player_id: int) -> int:
+    """Returns balance in micro-USDC (1 USDC = 1_000_000)."""
+    conn = get_db()
+    row = conn.execute("SELECT usdc_micros FROM players WHERE id=?", (player_id,)).fetchone()
+    conn.close()
+    return row["usdc_micros"] if row else 0
+
+
+def adjust_player_usdc(player_id: int, delta_micros: int) -> int:
+    """Atomically adjust USDC balance, clamped at 0. Returns new balance. Caller validates sufficiency first."""
+    conn = get_db()
+    conn.execute("UPDATE players SET usdc_micros = MAX(0, usdc_micros + ?) WHERE id=?", (delta_micros, player_id))
+    conn.commit()
+    row = conn.execute("SELECT usdc_micros FROM players WHERE id=?", (player_id,)).fetchone()
+    conn.close()
+    return row["usdc_micros"] if row else 0
+
+
+def record_crypto_tx(player_id: int, kind: str, amount_micros: int, tx_hash: str | None = None,
+                     match_id: int | None = None, status: str = "confirmed", detail: str | None = None) -> int:
+    conn = get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO crypto_transactions (created_at, player_id, kind, amount_micros, tx_hash, match_id, status, detail) VALUES (?,?,?,?,?,?,?,?)",
+        (now, player_id, kind, amount_micros, tx_hash, match_id, status, detail),
+    )
+    conn.commit()
+    txid = cur.lastrowid
+    conn.close()
+    return txid
+
+
+def get_crypto_txs(player_id: int, limit: int = 50) -> list[dict]:
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM crypto_transactions WHERE player_id=? ORDER BY id DESC LIMIT ?", (player_id, limit)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 # --- wallet and betting ---

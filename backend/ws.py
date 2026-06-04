@@ -11,8 +11,16 @@ from ai import AgentConfig
 from database import (
     get_agent, update_agent_after_match, update_elo, save_match,
     calculate_match_odds, get_player, update_player_coins,
+    get_player_usdc, adjust_player_usdc, record_crypto_tx,
 )
 from matchmaking import queue, online, QueueEntry
+from crypto import crypto_service, micros_to_usdc
+
+REAL_MIN_MICROS = 10_000        # $0.01
+REAL_MAX_MICROS = 10_000_000    # $10.00
+REAL_HOUSE_FEE_BPS = 500        # 5%
+REAL_MIN_LEVEL = 3
+REAL_MIN_MATCHES = 10
 
 router = APIRouter()
 
@@ -80,6 +88,7 @@ async def ws_play(ws: WebSocket):
 async def _handle_queue_join(ws: WebSocket, player_id: int, display_name: str, msg: dict):
     agent_id = msg.get("agent_id")
     bet_amount = msg.get("bet_amount", 0)
+    mode = msg.get("mode", "free")
 
     agent = get_agent(agent_id)
     if not agent:
@@ -89,10 +98,28 @@ async def _handle_queue_join(ws: WebSocket, player_id: int, display_name: str, m
         await ws.send_json({"type": "error", "message": "not your agent"})
         return
 
+    bet_micros = 0
+    if mode == "real":
+        if not crypto_service.available:
+            await ws.send_json({"type": "error", "message": "real play is not available"})
+            return
+        # eligibility: prevents throwaway agents from entering real-money matches
+        if (agent.get("level", 1) < REAL_MIN_LEVEL) or (agent.get("matches", 0) < REAL_MIN_MATCHES):
+            await ws.send_json({"type": "error", "message": f"real play requires a level {REAL_MIN_LEVEL}+ agent with {REAL_MIN_MATCHES}+ matches"})
+            return
+        bet_micros = int(round(float(bet_amount) * 1_000_000))
+        if bet_micros < REAL_MIN_MICROS or bet_micros > REAL_MAX_MICROS:
+            await ws.send_json({"type": "error", "message": "bet outside allowed range ($0.01-$10.00)"})
+            return
+        if get_player_usdc(player_id) < bet_micros:
+            await ws.send_json({"type": "error", "message": "insufficient USDC balance"})
+            return
+
     entry = QueueEntry(
         player_id=player_id, agent_id=agent_id, agent_elo=agent["elo"],
         bet_amount=bet_amount, joined_at=time.time(), websocket=ws,
         agent_name=agent["name"], display_name=display_name,
+        mode=mode, bet_micros=bet_micros,
     )
 
     online.set_status(player_id, "in_queue")
@@ -169,7 +196,7 @@ async def _run_multiplayer_match(red: QueueEntry, black: QueueEntry):
     update_agent_after_match(black.agent_id, black_elo_after, black_result_str)
 
     # save match
-    save_match(
+    match_id = save_match(
         red_config=red_cfg.to_dict(), black_config=black_cfg.to_dict(),
         winner=game["winner"], move_count=game["move_count"],
         final_red=game["final_red"], final_black=game["final_black"],
@@ -179,6 +206,39 @@ async def _run_multiplayer_match(red: QueueEntry, black: QueueEntry):
         red_agent_id=red.agent_id, black_agent_id=black.agent_id,
     )
 
+    # --- real-play (USDC) settlement ---
+    # v1 is custodial: stakes are settled against the server USDC ledger and the house
+    # takes 5%. The escrow contract (createMatch/joinMatch/settleMatch) is wired in once
+    # client-side wallet signing is added (Phase 2); it requires both players to fund the
+    # on-chain escrow, which needs their wallets to sign — out of scope for v1.
+    real_results = {}
+    if red.mode == "real" and black.mode == "real":
+        pot = red.bet_micros + black.bet_micros
+        fee = pot * REAL_HOUSE_FEE_BPS // 10000
+        winner_side = game["winner"]
+        for entry, side in [(red, "red"), (black, "black")]:
+            stake = entry.bet_micros
+            if winner_side == "draw":
+                ret = (pot - fee) // 2
+                kind = "match_draw"
+            elif winner_side == side:
+                ret = pot - fee
+                kind = "match_win"
+            else:
+                ret = 0
+                kind = "match_loss"
+            net = ret - stake
+            adjust_player_usdc(entry.player_id, net)
+            record_crypto_tx(entry.player_id, kind, net, match_id=match_id)
+            real_results[side] = {
+                "result": ("draw" if winner_side == "draw" else ("win" if winner_side == side else "loss")),
+                "stake_usdc": micros_to_usdc(stake),
+                "return_usdc": micros_to_usdc(ret),
+                "net_usdc": micros_to_usdc(net),
+                "balance_usdc": micros_to_usdc(get_player_usdc(entry.player_id)),
+                "house_fee_usdc": micros_to_usdc(fee),
+            }
+
     # settle bets and build per-player results
     for entry, side, agent_data, opp_agent, elo_before, elo_after in [
         (red, "red", red_agent, black_agent, red.agent_elo, red_elo_after),
@@ -186,7 +246,7 @@ async def _run_multiplayer_match(red: QueueEntry, black: QueueEntry):
     ]:
         won = game["winner"] == side
         bet_result = None
-        if entry.bet_amount > 0:
+        if entry.mode == "free" and entry.bet_amount > 0:
             side_odds = odds[side]
             payout = int(entry.bet_amount * side_odds) if won else 0
             net = payout - entry.bet_amount if won else -entry.bet_amount
@@ -213,6 +273,8 @@ async def _run_multiplayer_match(red: QueueEntry, black: QueueEntry):
             },
             "elo_change": {"before": elo_before, "after": elo_after, "delta": round(elo_after - elo_before, 1)},
             "bet_result": bet_result,
+            "mode": entry.mode,
+            "real_result": real_results.get(side),
         }
 
         try:

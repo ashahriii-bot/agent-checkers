@@ -1,0 +1,9 @@
+# Real-play (USDC) dependencies — NOT installed in the default Docker image.
+# These pull C-extension packages and bump `websockets`, so they stay out of the
+# free-play build to keep it lean and low-risk. Install only when enabling real play,
+# and add this file to the Dockerfile pip install at that point.
+#
+#   pip install -r requirements-crypto.txt
+#
+web3==7.16.0
+eth-account==0.13.7

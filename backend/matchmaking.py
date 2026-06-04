@@ -18,6 +18,8 @@ class QueueEntry:
     websocket: WebSocket
     agent_name: str = ""
     display_name: str = ""
+    mode: str = "free"          # "free" or "real"
+    bet_micros: int = 0         # USDC stake in micro-USDC (real mode only)
 
 
 class MatchmakingQueue:
@@ -47,6 +49,12 @@ class MatchmakingQueue:
         now = time.time()
         for e in self.entries:
             if e.player_id == entry.player_id:
+                continue
+            # never mix free and real queues
+            if e.mode != entry.mode:
+                continue
+            # real play matches by exact bet tier
+            if entry.mode == "real" and e.bet_micros != entry.bet_micros:
                 continue
             wait_a = now - e.joined_at
             wait_b = now - entry.joined_at
