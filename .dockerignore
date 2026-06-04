@@ -1,0 +1,9 @@
+node_modules
+__pycache__
+*.pyc
+backend/venv
+backend/matches.db
+backend/static
+frontend/dist
+.git
+.env
