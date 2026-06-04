@@ -191,6 +191,7 @@ function TournamentSetup({ roster, onStart, onBack, loading }) {
   const [bracketSize, setBracketSize] = useState(defaultBS);
   const [seeding, setSeeding] = useState("elo");
   const [opponent, setOpponent] = useState("open");
+  const [tournMode, setTournMode] = useState("live");
 
   const toggle = (id) => {
     const next = new Set(selected);
@@ -233,6 +234,13 @@ function TournamentSetup({ roster, onStart, onBack, loading }) {
 
       <div style={{ display: "flex", gap: 12, marginBottom: 12 }}>
         <div>
+          <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 1, marginBottom: 4 }}>MODE</div>
+          <div style={{ display: "flex", gap: 4 }}>
+            <button onClick={() => setTournMode("live")} style={{ ...btnStyle(tournMode === "live"), color: tournMode === "live" ? "#f39c12" : "#4a5568", borderColor: tournMode === "live" ? "#f39c12" : "#21262d" }}>🎰 LIVE</button>
+            <button onClick={() => setTournMode("instant")} style={btnStyle(tournMode === "instant")}>⚡ INSTANT</button>
+          </div>
+        </div>
+        <div>
           <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 1, marginBottom: 4 }}>OPPONENT</div>
           <div style={{ display: "flex", gap: 4 }}>
             <button onClick={() => { setOpponent("open"); }} style={btnStyle(opponent === "open")}>OPEN</button>
@@ -268,7 +276,7 @@ function TournamentSetup({ roster, onStart, onBack, loading }) {
         <div style={{ fontSize: 9, color: "#4a5568", marginBottom: 12 }}>{randomFill} random agent{randomFill > 1 ? "s" : ""} will fill remaining slots</div>
       )}
 
-      <button onClick={() => onStart([...selected], bracketSize, seeding, opponent === "mirror" ? "mirror" : null)} disabled={selected.size < 2 || loading}
+      <button onClick={() => onStart([...selected], bracketSize, seeding, opponent === "mirror" ? "mirror" : null, tournMode)} disabled={selected.size < 2 || loading}
         style={{
           padding: "10px 36px", borderRadius: 6, border: "none", fontFamily: "inherit",
           background: selected.size >= 2 ? "linear-gradient(135deg, #f39c12, #e67e22)" : "#21262d",
@@ -467,13 +475,227 @@ function TournamentBracket({ data, onBack, onNewTournament, roster }) {
   );
 }
 
+function LiveTournament({ data, onBack, onNewTournament }) {
+  const agents = data.bracket.agents;
+  const agentBySlot = {};
+  agents.forEach(a => { agentBySlot[a.slot] = a; });
+
+  const allRoundKeys = Object.keys(data.matches).sort((a, b) => {
+    if (a === "final") return 1; if (b === "final") return -1;
+    return a.localeCompare(b);
+  });
+
+  const [phase, setPhase] = useState("betting"); // betting | revealing | summary | awards
+  const [currentRound, setCurrentRound] = useState(0);
+  const [revealIndex, setRevealIndex] = useState(-1);
+  const [roundBets, setRoundBets] = useState({});
+  const [pnl, setPnl] = useState({ total: 0, rounds: {} });
+  const [settled, setSettled] = useState({});
+  const revealTimer = useRef(null);
+
+  const roundMatches = data.matches[allRoundKeys[currentRound]] || [];
+  const roundName = data.bracket.rounds[currentRound]?.name || `Round ${currentRound + 1}`;
+  const isLastRound = currentRound >= allRoundKeys.length - 1;
+  const isFinal = allRoundKeys[currentRound] === "final";
+  const luckyMatch = data.lucky_match;
+  const finalHeat = data.final_heat || 1.5;
+
+  const placeBet = (mi, side, amount) => {
+    const m = roundMatches[mi];
+    if (!m) return;
+    const odds = side === "red" ? data.bracket.rounds[currentRound]?.matches[mi]?.red_odds || 1.8 : 1.8;
+    // compute odds from elo
+    const rElo = m.red?.elo || 1200;
+    const bElo = m.black?.elo || 1200;
+    const pRed = 1 / (1 + Math.pow(10, (bElo - rElo) / 400));
+    const sideOdds = side === "red" ? Math.round((1 / (pRed * 0.94)) * 100) / 100 : Math.round((1 / ((1 - pRed) * 0.94)) * 100) / 100;
+    setRoundBets(prev => ({ ...prev, [`${currentRound}-${mi}`]: { side, amount, odds: sideOdds } }));
+  };
+
+  const lockBets = () => {
+    setPhase("revealing");
+    setRevealIndex(0);
+  };
+
+  // auto-reveal timer
+  useEffect(() => {
+    if (phase !== "revealing" || revealIndex < 0) return;
+    const hasBet = !!roundBets[`${currentRound}-${revealIndex}`];
+    const delay = isFinal ? 4000 : hasBet ? 3500 : 2000;
+    revealTimer.current = setTimeout(() => {
+      // settle bet for this match
+      const bet = roundBets[`${currentRound}-${revealIndex}`];
+      const m = roundMatches[revealIndex];
+      if (bet && m) {
+        const won = m.winner === bet.side;
+        let eff = bet.odds;
+        const isLucky = luckyMatch && luckyMatch.round === currentRound + 1 && luckyMatch.match_index === revealIndex;
+        if (isLucky) eff *= 2;
+        if (isFinal) eff *= finalHeat;
+        const payout = won ? Math.floor(bet.amount * eff) : 0;
+        const net = payout - bet.amount;
+        setSettled(prev => ({ ...prev, [`${currentRound}-${revealIndex}`]: { won, payout, net, odds: eff } }));
+        setPnl(prev => ({ ...prev, total: prev.total + net, rounds: { ...prev.rounds, [currentRound]: (prev.rounds[currentRound] || 0) + net } }));
+      }
+      if (revealIndex < roundMatches.length - 1) {
+        setRevealIndex(revealIndex + 1);
+      } else {
+        setPhase("summary");
+      }
+    }, delay);
+    return () => clearTimeout(revealTimer.current);
+  }, [phase, revealIndex, currentRound]);
+
+  // auto-advance from summary
+  useEffect(() => {
+    if (phase !== "summary") return;
+    const t = setTimeout(() => {
+      if (isLastRound) {
+        setPhase("awards");
+      } else {
+        setCurrentRound(currentRound + 1);
+        setRevealIndex(-1);
+        setPhase("betting");
+      }
+    }, 4000);
+    return () => clearTimeout(t);
+  }, [phase, currentRound]);
+
+  // awards screen
+  if (phase === "awards") {
+    return (
+      <div style={{ maxWidth: 600, margin: "0 auto", padding: "20px 12px", textAlign: "center" }}>
+        <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 4, color: "#f39c12", textTransform: "uppercase", marginBottom: 4 }}>Fight Night Complete</h2>
+        <div style={{ fontSize: 20, fontWeight: 800, color: "#ffd700", marginBottom: 4 }}>🏆 {data.champion.name}</div>
+        <div style={{ fontSize: 9, color: "#4a5568", marginBottom: 12 }}>Seed #{data.champion.seed}</div>
+        <div style={{ padding: "8px 16px", background: pnl.total >= 0 ? "rgba(46,204,113,0.1)" : "rgba(231,76,60,0.1)", border: `1px solid ${pnl.total >= 0 ? "rgba(46,204,113,0.3)" : "rgba(231,76,60,0.3)"}`, borderRadius: 6, marginBottom: 12 }}>
+          <div style={{ fontSize: 16, fontWeight: 800, color: pnl.total >= 0 ? "#2ecc71" : "#e74c3c" }}>{pnl.total >= 0 ? "+" : ""}{pnl.total} chips</div>
+          <div style={{ fontSize: 8, color: "#4a5568" }}>Tournament P&L</div>
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, justifyContent: "center", marginBottom: 16 }}>
+          {data.awards.map((a, i) => (
+            <div key={i} style={{ padding: "6px 10px", background: "#0d1117", border: "1px solid #1a1f2b", borderRadius: 4, minWidth: 100, textAlign: "left" }}>
+              <div style={{ fontSize: 7, color: i === 0 ? "#ffd700" : "#4a5568", letterSpacing: 1, textTransform: "uppercase" }}>{a.award}</div>
+              <div style={{ fontSize: 10, fontWeight: 700, color: "#c8d0da" }}>{a.agent_name}</div>
+            </div>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
+          <button onClick={onNewTournament} style={{ padding: "8px 24px", borderRadius: 4, border: "none", background: "linear-gradient(135deg, #f39c12, #e67e22)", color: "#fff", fontWeight: 800, fontSize: 11, letterSpacing: 2, cursor: "pointer", fontFamily: "inherit" }}>RUN IT BACK</button>
+          <button onClick={onBack} style={{ padding: "8px 16px", borderRadius: 4, border: "1px solid #21262d", background: "transparent", color: "#4a5568", fontSize: 9, cursor: "pointer", fontFamily: "inherit", letterSpacing: 1 }}>DONE</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ maxWidth: 700, margin: "0 auto", padding: "12px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+        <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 4, textTransform: "uppercase", color: "#f39c12" }}>{isFinal ? "THE FINAL" : roundName}</h2>
+        <span style={{ fontSize: 8, color: "#4a5568" }}>{phase === "betting" ? "PLACE YOUR BETS" : phase === "revealing" ? "REVEALING..." : "COMPLETE"}</span>
+      </div>
+
+      {/* P&L bar */}
+      <div style={{ padding: "3px 10px", background: "#0d1117", border: "1px solid #1a1f2b", borderRadius: 3, marginBottom: 8, display: "flex", justifyContent: "space-between", fontSize: 8 }}>
+        <span style={{ color: "#4a5568" }}>SESSION P&L:</span>
+        <span style={{ fontWeight: 700, color: pnl.total >= 0 ? "#2ecc71" : "#e74c3c" }}>{pnl.total >= 0 ? "+" : ""}{pnl.total}</span>
+      </div>
+
+      {/* match cards */}
+      <div style={{ display: "grid", gridTemplateColumns: roundMatches.length > 2 ? "1fr 1fr" : "1fr", gap: 8 }}>
+        {roundMatches.map((m, mi) => {
+          const key = `${currentRound}-${mi}`;
+          const bet = roundBets[key];
+          const result = settled[key];
+          const revealed = phase === "revealing" ? mi <= revealIndex : phase === "summary" || phase === "awards";
+          const isRevealing = phase === "revealing" && mi === revealIndex;
+          const isLucky = luckyMatch && luckyMatch.round === currentRound + 1 && luckyMatch.match_index === mi;
+
+          // compute odds
+          const rElo = m.red?.elo || 1200;
+          const bElo = m.black?.elo || 1200;
+          const pRed = 1 / (1 + Math.pow(10, (bElo - rElo) / 400));
+          const redOdds = Math.round((1 / (pRed * 0.94)) * 100) / 100;
+          const blackOdds = Math.round((1 / ((1 - pRed) * 0.94)) * 100) / 100;
+
+          return (
+            <div key={mi} style={{
+              padding: "8px 10px", borderRadius: 6,
+              background: isRevealing ? "#161b22" : isLucky && phase === "betting" ? "#1a1510" : "#0d1117",
+              border: `1px solid ${isRevealing ? "#f39c1266" : isLucky && phase === "betting" ? "#ffd70044" : "#1a1f2b"}`,
+              transition: "all 0.3s",
+            }}>
+              {isLucky && phase === "betting" && <div style={{ fontSize: 8, color: "#ffd700", fontWeight: 700, textAlign: "center", marginBottom: 4 }}>✨ LUCKY MATCH ✨ 2x PAYOUT</div>}
+              {isFinal && phase === "betting" && <div style={{ fontSize: 8, color: "#f39c12", fontWeight: 700, textAlign: "center", marginBottom: 4 }}>🔥 FINAL ROUND HEAT: 1.5x BOOST</div>}
+
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                <div>
+                  <div style={{ fontSize: 10, fontWeight: 700, color: revealed && m.winner === "red" ? "#2ecc71" : revealed && m.winner !== "red" ? "#3a4450" : "#e74c3c" }}>#{m.red?.seed} {m.red?.name}</div>
+                  <div style={{ fontSize: 8, color: "#4a5568" }}>{m.red?.elo} elo {phase === "betting" ? `| ${redOdds}x` : ""}</div>
+                </div>
+                <span style={{ fontSize: 9, color: "#4a5568", alignSelf: "center" }}>vs</span>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 10, fontWeight: 700, color: revealed && m.winner === "black" ? "#2ecc71" : revealed && m.winner !== "black" ? "#3a4450" : "#ecf0f1" }}>#{m.black?.seed} {m.black?.name}</div>
+                  <div style={{ fontSize: 8, color: "#4a5568" }}>{m.black?.elo} elo {phase === "betting" ? `| ${blackOdds}x` : ""}</div>
+                </div>
+              </div>
+
+              {revealed && m.tag && <div style={{ textAlign: "center", marginBottom: 2 }}><TagBadge tag={m.tag} /></div>}
+              {revealed && result && (
+                <div style={{ textAlign: "center", fontSize: 12, fontWeight: 800, color: result.won ? "#2ecc71" : "#e74c3c", marginTop: 2 }}>
+                  {result.won ? `+${result.payout}` : `-${roundBets[key]?.amount || 0}`}
+                </div>
+              )}
+              {revealed && m.move_count && <div style={{ textAlign: "center", fontSize: 7, color: "#4a5568" }}>{m.move_count} moves</div>}
+
+              {phase === "betting" && !bet && (
+                <div style={{ display: "flex", gap: 3, justifyContent: "center", marginTop: 4 }}>
+                  {[50, 100].map(amt => (
+                    <div key={amt} style={{ display: "flex", gap: 2 }}>
+                      <button onClick={() => placeBet(mi, "red", amt)} style={{ fontSize: 7, padding: "2px 6px", borderRadius: 2, background: "#161b22", border: "1px solid #e74c3c33", color: "#e74c3c", cursor: "pointer", fontFamily: "inherit" }}>{amt} RED</button>
+                      <button onClick={() => placeBet(mi, "black", amt)} style={{ fontSize: 7, padding: "2px 6px", borderRadius: 2, background: "#161b22", border: "1px solid #ecf0f133", color: "#ecf0f1", cursor: "pointer", fontFamily: "inherit" }}>{amt} BLK</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {phase === "betting" && bet && (
+                <div style={{ textAlign: "center", fontSize: 8, color: "#ffd700", marginTop: 4 }}>
+                  🔒 {bet.amount} on {bet.side.toUpperCase()} ({bet.odds}x)
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {phase === "betting" && (
+        <button onClick={lockBets} style={{ width: "100%", marginTop: 12, padding: "10px 0", borderRadius: 6, border: "none", background: "linear-gradient(135deg, #f39c12, #e67e22)", color: "#fff", fontWeight: 800, fontSize: 11, letterSpacing: 3, cursor: "pointer", fontFamily: "inherit" }}>
+          LOCK BETS & BEGIN {roundName.toUpperCase()}
+        </button>
+      )}
+
+      {phase === "summary" && (
+        <div style={{ marginTop: 12, padding: "8px 12px", background: "#0d1117", border: "1px solid #1a1f2b", borderRadius: 6, textAlign: "center" }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: "#f39c12", letterSpacing: 2 }}>{roundName.toUpperCase()} COMPLETE</div>
+          <div style={{ fontSize: 9, color: "#8892a0", marginTop: 4 }}>Round P&L: <span style={{ fontWeight: 700, color: (pnl.rounds[currentRound] || 0) >= 0 ? "#2ecc71" : "#e74c3c" }}>{(pnl.rounds[currentRound] || 0) >= 0 ? "+" : ""}{pnl.rounds[currentRound] || 0}</span></div>
+          <div style={{ fontSize: 8, color: "#4a5568", marginTop: 2 }}>{isLastRound ? "Advancing to awards..." : `Next: ${data.bracket.rounds[currentRound + 1]?.name || "next round"}...`}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 function Tournament({ roster, onBack, loadRoster }) {
   const [phase, setPhase] = useState("setup");
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
 
-  const startTournament = async (agentIds, bracketSize, seeding, mirrorCoach) => {
+  const [tournMode, setTournMode] = useState("live");
+
+  const startTournament = async (agentIds, bracketSize, seeding, mirrorCoach, mode) => {
     setLoading(true);
+    setTournMode(mode || "live");
     try {
       const body = { agent_ids: agentIds, bracket_size: bracketSize, seeding };
       if (mirrorCoach) body.vs_bot = { coach_id: mirrorCoach };
@@ -483,11 +705,12 @@ function Tournament({ roster, onBack, loadRoster }) {
       });
       if (!res.ok) throw new Error(`API error: ${res.status}`);
       const d = await res.json();
-      setData(d); setPhase("bracket"); loadRoster();
+      setData(d); setPhase(mode === "live" ? "live" : "bracket"); loadRoster();
     } catch (e) { alert(e.message); } finally { setLoading(false); }
   };
 
   if (phase === "setup") return <TournamentSetup roster={roster} onStart={startTournament} onBack={onBack} loading={loading} />;
+  if (phase === "live") return <LiveTournament data={data} onBack={onBack} onNewTournament={() => { setPhase("setup"); setData(null); }} />;
   if (phase === "bracket") return <TournamentBracket data={data} onBack={onBack} onNewTournament={() => { setPhase("setup"); setData(null); }} roster={roster} />;
   return null;
 }

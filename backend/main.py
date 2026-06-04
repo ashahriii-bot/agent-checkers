@@ -1226,6 +1226,8 @@ def api_create_tournament(req: TournamentRequest):
         "awards": awards,
         "elo_changes": elo_changes,
         "champion_bet": None,
+        "lucky_match": {"round": 1, "match_index": random.randint(0, max(1, matches_per_round - 1)), "multiplier": 2.0} if random.random() < 0.25 else None,
+        "final_heat": 1.5,
     }
 
     # --- tournament champion bet ---
@@ -1318,6 +1320,56 @@ def api_create_tournament(req: TournamentRequest):
         }
 
     return resp
+
+
+@app.post("/api/bets/tournament-settle")
+def api_settle_tournament_bets(body: dict):
+    bets = body.get("bets", [])
+    if not bets:
+        raise HTTPException(400, "no bets to settle")
+    results = []
+    total_payout = 0
+    total_wagered = 0
+    from database import get_db, add_to_jackpot, get_wallet, get_streak_multiplier, increment_streak, reset_streak
+    from datetime import datetime, timezone
+    conn = get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    for b in bets:
+        amount = b.get("amount", 0)
+        odds = b.get("odds", 1.0)
+        won = b.get("won", False)
+        is_lucky = b.get("lucky", False)
+        is_heat = b.get("heat", False)
+        effective_odds = odds
+        if is_lucky:
+            effective_odds *= 2.0
+        if is_heat:
+            effective_odds *= 1.5
+        # streak
+        w = get_wallet()
+        streak_mult = get_streak_multiplier(w["win_streak"])
+        effective_odds = round(effective_odds * streak_mult, 2)
+        payout = int(amount * effective_odds) if won else 0
+        total_wagered += amount
+        total_payout += payout
+        # deduct and settle
+        conn.execute("UPDATE wallet SET balance = balance - ? WHERE id = 1", (amount,))
+        if payout > 0:
+            conn.execute("UPDATE wallet SET balance = balance + ? WHERE id = 1", (payout,))
+        add_to_jackpot(amount)
+        results.append({"amount": amount, "odds": odds, "effective_odds": effective_odds, "won": won, "payout": payout})
+    # streak update: if any bet lost, reset; otherwise increment by wins count
+    wins_count = sum(1 for r in results if r["won"])
+    losses = sum(1 for r in results if not r["won"])
+    if losses > 0:
+        reset_streak()
+    elif wins_count > 0:
+        increment_streak(wins_count)
+    conn.commit()
+    final_w = conn.execute("SELECT balance FROM wallet WHERE id = 1").fetchone()
+    conn.close()
+    net = total_payout - total_wagered
+    return {"results": results, "total_wagered": total_wagered, "total_payout": total_payout, "net": net, "balance": final_w["balance"]}
 
 
 @app.get("/api/tournaments")

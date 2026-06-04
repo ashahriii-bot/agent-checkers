@@ -170,6 +170,22 @@ def init_db():
         )
     """)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS tournament_bets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tournament_id INTEGER NOT NULL,
+            round INTEGER NOT NULL,
+            match_index INTEGER NOT NULL,
+            selection TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            odds REAL NOT NULL,
+            is_lucky INTEGER DEFAULT 0,
+            is_heat INTEGER DEFAULT 0,
+            result TEXT,
+            payout INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS jackpot (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             pool INTEGER NOT NULL DEFAULT 0,
