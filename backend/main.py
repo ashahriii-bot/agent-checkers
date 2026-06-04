@@ -30,6 +30,9 @@ from database import (
     get_wallet, place_bet, settle_bet, get_bet_history,
     calculate_match_odds, calculate_tournament_odds,
     create_player, get_player, get_player_by_username, update_player_coins,
+    get_jackpot, add_to_jackpot, hit_jackpot,
+    increment_streak, reset_streak, get_streak_multiplier,
+    save_parlay, calc_parlay_payout,
 )
 
 app = FastAPI(title="Agent Checkers API", version="0.6.0")
@@ -112,12 +115,24 @@ class SimulateRequest(BaseModel):
     vs_bot: Optional[VsBotSchema] = None
 
 
+class ParlayPrediction(BaseModel):
+    round: int
+    match_index: int
+    predicted_winner_slot: int
+
+
+class ParlaySchema(BaseModel):
+    amount: int = Field(ge=10)
+    predictions: list[ParlayPrediction]
+
+
 class TournamentRequest(BaseModel):
     agent_ids: list[int]
     bracket_size: int = Field(default=8, ge=4, le=8)
     seeding: str = "elo"
     champion_bet: Optional[ChampionBetSchema] = None
     vs_bot: Optional[VsBotSchema] = None
+    parlay: Optional[ParlaySchema] = None
 
 
 # --- core game simulation (shared by single match and tournament) ---
@@ -458,6 +473,72 @@ def api_bet_history(limit: int = 20):
     return {"bets": get_bet_history(limit)}
 
 
+@app.get("/api/jackpot")
+def api_get_jackpot():
+    return get_jackpot()
+
+
+@app.post("/api/bets/double")
+def api_double_or_nothing(body: dict):
+    previous_bet_id = body.get("previous_bet_id")
+    agent_id = body.get("agent_id")
+    if not previous_bet_id or not agent_id:
+        raise HTTPException(400, "previous_bet_id and agent_id required")
+    agent = get_agent(agent_id)
+    if not agent:
+        raise HTTPException(400, "agent not found")
+    # get the amount at risk from wallet streak context
+    risk_amount = body.get("amount", 0)
+    if risk_amount <= 0:
+        raise HTTPException(400, "no amount to double")
+
+    # generate a bot opponent matched to agent elo
+    from coaches import COACHES, generate_bot_agent
+    coach = random.choice(list(COACHES.values()))
+    bot = generate_bot_agent(coach, agent["elo"])
+    bot_cfg = AgentConfig(aggression=bot["aggression"], risk_tolerance=bot["risk_tolerance"],
+                          king_priority=bot["king_priority"], edge_affinity=bot["edge_affinity"],
+                          trade_down=bot["trade_down"])
+    player_cfg = AgentConfig(aggression=agent["aggression"], risk_tolerance=agent["risk_tolerance"],
+                             king_priority=agent["king_priority"], edge_affinity=agent["edge_affinity"],
+                             trade_down=agent["trade_down"])
+    game = _run_game(player_cfg, bot_cfg, red_perk=agent.get("perk"), black_perk=bot.get("perk"))
+    won = game["winner"] == "red"
+
+    # XP for the player's agent
+    update_agent_after_match(agent_id, agent["elo"], "win" if won else "loss")
+    # jackpot contribution
+    add_to_jackpot(risk_amount)
+
+    if won:
+        new_amount = risk_amount * 2
+        streak_info = increment_streak()
+        # credit the doubled amount
+        w = get_wallet()
+        settle_bet(previous_bet_id, "win", new_amount)
+        return {"result": "win", "amount": new_amount, "next_double": new_amount * 2,
+                "boards": game["boards"], "moves": game["moves"], "events": game["events"],
+                "move_count": game["move_count"], "bot": bot, "streak": streak_info}
+    else:
+        streak_info = reset_streak()
+        return {"result": "loss", "amount": 0,
+                "boards": game["boards"], "moves": game["moves"], "events": game["events"],
+                "move_count": game["move_count"], "bot": bot, "streak": streak_info}
+
+
+@app.post("/api/bets/cashout")
+def api_cashout(body: dict):
+    amount = body.get("amount", 0)
+    if amount <= 0:
+        raise HTTPException(400, "nothing to cash out")
+    conn = __import__("database").get_db()
+    conn.execute("UPDATE wallet SET balance = balance + ? WHERE id = 1", (amount,))
+    conn.commit()
+    w = conn.execute("SELECT balance FROM wallet WHERE id = 1").fetchone()
+    conn.close()
+    return {"cashed_out": amount, "balance": w["balance"]}
+
+
 # --- auth ---
 
 class RegisterRequest(BaseModel):
@@ -624,14 +705,27 @@ def simulate_game(req: SimulateRequest):
         except ValueError as e:
             raise HTTPException(400, str(e))
         won = game["winner"] == req.bet.side
-        payout = int(req.bet.amount * side_odds) if won else 0
+        # streak multiplier
+        w = get_wallet()
+        streak_mult = get_streak_multiplier(w["win_streak"])
+        effective_odds = round(side_odds * streak_mult, 2)
+        payout = int(req.bet.amount * effective_odds) if won else 0
         settle_result = settle_bet(bet_info["bet_id"], "win" if won else "loss", payout)
+        # jackpot contribution
+        jp_add = add_to_jackpot(req.bet.amount)
+        # streak update
+        if won:
+            streak_info = increment_streak()
+        else:
+            streak_info = reset_streak()
         bet_result = {
             "bet_id": bet_info["bet_id"], "side": req.bet.side,
-            "amount": req.bet.amount, "odds": side_odds,
+            "amount": req.bet.amount, "odds": side_odds, "streak_mult": streak_mult,
+            "effective_odds": effective_odds,
             "result": "win" if won else "loss",
             "payout": payout, "net": payout - req.bet.amount if won else -req.bet.amount,
             "balance_after": settle_result["balance"], "bankrupt": settle_result["bankrupt"],
+            "streak": streak_info, "jackpot_contribution": jp_add,
         }
 
     resp = {
@@ -889,6 +983,62 @@ def api_create_tournament(req: TournamentRequest):
             "player": {"wins": player_wins},
             "bot": {"coach_id": bot_coach.id, "coach_name": bot_coach.name, "wins": bot_wins},
             "team_result": "player" if player_wins > bot_wins else "bot" if bot_wins > player_wins else "split",
+        }
+
+    # --- parlay ---
+    if req.parlay and req.parlay.predictions:
+        try:
+            parlay_bet = place_bet("parlay", "bracket", req.parlay.amount, 1.0, tournament_id=tid)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        add_to_jackpot(req.parlay.amount)
+        # check predictions vs actual results
+        correct = 0
+        total_predictions = len(req.parlay.predictions)
+        per_match = []
+        total_odds = 1.0
+        for pred in req.parlay.predictions:
+            rd_idx = pred.round - 1
+            mi = pred.match_index
+            if rd_idx < len(rounds_output) and mi < len(rounds_output[rd_idx]["matches"]):
+                match_data = rounds_output[rd_idx]["matches"][mi]
+                actual_winner = match_data["winner_slot"]
+                is_correct = actual_winner == pred.predicted_winner_slot
+                if is_correct:
+                    correct += 1
+                # calc individual match odds
+                red_elo = match_data.get("red_elo", 1200)
+                black_elo = match_data.get("black_elo", 1200)
+                match_odds = calculate_match_odds(red_elo, black_elo)
+                winner_side = "red" if actual_winner == match_data["red_slot"] else "black"
+                this_odds = match_odds.get(winner_side, 1.8)
+                total_odds *= this_odds
+                per_match.append({"round": pred.round, "match_index": mi,
+                                  "predicted_slot": pred.predicted_winner_slot,
+                                  "actual_slot": actual_winner, "correct": is_correct})
+            else:
+                per_match.append({"round": pred.round, "match_index": mi, "correct": False})
+
+        result_type, payout = calc_parlay_payout(correct, total_predictions, req.parlay.amount, total_odds)
+        settle_bet(parlay_bet["bet_id"], "win" if payout > 0 else "loss", payout)
+        if payout > 0:
+            increment_streak(3 if result_type == "full_hit" else 1)
+        else:
+            reset_streak()
+
+        # jackpot trigger: perfect 8-bracket parlay
+        jackpot_payout = 0
+        if result_type == "full_hit" and req.bracket_size == 8:
+            jackpot_payout = hit_jackpot()
+
+        save_parlay(tid, req.parlay.amount, [p.dict() for p in req.parlay.predictions],
+                    total_odds, correct, total_predictions, result_type, payout)
+
+        resp["parlay_result"] = {
+            "predictions": total_predictions, "correct": correct,
+            "result": result_type, "total_odds": round(total_odds, 2),
+            "payout": payout, "jackpot_payout": jackpot_payout,
+            "per_match": per_match,
         }
 
     return resp

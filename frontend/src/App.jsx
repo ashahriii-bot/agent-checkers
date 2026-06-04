@@ -895,7 +895,8 @@ export default function App() {
   const [showHelp, setShowHelp] = useState(true);
   const [muted, setMuted] = useState(false);
   useEffect(() => { gameAudio.ensureInit(); }, []);
-  const [wallet, setWallet] = useState({ balance: 1000 });
+  const [wallet, setWallet] = useState({ balance: 1000, win_streak: 0 });
+  const [jackpotPool, setJackpotPool] = useState(0);
   const [currentBet, setCurrentBet] = useState(null);
   const [betOdds, setBetOdds] = useState(null);
   const [coaches, setCoaches] = useState([]);
@@ -926,10 +927,11 @@ export default function App() {
   const loadHistory = async () => { try { const res = await fetch(`${API}/history?limit=20`); if (res.ok) setHistory(await res.json()); } catch {} };
   const loadLeaderboard = async () => { try { const res = await fetch(`${API}/leaderboard?limit=15`); if (res.ok) { const d = await res.json(); setLeaderboard(d.agents || []); } } catch {} };
   const loadWallet = async () => { try { const res = await fetch(`${API}/wallet`); if (res.ok) setWallet(await res.json()); } catch {} };
+  const loadJackpot = async () => { try { const res = await fetch(`${API}/jackpot`); if (res.ok) { const d = await res.json(); setJackpotPool(d.pool); } } catch {} };
   const loadOdds = async (rElo, bElo) => { try { const res = await fetch(`${API}/odds/match?red_elo=${rElo}&black_elo=${bElo}`); if (res.ok) setBetOdds(await res.json()); } catch {} };
   const loadCoaches = async () => { try { const res = await fetch(`${API}/coaches`); if (res.ok) { const d = await res.json(); setCoaches(d.coaches); } } catch {} };
 
-  useEffect(() => { loadRoster(); loadHistory(); loadLeaderboard(); loadWallet(); loadCoaches(); }, []);
+  useEffect(() => { loadRoster(); loadHistory(); loadLeaderboard(); loadWallet(); loadCoaches(); loadJackpot(); }, []);
   useEffect(() => { if (roster.length >= 2 && !redAgent && !blackAgent && !boards) { setRedAgent(roster[0]); setBlackAgent(roster[1]); } }, [roster]);
   useEffect(() => {
     if (matchMode === "vsbot" && redAgent && selectedCoach) loadOdds(redAgent.elo, redAgent.elo);
@@ -956,7 +958,7 @@ export default function App() {
       setBoards(data.boards); setMoves(data.moves); setEvents(data.events || []); setResult(data);
       maxStepRef.current = data.boards.length - 1; stepRef.current = 0; setCurrentStep(0);
       playingRef.current = true; setPlaying(true); playNext();
-      loadRoster(); loadHistory(); loadLeaderboard(); loadWallet();
+      loadRoster(); loadHistory(); loadLeaderboard(); loadWallet(); loadJackpot();
     } catch (err) { setError(err.message); } finally { setLoading(false); }
   };
 
@@ -1039,6 +1041,17 @@ export default function App() {
             <span style={{ fontSize: 14 }}>&#x1FA99;</span>
             <span style={{ fontSize: 16, fontWeight: 800, color: "#ffd700" }}>{wallet.balance?.toLocaleString()}</span>
           </div>
+          {wallet.win_streak >= 3 && (
+            <span style={{ fontSize: 11, padding: "2px 6px", background: "#161b22", border: "1px solid #e67e2233", borderRadius: 4 }}>
+              {wallet.win_streak >= 10 ? "💎" : wallet.win_streak >= 7 ? "🔥🔥🔥" : wallet.win_streak >= 5 ? "🔥🔥" : "🔥"}
+              <span style={{ fontSize: 9, color: "#e67e22", marginLeft: 2 }}>{wallet.win_streak} ({wallet.win_streak >= 10 ? "5" : wallet.win_streak >= 7 ? "3" : wallet.win_streak >= 5 ? "2" : "1.5"}x)</span>
+            </span>
+          )}
+          {jackpotPool > 0 && (
+            <span style={{ fontSize: 10, padding: "2px 6px", background: "#161b22", border: "1px solid #9b59b633", borderRadius: 4, color: "#9b59b6" }}>
+              💎 {jackpotPool.toLocaleString()}
+            </span>
+          )}
           <button onClick={() => { const next = !muted; setMuted(next); gameAudio.setMuted(next); }} style={{ padding: "3px 8px", background: "#0d1117", border: "1px solid #21262d", borderRadius: 4, color: muted ? "#4a5568" : "#8892a0", cursor: "pointer", fontFamily: "inherit", fontSize: 12 }}>
             {muted ? "🔇" : "🔊"}
           </button>
@@ -1119,7 +1132,8 @@ export default function App() {
           {/* betting panel / bet indicator */}
           {canGo && !currentBet && betOdds && (
             <div style={{ width: "100%", padding: "8px 12px", background: "#0d1117", border: "1px solid #1a1f2b", borderRadius: 6, marginTop: 8 }}>
-              <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 2, textTransform: "uppercase", textAlign: "center", marginBottom: 6 }}>Place your bet</div>
+              <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 2, textTransform: "uppercase", textAlign: "center", marginBottom: 4 }}>Place your bet</div>
+              {wallet.win_streak >= 3 && <div style={{ fontSize: 8, color: "#e67e22", textAlign: "center", marginBottom: 4 }}>🔥 Streak bonus: {wallet.win_streak >= 10 ? "5" : wallet.win_streak >= 7 ? "3" : wallet.win_streak >= 5 ? "2" : "1.5"}x on all payouts</div>}
               <div style={{ display: "flex", justifyContent: "space-around", marginBottom: 6 }}>
                 <div style={{ textAlign: "center" }}>
                   <div style={{ fontSize: 8, color: "#e74c3c" }}>RED</div>
@@ -1186,8 +1200,34 @@ export default function App() {
                 </div>
                 <div style={{ fontSize: 9, color: "#8892a0" }}>{result.bet.amount} bet on {result.bet.side.toUpperCase()} at {result.bet.odds}x</div>
                 {result.bet.bankrupt && <div style={{ fontSize: 9, color: "#ffd700", marginTop: 2 }}>Bankrupt! Here's 500 coins to get back in the game.</div>}
+                {result.bet.streak && <div style={{ fontSize: 8, color: "#e67e22", marginTop: 2 }}>{result.bet.result === "win" ? `🔥 Streak: ${result.bet.streak.streak}` : "Streak broken"}</div>}
+                {result.bet.effective_odds && result.bet.effective_odds !== result.bet.odds && (
+                  <div style={{ fontSize: 8, color: "#4a5568", marginTop: 1 }}>Streak boosted: {result.bet.odds}x * {result.bet.streak_mult}x = {result.bet.effective_odds}x</div>
+                )}
               </div>
             )}
+            {/* near-miss for lost bets */}
+            {isFinished && result?.bet?.result === "loss" && boards && (() => {
+              const side = result.bet.side;
+              let bestAdv = -Infinity, bestMove = 0;
+              for (let i = 0; i < boards.length; i++) {
+                let r = 0, b = 0;
+                for (const row of boards[i]) for (const c of row) { if (c === RED || c === RED_KING) r++; if (c === BLACK || c === BLACK_KING) b++; }
+                const adv = side === "red" ? r - b : b - r;
+                if (adv > bestAdv) { bestAdv = adv; bestMove = i; }
+              }
+              if (bestAdv >= 2) return (
+                <div style={{ padding: "4px 10px", background: "rgba(231,76,60,0.06)", border: "1px solid rgba(231,76,60,0.15)", borderRadius: 4, fontSize: 8, color: "#e67e22", textAlign: "center" }}>
+                  SO CLOSE: Your side was ahead by {bestAdv} at move {bestMove}
+                </div>
+              );
+              if (bestAdv >= 0) return (
+                <div style={{ padding: "4px 10px", background: "rgba(231,76,60,0.06)", border: "1px solid rgba(231,76,60,0.15)", borderRadius: 4, fontSize: 8, color: "#4a5568", textAlign: "center" }}>
+                  Close game. Tied at move {bestMove}.
+                </div>
+              );
+              return null;
+            })()}
             {isFinished && (
               <>
                 <span style={{ fontSize: 14, fontWeight: 800, letterSpacing: 2, textTransform: "uppercase", color: result.winner === "red" ? "#e74c3c" : result.winner === "black" ? "#ecf0f1" : "#f39c12" }}>{result.winner === "draw" ? "DRAW" : `${result.winner === "red" ? (result.red_agent?.name || "RED") : (result.black_agent?.name || "BLACK")} wins`}</span>

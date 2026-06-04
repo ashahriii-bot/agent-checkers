@@ -155,6 +155,30 @@ def init_db():
             tournament_id INTEGER
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS parlays (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            tournament_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            predictions TEXT NOT NULL,
+            total_odds REAL NOT NULL,
+            correct INTEGER NOT NULL DEFAULT 0,
+            total INTEGER NOT NULL DEFAULT 0,
+            result TEXT DEFAULT 'pending',
+            payout INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS jackpot (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            pool INTEGER NOT NULL DEFAULT 0,
+            last_hit_at TEXT,
+            last_hit_amount INTEGER DEFAULT 0,
+            total_hits INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    conn.execute("INSERT OR IGNORE INTO jackpot (id, pool) VALUES (1, 0)")
     conn.execute("INSERT OR IGNORE INTO wallet (id, balance) VALUES (1, 1000)")
     # migrations
     match_cols = {r[1] for r in conn.execute("PRAGMA table_info(matches)").fetchall()}
@@ -713,6 +737,103 @@ def get_bet_history(limit: int = 50) -> list[dict]:
         "result": r["result"], "payout": r["payout"],
         "net": (r["payout"] - r["amount"]) if r["result"] == "win" else -r["amount"] if r["result"] else 0,
     } for r in rows]
+
+
+# --- jackpot ---
+
+JACKPOT_RATE = 0.03  # 3% of every bet goes to jackpot
+
+
+def get_jackpot() -> dict:
+    conn = get_db()
+    r = conn.execute("SELECT * FROM jackpot WHERE id = 1").fetchone()
+    conn.close()
+    if not r:
+        return {"pool": 0, "last_hit_amount": 0, "total_hits": 0}
+    return {"pool": r["pool"], "last_hit_amount": r["last_hit_amount"] or 0, "total_hits": r["total_hits"]}
+
+
+def add_to_jackpot(amount: int):
+    contribution = max(1, int(amount * JACKPOT_RATE))
+    conn = get_db()
+    conn.execute("UPDATE jackpot SET pool = pool + ? WHERE id = 1", (contribution,))
+    conn.commit()
+    conn.close()
+    return contribution
+
+
+def hit_jackpot() -> int:
+    conn = get_db()
+    r = conn.execute("SELECT pool FROM jackpot WHERE id = 1").fetchone()
+    pool = r["pool"] if r else 0
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE jackpot SET pool = 0, last_hit_at = ?, last_hit_amount = ?, total_hits = total_hits + 1 WHERE id = 1",
+                 (now, pool))
+    conn.commit()
+    conn.close()
+    return pool
+
+
+# --- streak ---
+
+STREAK_MULTIPLIERS = {0: 1.0, 3: 1.5, 5: 2.0, 7: 3.0, 10: 5.0}
+
+
+def get_streak_multiplier(streak: int) -> float:
+    mult = 1.0
+    for threshold, m in sorted(STREAK_MULTIPLIERS.items()):
+        if streak >= threshold:
+            mult = m
+    return mult
+
+
+def increment_streak(amount: int = 1) -> dict:
+    conn = get_db()
+    conn.execute("UPDATE wallet SET win_streak = win_streak + ? WHERE id = 1", (amount,))
+    w = conn.execute("SELECT win_streak, best_streak FROM wallet WHERE id = 1").fetchone()
+    best = max(w["win_streak"], w["best_streak"])
+    conn.execute("UPDATE wallet SET best_streak = ? WHERE id = 1", (best,))
+    conn.commit()
+    conn.close()
+    return {"streak": w["win_streak"], "multiplier": get_streak_multiplier(w["win_streak"])}
+
+
+def reset_streak() -> dict:
+    conn = get_db()
+    w = conn.execute("SELECT win_streak FROM wallet WHERE id = 1").fetchone()
+    old_streak = w["win_streak"] if w else 0
+    conn.execute("UPDATE wallet SET win_streak = 0 WHERE id = 1")
+    conn.commit()
+    conn.close()
+    return {"old_streak": old_streak, "streak": 0, "multiplier": 1.0}
+
+
+# --- parlays ---
+
+def save_parlay(tournament_id: int, amount: int, predictions: list, total_odds: float,
+                correct: int, total: int, result: str, payout: int) -> int:
+    conn = get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        "INSERT INTO parlays (created_at, tournament_id, amount, predictions, total_odds, correct, total, result, payout) VALUES (?,?,?,?,?,?,?,?,?)",
+        (now, tournament_id, amount, json.dumps(predictions), total_odds, correct, total, result, payout),
+    )
+    conn.commit()
+    pid = cursor.lastrowid
+    conn.close()
+    return pid
+
+
+PARLAY_CONSOLATION = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0.5, 5: 1.0, 6: 3.0}
+
+
+def calc_parlay_payout(correct: int, total: int, amount: int, total_odds: float) -> tuple[str, int]:
+    if correct == total:
+        return "full_hit", int(amount * total_odds)
+    mult = PARLAY_CONSOLATION.get(correct, 0)
+    if mult > 0:
+        return "consolation", int(amount * mult)
+    return "bust", 0
 
 
 init_db()
