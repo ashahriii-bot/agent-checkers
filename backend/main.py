@@ -16,7 +16,7 @@ from engine import (
     init_board, apply_move, get_all_moves, count_pieces,
     board_to_list, shrink_board, apply_king_fatigue, Piece, is_king,
 )
-from ai import AgentConfig, pick_move, detect_phase, calc_overextension_factor, suggest_names, apply_perk_overrides
+from ai import AgentConfig, pick_move, detect_phase, calc_overextension_factor, suggest_names, apply_perk_overrides, apply_progression_edges, EDGE_DEFINITIONS
 from auth import hash_password, verify_password, create_token, get_current_player_id, get_optional_player_id
 from coaches import COACHES, generate_bot_agent, get_coach_list
 from mirror import get_mirror_profile, get_mirror_history, generate_mirror_agent, record_mirror_bout
@@ -40,7 +40,10 @@ from database import (
     update_rivalry, get_rivalry, get_agent_rivalries,
     check_and_update_records, get_agent_records,
     set_player_wallet, get_player_usdc, adjust_player_usdc, record_crypto_tx, get_crypto_txs,
+    EDGE_UNLOCK_LEVELS,
+    process_agent_evolution, update_familiarity, get_familiarity_score, decay_familiarity, get_agent_familiarity,
 )
+from familiarity import categorize_opponent
 
 REAL_PLAY_MIN_BET_MICROS = 10_000      # $0.01
 REAL_PLAY_MAX_BET_MICROS = 10_000_000  # $10.00
@@ -163,7 +166,8 @@ def _init_perk_state(perk: str | None) -> dict | None:
 
 
 def _run_game(red_cfg: AgentConfig, black_cfg: AgentConfig,
-              red_perk: str | None = None, black_perk: str | None = None) -> dict:
+              red_perk: str | None = None, black_perk: str | None = None,
+              red_familiarity: float = 0.0, black_familiarity: float = 0.0) -> dict:
     board = init_board()
     turn = "black"
     moves = []
@@ -182,6 +186,11 @@ def _run_game(red_cfg: AgentConfig, black_cfg: AgentConfig,
     # perk state
     perk_state = {"red": _init_perk_state(red_perk), "black": _init_perk_state(black_perk)}
     moves_since_capture = 0
+    # progression-edge state (board-conditional / flux edges)
+    edge_by_side = {"red": red_perk, "black": black_perk}
+    familiarity_by_side = {"red": red_familiarity, "black": black_familiarity}
+    flux_state = {"red": {}, "black": {}}
+    prog_active = {"red": False, "black": False}
 
     while move_count < MAX_MOVES:
         if move_count >= SHRINK_START and (move_count - SHRINK_START) % SHRINK_INTERVAL == 0:
@@ -211,7 +220,16 @@ def _run_game(red_cfg: AgentConfig, black_cfg: AgentConfig,
         # apply perk overrides for the current player
         base_cfg = red_cfg if turn == "red" else black_cfg
         effective_cfg = apply_perk_overrides(base_cfg, perk_state[turn])
-        move = pick_move(board, turn, effective_cfg, phase=current_phase)
+        # progression edges (anchor/phantom/siege/flux) layer on top, board-conditional
+        effective_cfg, prog_on, prog_detail = apply_progression_edges(
+            effective_cfg, edge_by_side[turn], board, turn, move_count, flux_state[turn])
+        if prog_on and not prog_active[turn]:
+            events.append({"type": "perk_activate", "move": move_count, "side": turn,
+                           "perk": edge_by_side[turn], "duration": 0, "detail": prog_detail})
+        elif not prog_on and prog_active[turn]:
+            events.append({"type": "perk_deactivate", "move": move_count, "side": turn, "perk": edge_by_side[turn]})
+        prog_active[turn] = prog_on
+        move = pick_move(board, turn, effective_cfg, phase=current_phase, familiarity=familiarity_by_side[turn])
         if move is None:
             winner = "red" if turn == "black" else "black"; break
 
@@ -622,6 +640,30 @@ def api_agent_rivalries(agent_id: int):
     return {"rivalries": get_agent_rivalries(agent_id)}
 
 
+@app.get("/api/agents/{agent_id}/familiarity")
+def api_agent_familiarity(agent_id: int):
+    return {"familiarity": get_agent_familiarity(agent_id)}
+
+
+@app.get("/api/edges")
+def api_edges():
+    """Edge catalog with unlock levels and descriptions for the selection UI."""
+    descriptions = {
+        "rope_a_dope": "Tightens defense after being attacked",
+        "press": "Forces action during stalemates",
+        "momentum": "Captures breed more captures",
+        "anchor": "Back-row pieces become a fortress. Strong vs aggressors.",
+        "phantom": "Calculated counter-attack while behind. Strong vs grinders.",
+        "siege": "Kings become assault weapons. Strong vs turtles.",
+        "flux": "Playstyle shifts every 8 moves. Strong vs adaptive opponents.",
+    }
+    return {"edges": [
+        {"id": eid, "name": d["name"], "icon": d["icon"], "unlock_level": d["unlock_level"],
+         "description": descriptions.get(eid, "")}
+        for eid, d in EDGE_DEFINITIONS.items()
+    ]}
+
+
 @app.get("/api/jackpot")
 def api_get_jackpot():
     return get_jackpot()
@@ -905,6 +947,9 @@ def simulate_game(req: SimulateRequest):
 
     is_mirror = False
     mirror_meta = None
+    competitive = False   # only VS BOT medium+/mirror and multiplayer count for progression
+    opp_type = None
+    red_familiarity = 0.0
 
     if req.vs_bot:
         coach_id = req.vs_bot.coach_id
@@ -953,6 +998,12 @@ def simulate_game(req: SimulateRequest):
                 "king_priority": bot["king_priority"], "edge_affinity": bot["edge_affinity"],
                 "trade_down": bot["trade_down"], "elo": bot["elo"], "perk": bot["perk"],
             }
+        # competitive = mirror or a medium/hard coach (wildcard/easy doesn't count)
+        coach_obj = COACHES.get(coach_id)
+        competitive = (coach_id == "mirror") or (coach_obj is not None and coach_obj.difficulty in ("medium", "hard"))
+        if competitive and red_agent:
+            opp_type = categorize_opponent(bot_opponent)
+            red_familiarity = get_familiarity_score(red_agent["id"], opp_type)
     else:
         red_cfg, red_agent = _resolve_side(req.red_agent_id, req.red, "red")
         black_cfg, black_agent = _resolve_side(req.black_agent_id, req.black, "black")
@@ -961,7 +1012,8 @@ def simulate_game(req: SimulateRequest):
         red_perk = red_agent["perk"] if red_agent else None
         black_perk = black_agent["perk"] if black_agent else None
 
-    game = _run_game(red_cfg, black_cfg, red_perk=red_perk, black_perk=black_perk)
+    game = _run_game(red_cfg, black_cfg, red_perk=red_perk, black_perk=black_perk,
+                     red_familiarity=red_familiarity)
 
     result_red = 1.0 if game["winner"] == "red" else (0.0 if game["winner"] == "black" else 0.5)
     red_elo_after, black_elo_after = update_elo(red_elo_before, black_elo_before, result_red)
@@ -992,6 +1044,16 @@ def simulate_game(req: SimulateRequest):
         red_agent_id=red_agent["id"] if red_agent else None,
         black_agent_id=black_agent["id"] if black_agent else None,
     )
+
+    # --- progression: evolution + familiarity (competitive matches only) ---
+    evolution_result = None
+    if competitive and red_agent:
+        evolution_result = process_agent_evolution(red_agent["id"], red_result)
+        if opp_type:
+            update_familiarity(red_agent["id"], opp_type, won=(red_result == "win"))
+        fresh = get_agent(red_agent["id"])
+        if fresh and fresh["matches"] > 0 and fresh["matches"] % 50 == 0:
+            decay_familiarity(red_agent["id"])
 
     # --- betting ---
     bet_result = None
@@ -1039,6 +1101,8 @@ def simulate_game(req: SimulateRequest):
         resp["black_agent"] = {"id": black_agent["id"], "name": black_agent["name"], "perk": black_perk}
     if level_ups:
         resp["level_ups"] = level_ups
+    if evolution_result:
+        resp["evolution"] = evolution_result
     resp["bet"] = bet_result
 
     # --- prop bets ---

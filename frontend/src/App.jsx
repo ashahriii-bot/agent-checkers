@@ -20,10 +20,15 @@ const TAG_COLORS = { UPSET: "#f39c12", COMEBACK: "#2ecc71", NAIL_BITER: "#3498db
 const TAG_LABELS = { UPSET: "UPSET", COMEBACK: "COMEBACK", NAIL_BITER: "NAIL-BITER", DOMINANT: "DOMINANT", LAST_STAND: "LAST STAND" };
 
 const PERK_INFO = {
-  rope_a_dope: { name: "COUNTER", color: "#3498db", icon: "🛡️", short: "Tightens defense after being attacked", tag: "Strong vs aggressive fighters" },
-  press: { name: "SURGE", color: "#e67e22", icon: "⚡", short: "Forces action during stalemates", tag: "Strong vs defensive fighters" },
-  momentum: { name: "FRENZY", color: "#2ecc71", icon: "🔥", short: "Captures breed more captures", tag: "Strong vs mid-range fighters" },
+  rope_a_dope: { name: "COUNTER", color: "#3498db", icon: "🛡️", short: "Tightens defense after being attacked", tag: "Strong vs aggressive fighters", unlock: 5 },
+  press: { name: "SURGE", color: "#e67e22", icon: "⚡", short: "Forces action during stalemates", tag: "Strong vs defensive fighters", unlock: 5 },
+  momentum: { name: "FRENZY", color: "#2ecc71", icon: "🔥", short: "Captures breed more captures", tag: "Strong vs mid-range fighters", unlock: 5 },
+  anchor: { name: "ANCHOR", color: "#16a085", icon: "⚓", short: "Back-row pieces become a fortress", tag: "Strong vs aggressors", unlock: 15 },
+  phantom: { name: "PHANTOM", color: "#9b59b6", icon: "👻", short: "Calculated counter-attack while behind", tag: "Strong vs grinders", unlock: 15 },
+  siege: { name: "SIEGE", color: "#e74c3c", icon: "🏰", short: "Kings become assault weapons", tag: "Strong vs turtles", unlock: 25 },
+  flux: { name: "FLUX", color: "#f1c40f", icon: "🌀", short: "Playstyle shifts every 8 moves", tag: "Strong vs adaptive foes", unlock: 25 },
 };
+const EDGE_ORDER = ["rope_a_dope", "press", "momentum", "anchor", "phantom", "siege", "flux"];
 
 const ADJECTIVE_POOLS = {
   aggression: ["Reckless", "Savage", "Furious", "Relentless", "Vicious"],
@@ -103,17 +108,33 @@ function MiniBars({ config, width = "100%" }) {
   );
 }
 
-function Piece({ type, highlight }) {
+function Piece({ type, highlight, level = 1 }) {
   if (type <= 0) return null;
   const red = isRed(type);
   const king = isKing(type);
+  // cosmetic confidence by level band (visual only, no gameplay effect -- spec Layer 4):
+  // 1-4 standard / 5-9 subtle glow / 10-14 defined glow+sharper shadow / 15-19 veteran
+  // stripe ring / 20-24 gold-tinted ring / 25+ full gold ring, confident glow, larger shadow.
+  const tier = level >= 25 ? 5 : level >= 20 ? 4 : level >= 15 ? 3 : level >= 10 ? 2 : level >= 5 ? 1 : 0;
+  const glowRGB = red ? "231,76,60" : "210,220,235";
+  const baseShadow = highlight
+    ? `0 0 16px 4px ${red ? "rgba(231,76,60,0.6)" : "rgba(200,210,220,0.5)"}`
+    : (tier >= 5 ? "0 4px 9px rgba(0,0,0,0.5), inset 0 1px 2px rgba(255,255,255,0.2)"
+       : tier >= 2 ? "0 3px 7px rgba(0,0,0,0.5), inset 0 1px 2px rgba(255,255,255,0.2)"
+       : "0 3px 6px rgba(0,0,0,0.4), inset 0 1px 2px rgba(255,255,255,0.2)");
+  const veteranGlow = ["", `, 0 0 5px rgba(${glowRGB},0.28)`, `, 0 0 8px rgba(${glowRGB},0.42)`,
+    `, 0 0 9px rgba(${glowRGB},0.45)`, `, 0 0 12px rgba(255,215,0,0.4)`, `, 0 0 16px rgba(255,215,0,0.55)`][tier];
+  const veteranRing = tier >= 5 ? "2.5px solid rgba(255,215,0,0.85)"
+    : tier === 4 ? "2px solid rgba(255,215,0,0.6)"
+    : tier === 3 ? "2px solid rgba(220,225,235,0.5)"
+    : (king ? "2px solid #ffd700" : "1px solid rgba(0,0,0,0.2)");
   return (
     <div style={{
       width: "78%", height: "78%", borderRadius: "50%",
       display: "flex", alignItems: "center", justifyContent: "center",
       background: red ? "radial-gradient(circle at 35% 35%, #ff6b6b, #c0392b)" : "radial-gradient(circle at 35% 35%, #f0f0f0, #95a5a6)",
-      boxShadow: highlight ? `0 0 16px 4px ${red ? "rgba(231,76,60,0.6)" : "rgba(200,210,220,0.5)"}` : "0 3px 6px rgba(0,0,0,0.4), inset 0 1px 2px rgba(255,255,255,0.2)",
-      border: king ? "2px solid #ffd700" : "1px solid rgba(0,0,0,0.2)",
+      boxShadow: baseShadow + veteranGlow,
+      border: veteranRing,
       transition: "all 0.3s", transform: highlight ? "scale(1.05)" : "scale(1)",
     }}>
       {king && <span style={{ fontSize: 12, color: "#ffd700", textShadow: "0 1px 2px rgba(0,0,0,0.5)" }}>&#9813;</span>}
@@ -121,7 +142,7 @@ function Piece({ type, highlight }) {
   );
 }
 
-function BoardGrid({ board, lastMove, maxWidth = 380 }) {
+function BoardGrid({ board, lastMove, maxWidth = 380, redLevel = 1, blackLevel = 1 }) {
   return (
     <div style={{
       display: "grid", gridTemplateColumns: `repeat(${SIZE}, 1fr)`,
@@ -141,7 +162,7 @@ function BoardGrid({ board, lastMove, maxWidth = 380 }) {
               transition: "background 0.4s", position: "relative",
             }}>
               {isDead && <div style={{ position: "absolute", inset: 0, background: "repeating-linear-gradient(45deg, transparent, transparent 3px, rgba(231,76,60,0.08) 3px, rgba(231,76,60,0.08) 6px)" }} />}
-              {cell > 0 && <Piece type={cell} highlight={isLastTo} />}
+              {cell > 0 && <Piece type={cell} highlight={isLastTo} level={isRed(cell) ? redLevel : blackLevel} />}
             </div>
           );
         })
@@ -725,9 +746,9 @@ function LevelBadge({ level }) {
   );
 }
 
-function XpBar({ xp, xpNext, level }) {
+function XpBar({ xp, xpNext, xpCurrent = 0, level }) {
   if (!xpNext) return <span style={{ fontSize: 7, color: "#ffd700" }}>MAX</span>;
-  const prevThreshold = { 1: 0, 2: 5, 3: 15, 4: 30, 5: 50 }[level] || 0;
+  const prevThreshold = xpCurrent;
   const progress = (xp - prevThreshold) / (xpNext - prevThreshold);
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
@@ -750,9 +771,10 @@ function PerkBadge({ perk }) {
   );
 }
 
-function PerkSelector({ agentId, onSelect }) {
+function PerkSelector({ agentId, agentLevel = 5, onSelect }) {
   const [saving, setSaving] = useState(false);
   const [chosen, setChosen] = useState(null);
+  const unlockedCount = EDGE_ORDER.filter(k => agentLevel >= PERK_INFO[k].unlock).length;
 
   const confirm = async () => {
     if (!chosen) return;
@@ -768,21 +790,29 @@ function PerkSelector({ agentId, onSelect }) {
 
   return (
     <div style={{ padding: 8, background: "#0a0c10", border: "1px solid #ffd70033", borderRadius: 6, marginTop: 6 }}>
-      <div style={{ fontSize: 8, fontWeight: 700, color: "#ffd700", letterSpacing: 1, marginBottom: 6, textTransform: "uppercase" }}>Choose your Edge</div>
-      {Object.entries(PERK_INFO).map(([key, info]) => (
-        <div key={key} onClick={() => setChosen(key)} style={{
-          padding: "6px 8px", marginBottom: 4, borderRadius: 4, cursor: "pointer",
-          background: chosen === key ? info.color + "15" : "#0d1117",
-          border: `1px solid ${chosen === key ? info.color + "66" : "#1a1f2b"}`,
-        }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 2 }}>
-            <span style={{ fontSize: 12 }}>{info.icon}</span>
-            <span style={{ fontSize: 9, fontWeight: 700, color: info.color }}>{info.name}</span>
+      <div style={{ fontSize: 8, fontWeight: 700, color: "#ffd700", letterSpacing: 1, marginBottom: 6, textTransform: "uppercase" }}>Choose your Edge ({unlockedCount} of {EDGE_ORDER.length} unlocked)</div>
+      {EDGE_ORDER.map((key) => {
+        const info = PERK_INFO[key];
+        const locked = agentLevel < info.unlock;
+        return (
+          <div key={key} onClick={() => !locked && setChosen(key)} style={{
+            padding: "6px 8px", marginBottom: 4, borderRadius: 4, cursor: locked ? "not-allowed" : "pointer",
+            background: chosen === key ? info.color + "15" : "#0d1117",
+            border: `1px solid ${chosen === key ? info.color + "66" : "#1a1f2b"}`,
+            opacity: locked ? 0.45 : 1,
+          }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 2 }}>
+              <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                <span style={{ fontSize: 12 }}>{info.icon}</span>
+                <span style={{ fontSize: 9, fontWeight: 700, color: locked ? "#4a5568" : info.color }}>{info.name}</span>
+              </span>
+              {locked && <span style={{ fontSize: 7, color: "#8892a0" }}>🔒 Level {info.unlock}</span>}
+            </div>
+            <div style={{ fontSize: 8, color: "#8892a0" }}>{info.short}</div>
+            <div style={{ fontSize: 7, color: "#4a5568", marginTop: 1 }}>{info.tag}</div>
           </div>
-          <div style={{ fontSize: 8, color: "#8892a0" }}>{info.short}</div>
-          <div style={{ fontSize: 7, color: "#4a5568", marginTop: 1 }}>{info.tag}</div>
-        </div>
-      ))}
+        );
+      })}
       <div style={{ display: "flex", gap: 4, marginTop: 4 }}>
         <button onClick={confirm} disabled={!chosen || saving} style={{
           flex: 1, padding: "4px 0", borderRadius: 3, border: "none", fontFamily: "inherit",
@@ -791,6 +821,40 @@ function PerkSelector({ agentId, onSelect }) {
         }}>{saving ? "..." : "CONFIRM"}</button>
       </div>
       <div style={{ fontSize: 7, color: "#3a4450", marginTop: 3, textAlign: "center" }}>you can change your edge anytime</div>
+    </div>
+  );
+}
+
+function EvolutionDeltas({ agent }) {
+  const orig = agent.original;
+  if (!orig) return null;
+  const anyDrift = SLIDER_KEYS.some(s => agent[s.key] !== orig[s.key]);
+  if (!anyDrift) return null;
+  return (
+    <div style={{ marginTop: 3, fontSize: 7, color: "#4a5568", display: "flex", gap: 6, flexWrap: "wrap" }}>
+      <span style={{ color: "#8892a0" }}>EVOLVED:</span>
+      {SLIDER_KEYS.map(s => {
+        const cur = agent[s.key], o = orig[s.key], d = cur - o;
+        if (d === 0) return null;
+        return <span key={s.key}>{s.short} {cur}<span style={{ color: "#3a4450" }}>←{o}</span> <span style={{ color: d > 0 ? "#2ecc71" : "#e74c3c" }}>({d > 0 ? "+" : ""}{d})</span></span>;
+      })}
+    </div>
+  );
+}
+
+function FamiliarityBars({ familiarity }) {
+  return (
+    <div style={{ marginTop: 4 }}>
+      <div style={{ fontSize: 6, color: "#4a5568", letterSpacing: 1, textTransform: "uppercase", marginBottom: 1 }}>Matchup experience</div>
+      {familiarity.filter(f => f.matches_faced > 0).map(f => (
+        <div key={f.type} style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 1 }} title={`${f.matches_faced} bouts, ${f.wins} wins`}>
+          <span style={{ fontSize: 6, color: "#8892a0", width: 52 }}>{f.label}</span>
+          <div style={{ flex: 1, height: 3, background: "#1a1f2b", borderRadius: 2, overflow: "hidden" }}>
+            <div style={{ width: `${Math.round(f.familiarity_score * 100)}%`, height: "100%", background: "#16a085", borderRadius: 2 }} />
+          </div>
+          <span style={{ fontSize: 6, color: "#4a5568", width: 38, textAlign: "right" }}>{Math.round(f.familiarity_score * 100)}% ({f.matches_faced})</span>
+        </div>
+      ))}
     </div>
   );
 }
@@ -835,6 +899,16 @@ function RosterPanel({ side, color, selectedAgent, onSelect, roster, disabled, m
   const [suggestions, setSuggestions] = useState([]);
   const [saving, setSaving] = useState(false);
   const [editingAgent, setEditingAgent] = useState(null);
+  const [editingEdge, setEditingEdge] = useState(false);
+  const [familiarity, setFamiliarity] = useState(null);
+
+  // load familiarity + reset edge picker when the selected agent changes
+  useEffect(() => {
+    setEditingEdge(false);
+    if (selectedAgent?.id) {
+      fetch(`${API}/agents/${selectedAgent.id}/familiarity`).then(r => r.json()).then(d => setFamiliarity(d.familiarity)).catch(() => setFamiliarity(null));
+    } else { setFamiliarity(null); }
+  }, [selectedAgent?.id]);
 
   const refreshSuggestions = (cfg) => setSuggestions(localSuggestNames(cfg));
 
@@ -950,11 +1024,18 @@ function RosterPanel({ side, color, selectedAgent, onSelect, roster, disabled, m
             <span style={{ fontSize: 13, fontWeight: 800, color: "#8892a0" }}>{Math.round(selectedAgent.elo)} <span style={{ fontSize: 8, fontWeight: 400 }}>ELO</span></span>
             <span style={{ fontSize: 7, color: "#4a5568" }}>{selectedAgent.wins}W {selectedAgent.losses}L {selectedAgent.draws}D</span>
           </div>
-          <XpBar xp={selectedAgent.xp || 0} xpNext={selectedAgent.xp_next} level={selectedAgent.level || 1} />
+          <XpBar xp={selectedAgent.xp || 0} xpNext={selectedAgent.xp_next} xpCurrent={selectedAgent.xp_current || 0} level={selectedAgent.level || 1} />
           <MiniBars config={selectedAgent} /><OverextWarning config={selectedAgent} />
-          {selectedAgent.perk && <div style={{ marginTop: 3 }}><PerkBadge perk={selectedAgent.perk} /></div>}
-          {(selectedAgent.level || 1) >= 5 && !selectedAgent.perk && (
-            <PerkSelector agentId={selectedAgent.id} onSelect={(updated) => { onSelect(updated); onRosterChange(); }} />
+          <EvolutionDeltas agent={selectedAgent} />
+          {familiarity && familiarity.some(f => f.matches_faced > 0) && <FamiliarityBars familiarity={familiarity} />}
+          {selectedAgent.perk && (
+            <div style={{ marginTop: 3, display: "flex", alignItems: "center", gap: 6 }}>
+              <PerkBadge perk={selectedAgent.perk} />
+              <button onClick={() => setEditingEdge(v => !v)} style={{ fontSize: 6, background: "none", border: "1px solid #21262d", color: "#4a5568", borderRadius: 3, padding: "1px 4px", cursor: "pointer", fontFamily: "inherit" }}>CHANGE EDGE</button>
+            </div>
+          )}
+          {(selectedAgent.level || 1) >= 5 && (editingEdge || !selectedAgent.perk) && (
+            <PerkSelector agentId={selectedAgent.id} agentLevel={selectedAgent.level || 1} onSelect={(updated) => { onSelect(updated); onRosterChange(); setEditingEdge(false); }} />
           )}
         </div>
       )}
@@ -1552,7 +1633,7 @@ export default function App() {
 
             {/* board with overlaid event banners */}
             <div style={{ position: "relative" }}>
-              <BoardGrid board={board} lastMove={lastMove} />
+              <BoardGrid board={board} lastMove={lastMove} redLevel={redAgent?.level || 1} blackLevel={blackAgent?.level || 1} />
               {/* overlay banners: position absolute, no layout shift */}
               {activeShrinkEvent && <div style={{ position: "absolute", top: 0, left: 0, right: 0, padding: "6px 12px", background: "rgba(231,76,60,0.88)", borderRadius: "6px 6px 0 0", fontSize: 10, color: "#fff", letterSpacing: 1, textTransform: "uppercase", textAlign: "center", zIndex: 10 }}>board shrinking: {activeShrinkEvent.killed.length} squares eliminated</div>}
               {activeFatigueEvent && <div style={{ position: "absolute", top: 0, left: 0, right: 0, padding: "6px 12px", background: "rgba(241,196,15,0.88)", borderRadius: "6px 6px 0 0", fontSize: 10, color: "#0d1117", letterSpacing: 1, textTransform: "uppercase", textAlign: "center", zIndex: 10 }}>king fatigue: idle kings demoted</div>}
@@ -1771,10 +1852,29 @@ export default function App() {
               );
             })()}
             {isFinished && result.level_ups && result.level_ups.map((lu, i) => (
-              <div key={i} style={{ padding: "4px 10px", borderRadius: 4, fontSize: 9, letterSpacing: 1, textTransform: "uppercase", background: lu.perk_unlocked ? "rgba(255,215,0,0.12)" : "rgba(46,204,113,0.12)", border: `1px solid ${lu.perk_unlocked ? "rgba(255,215,0,0.3)" : "rgba(46,204,113,0.3)"}`, color: lu.perk_unlocked ? "#ffd700" : "#2ecc71" }}>
-                {lu.name} reached Level {lu.new_level}{lu.perk_unlocked ? " -- Choose an edge!" : ""}
+              <div key={i}>
+                <div style={{ padding: "4px 10px", borderRadius: 4, fontSize: 9, letterSpacing: 1, textTransform: "uppercase", background: lu.perk_unlocked ? "rgba(255,215,0,0.12)" : "rgba(46,204,113,0.12)", border: `1px solid ${lu.perk_unlocked ? "rgba(255,215,0,0.3)" : "rgba(46,204,113,0.3)"}`, color: lu.perk_unlocked ? "#ffd700" : "#2ecc71" }}>
+                  {lu.name} reached Level {lu.new_level}{lu.perk_unlocked ? " -- Choose an edge!" : ""}
+                </div>
+                {lu.new_level >= 15 && lu.old_level < 15 && (
+                  <div style={{ padding: "3px 10px", marginTop: 2, borderRadius: 4, fontSize: 8, background: "rgba(22,160,133,0.12)", border: "1px solid rgba(22,160,133,0.3)", color: "#16a085" }}>NEW EDGES UNLOCKED: Anchor ⚓ and Phantom 👻</div>
+                )}
+                {lu.new_level >= 25 && lu.old_level < 25 && (
+                  <div style={{ padding: "3px 10px", marginTop: 2, borderRadius: 4, fontSize: 8, background: "rgba(231,76,60,0.12)", border: "1px solid rgba(231,76,60,0.3)", color: "#e74c3c" }}>NEW EDGES UNLOCKED: Siege 🏰 and Flux 🌀</div>
+                )}
               </div>
             ))}
+            {/* evolution notification */}
+            {isFinished && result.evolution && (
+              <div style={{ width: "100%", padding: "5px 10px", background: "rgba(155,89,182,0.1)", border: "1px solid rgba(155,89,182,0.3)", borderRadius: 4, fontSize: 8 }}>
+                <div style={{ fontSize: 7, color: "#9b59b6", letterSpacing: 1, textTransform: "uppercase", marginBottom: 2 }}>🧬 Evolution · {result.evolution.matches_analyzed} bouts analyzed</div>
+                <div style={{ fontSize: 9, fontWeight: 700, color: "#c8d0da", marginBottom: 2 }}>{result.evolution.agent_name} evolved</div>
+                {Object.entries(result.evolution.changes).map(([s, c]) => (
+                  <div key={s} style={{ color: "#8892a0" }}>{s.replace("_", " ")}: {c.from} → {c.to} <span style={{ color: (c.to - c.from) > 0 ? "#2ecc71" : "#e74c3c" }}>({(c.to - c.from) > 0 ? "+" : ""}{c.to - c.from})</span></div>
+                ))}
+                <div style={{ fontSize: 7, color: "#6b7280", marginTop: 2, fontStyle: "italic" }}>Sliders nudged toward what's been winning over the last {result.evolution.matches_analyzed} competitive bouts.</div>
+              </div>
+            )}
             {/* prop bet results */}
             {isFinished && result.prop_results && result.prop_results.length > 0 && (
               <div style={{ width: "100%", padding: "4px 8px", background: "#0a0c10", border: "1px solid #1a1f2b", borderRadius: 4, fontSize: 8, marginTop: 4 }}>

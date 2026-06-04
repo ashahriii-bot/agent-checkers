@@ -2,7 +2,10 @@ node_modules/
 __pycache__/
 *.pyc
 backend/venv/
+.venv/
 backend/matches.db
+backend/matches.db-shm
+backend/matches.db-wal
 backend/static/
 frontend/dist/
 .env

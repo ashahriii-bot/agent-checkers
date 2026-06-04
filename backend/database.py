@@ -14,21 +14,31 @@ DB_PATH = Path(os.environ.get("DB_PATH", str(Path(__file__).parent / "matches.db
 K_FACTOR = 32
 DEFAULT_ELO = 1200
 
-LEVEL_THRESHOLDS = {1: 0, 2: 5, 3: 15, 4: 30, 5: 50}
-VALID_PERKS = {"rope_a_dope", "press", "momentum"}
+# Levels run 1..MAX_LEVEL. The original curve (L1=0, L2=5, L3=15, L4=30, L5=50)
+# is exactly total_xp(N) = 5*N*(N-1)/2, so we continue that same quadratic up to 25.
+# XP is flat (1 per match), so this reaches: L15=525 matches, L20=950, L25=1500 --
+# the progression edges (L15/L25) and the veteran cosmetics land for genuine
+# long-haul agents, matching the spec's "500-match veteran" framing.
+MAX_LEVEL = 25
+LEVEL_THRESHOLDS = {lv: (5 * lv * (lv - 1)) // 2 for lv in range(1, MAX_LEVEL + 1)}
+# edge -> agent level required to equip it
+EDGE_UNLOCK_LEVELS = {
+    "rope_a_dope": 5, "press": 5, "momentum": 5,
+    "anchor": 15, "phantom": 15,
+    "siege": 25, "flux": 25,
+}
+VALID_PERKS = set(EDGE_UNLOCK_LEVELS.keys())
 
 
 def xp_to_level(xp: int) -> int:
-    level = 1
-    for lv in (5, 4, 3, 2):
+    for lv in range(MAX_LEVEL, 1, -1):
         if xp >= LEVEL_THRESHOLDS[lv]:
-            level = lv
-            break
-    return level
+            return lv
+    return 1
 
 
 def xp_for_next_level(level: int) -> int | None:
-    if level >= 5:
+    if level >= MAX_LEVEL:
         return None
     return LEVEL_THRESHOLDS[level + 1]
 
@@ -277,6 +287,27 @@ def init_db():
         conn.execute("ALTER TABLE agents ADD COLUMN player_id INTEGER")
     if "recent_results" not in agent_cols:
         conn.execute("ALTER TABLE agents ADD COLUMN recent_results TEXT DEFAULT '[]'")
+    # progression: adaptive sliders. original_* is the +/-10 drift reference.
+    for slider in ("aggression", "risk_tolerance", "king_priority", "edge_affinity", "trade_down"):
+        col = f"original_{slider}"
+        if col not in agent_cols:
+            conn.execute(f"ALTER TABLE agents ADD COLUMN {col} INTEGER")
+            conn.execute(f"UPDATE agents SET {col} = {slider} WHERE {col} IS NULL")
+    if "evolution_matches" not in agent_cols:
+        conn.execute("ALTER TABLE agents ADD COLUMN evolution_matches INTEGER NOT NULL DEFAULT 0")
+    if "evolution_log" not in agent_cols:
+        conn.execute("ALTER TABLE agents ADD COLUMN evolution_log TEXT DEFAULT '[]'")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS agent_familiarity (
+            agent_id INTEGER NOT NULL,
+            matchup_type TEXT NOT NULL,
+            matches_faced INTEGER NOT NULL DEFAULT 0,
+            wins INTEGER NOT NULL DEFAULT 0,
+            familiarity_score REAL NOT NULL DEFAULT 0.0,
+            last_faced_at TEXT,
+            PRIMARY KEY (agent_id, matchup_type)
+        )
+    """)
     # real-play (USDC) columns on players. usdc_micros = integer micro-USDC (1 USDC = 1_000_000)
     player_cols = {r[1] for r in conn.execute("PRAGMA table_info(players)").fetchall()}
     if "wallet_address" not in player_cols:
@@ -296,6 +327,12 @@ def init_db():
             detail TEXT
         )
     """)
+    # recompute stored levels against the (possibly extended) XP curve, so existing
+    # veterans are not stuck at the old L5 cap until their next match. Idempotent.
+    for row in conn.execute("SELECT id, xp, level FROM agents").fetchall():
+        correct = xp_to_level(row["xp"] or 0)
+        if correct != (row["level"] or 1):
+            conn.execute("UPDATE agents SET level=? WHERE id=?", (correct, row["id"]))
     conn.commit()
     _seed_starter_agents(conn)
     conn.close()
@@ -334,11 +371,15 @@ def _calc_form(recent_results_json: str) -> str:
 
 
 def _agent_row_to_dict(r) -> dict:
-    xp = r["xp"] if "xp" in r.keys() else 0
-    level = r["level"] if "level" in r.keys() else 1
-    perk = r["perk"] if "perk" in r.keys() else None
+    keys = r.keys()
+    xp = r["xp"] if "xp" in keys else 0
+    level = r["level"] if "level" in keys else 1
+    perk = r["perk"] if "perk" in keys else None
     next_xp = xp_for_next_level(level)
-    recent = r["recent_results"] if "recent_results" in r.keys() else "[]"
+    cur_xp = LEVEL_THRESHOLDS.get(level, 0)
+    recent = r["recent_results"] if "recent_results" in keys else "[]"
+    SLIDERS = ("aggression", "risk_tolerance", "king_priority", "edge_affinity", "trade_down")
+    original = {s: (r[f"original_{s}"] if f"original_{s}" in keys and r[f"original_{s}"] is not None else r[s]) for s in SLIDERS}
     return {
         "id": r["id"],
         "name": r["name"],
@@ -357,7 +398,10 @@ def _agent_row_to_dict(r) -> dict:
         "level": level,
         "perk": perk,
         "xp_next": next_xp,
+        "xp_current": cur_xp,
         "form": _calc_form(recent),
+        "original": original,
+        "evolution_matches": r["evolution_matches"] if "evolution_matches" in keys else 0,
     }
 
 
@@ -367,8 +411,11 @@ def create_agent(name: str, aggression: int, risk_tolerance: int, king_priority:
     now = datetime.now(timezone.utc).isoformat()
     try:
         cursor = conn.execute(
-            "INSERT INTO agents (name, aggression, risk_tolerance, king_priority, edge_affinity, trade_down, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
-            (name, aggression, risk_tolerance, king_priority, edge_affinity, trade_down, now, now),
+            """INSERT INTO agents (name, aggression, risk_tolerance, king_priority, edge_affinity, trade_down,
+                original_aggression, original_risk_tolerance, original_king_priority, original_edge_affinity, original_trade_down,
+                created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (name, aggression, risk_tolerance, king_priority, edge_affinity, trade_down,
+             aggression, risk_tolerance, king_priority, edge_affinity, trade_down, now, now),
         )
         conn.commit()
         agent_id = cursor.lastrowid
@@ -415,10 +462,14 @@ def update_agent(agent_id: int, name: str | None = None, aggression: int | None 
     )
     try:
         if config_changed:
+            # editing resets the agent: new originals become the drift reference, evolution restarts
             conn.execute(
-                "UPDATE agents SET name=?, aggression=?, risk_tolerance=?, king_priority=?, edge_affinity=?, trade_down=?, elo=1200, wins=0, losses=0, draws=0, matches=0, updated_at=? WHERE id=?",
-                (new_name, new_a, new_r, new_k, new_e, new_t, now, agent_id),
+                """UPDATE agents SET name=?, aggression=?, risk_tolerance=?, king_priority=?, edge_affinity=?, trade_down=?,
+                   original_aggression=?, original_risk_tolerance=?, original_king_priority=?, original_edge_affinity=?, original_trade_down=?,
+                   evolution_matches=0, evolution_log='[]', elo=1200, wins=0, losses=0, draws=0, matches=0, updated_at=? WHERE id=?""",
+                (new_name, new_a, new_r, new_k, new_e, new_t, new_a, new_r, new_k, new_e, new_t, now, agent_id),
             )
+            conn.execute("DELETE FROM agent_familiarity WHERE agent_id=?", (agent_id,))
         else:
             conn.execute(
                 "UPDATE agents SET name=?, updated_at=? WHERE id=?",
@@ -436,9 +487,122 @@ def update_agent(agent_id: int, name: str | None = None, aggression: int | None 
 def delete_agent(agent_id: int) -> bool:
     conn = get_db()
     cursor = conn.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
+    conn.execute("DELETE FROM agent_familiarity WHERE agent_id = ?", (agent_id,))
     conn.commit()
     conn.close()
     return cursor.rowcount > 0
+
+
+# --- progression: adaptive sliders (evolution) ---
+
+def process_agent_evolution(agent_id: int, result: str) -> dict | None:
+    """Record one competitive result; every EVOLUTION_WINDOW matches, evolve the
+    sliders and return a changes dict for the notification (else None)."""
+    from evolution import evolve_sliders, clamp_to_cap, EVOLUTION_WINDOW, SLIDERS
+    conn = get_db()
+    row = conn.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+    if not row:
+        conn.close()
+        return None
+    try:
+        log = json.loads(row["evolution_log"]) if row["evolution_log"] else []
+    except (json.JSONDecodeError, TypeError):
+        log = []
+    log.append(result)
+    em = (row["evolution_matches"] or 0) + 1
+
+    if em < EVOLUTION_WINDOW:
+        conn.execute("UPDATE agents SET evolution_matches=?, evolution_log=? WHERE id=?",
+                     (em, json.dumps(log[-EVOLUTION_WINDOW:]), agent_id))
+        conn.commit(); conn.close()
+        return None
+
+    wins = sum(1 for r in log if r == "win")
+    losses = sum(1 for r in log if r == "loss")
+    agent = _agent_row_to_dict(row)
+    adjustments = evolve_sliders(agent, wins, losses)
+
+    changes = {}
+    sets = []
+    params = []
+    for slider in SLIDERS:
+        adj = adjustments.get(slider, 0)
+        if adj == 0:
+            continue
+        current = row[slider]
+        original = row[f"original_{slider}"] if row[f"original_{slider}"] is not None else current
+        new_val = clamp_to_cap(current, adj, original)
+        if new_val != current:
+            sets.append(f"{slider}=?")
+            params.append(new_val)
+            changes[slider] = {"from": current, "to": new_val, "original": original, "drift": new_val - original}
+
+    sets.append("evolution_matches=0")
+    sets.append("evolution_log='[]'")
+    params.append(agent_id)
+    conn.execute(f"UPDATE agents SET {', '.join(sets)} WHERE id=?", tuple(params))
+    conn.commit(); conn.close()
+
+    if not changes:
+        return None
+    return {
+        "agent_id": agent_id, "agent_name": row["name"],
+        "changes": changes,
+        "total_drift": sum(c["drift"] for c in changes.values()),
+        "matches_analyzed": EVOLUTION_WINDOW,
+    }
+
+
+# --- progression: matchup familiarity ---
+
+def update_familiarity(agent_id: int, matchup_type: str, won: bool):
+    from familiarity import calculate_familiarity
+    conn = get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    row = conn.execute("SELECT matches_faced, wins FROM agent_familiarity WHERE agent_id=? AND matchup_type=?",
+                       (agent_id, matchup_type)).fetchone()
+    if row:
+        faced = row["matches_faced"] + 1
+        w = row["wins"] + (1 if won else 0)
+        conn.execute("UPDATE agent_familiarity SET matches_faced=?, wins=?, familiarity_score=?, last_faced_at=? WHERE agent_id=? AND matchup_type=?",
+                     (faced, w, calculate_familiarity(faced), now, agent_id, matchup_type))
+    else:
+        faced = 1
+        conn.execute("INSERT INTO agent_familiarity (agent_id, matchup_type, matches_faced, wins, familiarity_score, last_faced_at) VALUES (?,?,?,?,?,?)",
+                     (agent_id, matchup_type, 1, 1 if won else 0, calculate_familiarity(1), now))
+    conn.commit(); conn.close()
+
+
+def get_familiarity_score(agent_id: int, matchup_type: str) -> float:
+    conn = get_db()
+    row = conn.execute("SELECT familiarity_score FROM agent_familiarity WHERE agent_id=? AND matchup_type=?",
+                       (agent_id, matchup_type)).fetchone()
+    conn.close()
+    return row["familiarity_score"] if row else 0.0
+
+
+def decay_familiarity(agent_id: int):
+    """Use it or lose it: reduce all familiarity scores by 10%."""
+    conn = get_db()
+    conn.execute("UPDATE agent_familiarity SET familiarity_score = familiarity_score * 0.9 WHERE agent_id=? AND familiarity_score > 0", (agent_id,))
+    conn.commit(); conn.close()
+
+
+def get_agent_familiarity(agent_id: int) -> list[dict]:
+    from familiarity import MATCHUP_TYPES, MATCHUP_LABELS
+    conn = get_db()
+    rows = {r["matchup_type"]: r for r in conn.execute("SELECT * FROM agent_familiarity WHERE agent_id=?", (agent_id,)).fetchall()}
+    conn.close()
+    out = []
+    for t in MATCHUP_TYPES:
+        r = rows.get(t)
+        out.append({
+            "type": t, "label": MATCHUP_LABELS[t],
+            "matches_faced": r["matches_faced"] if r else 0,
+            "wins": r["wins"] if r else 0,
+            "familiarity_score": round(r["familiarity_score"], 3) if r else 0.0,
+        })
+    return out
 
 
 def update_agent_after_match(agent_id: int, new_elo: float, result: str) -> dict | None:
@@ -471,8 +635,11 @@ def update_agent_after_match(agent_id: int, new_elo: float, result: str) -> dict
     conn.commit()
     conn.close()
     if new_level > old_level:
+        # "edge unlocked" only when this level-up crosses an edge-availability threshold
+        # (L5 first slot, L15 anchor/phantom, L25 siege/flux) -- not every cosmetic level.
+        edge_unlocked = any(old_level < t <= new_level for t in (5, 15, 25))
         return {"agent_id": agent_id, "name": row["name"], "old_level": old_level,
-                "new_level": new_level, "perk_unlocked": new_level >= 5}
+                "new_level": new_level, "perk_unlocked": edge_unlocked}
     return None
 
 
@@ -485,7 +652,7 @@ def set_agent_perk(agent_id: int, perk: str | None) -> dict | None:
         conn.close()
         return None
     level = row["level"] if row["level"] else 1
-    if perk is not None and level < 5:
+    if perk is not None and level < EDGE_UNLOCK_LEVELS.get(perk, 5):
         conn.close()
         return None
     now = datetime.now(timezone.utc).isoformat()

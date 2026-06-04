@@ -12,7 +12,9 @@ from database import (
     get_agent, update_agent_after_match, update_elo, save_match,
     calculate_match_odds, get_player, update_player_coins,
     get_player_usdc, adjust_player_usdc, record_crypto_tx,
+    process_agent_evolution, update_familiarity, get_familiarity_score, decay_familiarity,
 )
+from familiarity import categorize_opponent
 from matchmaking import queue, online, QueueEntry
 from crypto import crypto_service, micros_to_usdc
 
@@ -184,8 +186,15 @@ async def _run_multiplayer_match(red: QueueEntry, black: QueueEntry):
     black_cfg = AgentConfig(aggression=black_agent["aggression"], risk_tolerance=black_agent["risk_tolerance"],
                             king_priority=black_agent["king_priority"], edge_affinity=black_agent["edge_affinity"],
                             trade_down=black_agent["trade_down"])
+    # matchup familiarity (multiplayer is always competitive): each side vs the other's type
+    red_type = categorize_opponent(black_agent)
+    black_type = categorize_opponent(red_agent)
+    red_fam = get_familiarity_score(red.agent_id, red_type)
+    black_fam = get_familiarity_score(black.agent_id, black_type)
+
     game = run_game(red_cfg, black_cfg,
-                    red_perk=red_agent.get("perk"), black_perk=black_agent.get("perk"))
+                    red_perk=red_agent.get("perk"), black_perk=black_agent.get("perk"),
+                    red_familiarity=red_fam, black_familiarity=black_fam)
 
     # elo update
     result_red = 1.0 if game["winner"] == "red" else (0.0 if game["winner"] == "black" else 0.5)
@@ -194,6 +203,14 @@ async def _run_multiplayer_match(red: QueueEntry, black: QueueEntry):
     black_result_str = "win" if game["winner"] == "black" else ("loss" if game["winner"] == "red" else "draw")
     update_agent_after_match(red.agent_id, red_elo_after, red_result_str)
     update_agent_after_match(black.agent_id, black_elo_after, black_result_str)
+
+    # progression: evolution + familiarity for both player agents
+    for aid, res_str, mtype in [(red.agent_id, red_result_str, red_type), (black.agent_id, black_result_str, black_type)]:
+        process_agent_evolution(aid, res_str)
+        update_familiarity(aid, mtype, won=(res_str == "win"))
+        fa = get_agent(aid)
+        if fa and fa["matches"] > 0 and fa["matches"] % 50 == 0:
+            decay_familiarity(aid)
 
     # save match
     match_id = save_match(

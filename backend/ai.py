@@ -10,6 +10,7 @@ from engine import (
     calc_material_balance, calc_advancement, calc_back_rank_integrity,
     calc_center_control, calc_formation_quality,
 )
+from familiarity import familiarity_eval_factor
 
 
 @dataclass
@@ -31,6 +32,22 @@ class AgentConfig:
 
     def config_key(self) -> str:
         return f"{self.aggression}:{self.risk_tolerance}:{self.king_priority}:{self.edge_affinity}:{self.trade_down}"
+
+
+# All equippable edges. unlock_level gates which an agent may select.
+EDGE_DEFINITIONS = {
+    "rope_a_dope": {"name": "Counter", "icon": "🛡️", "unlock_level": 5},
+    "press": {"name": "Surge", "icon": "⚡", "unlock_level": 5},
+    "momentum": {"name": "Frenzy", "icon": "🔥", "unlock_level": 5},
+    "anchor": {"name": "Anchor", "icon": "⚓", "unlock_level": 15},
+    "phantom": {"name": "Phantom", "icon": "👻", "unlock_level": 15},
+    "siege": {"name": "Siege", "icon": "🏰", "unlock_level": 25},
+    "flux": {"name": "Flux", "icon": "🌀", "unlock_level": 25},
+}
+
+# edges driven by board state / timers rather than the active_moves timer
+PROGRESSION_EDGES = {"anchor", "phantom", "siege", "flux"}
+_SLIDERS = ["aggression", "risk_tolerance", "king_priority", "edge_affinity", "trade_down"]
 
 
 # Phase multipliers: how much each personality dimension matters per phase
@@ -126,6 +143,70 @@ def apply_perk_overrides(config: AgentConfig, perk_state: dict | None) -> AgentC
     return c
 
 
+def _count_back_row(board: Board, side: str) -> int:
+    rows = (0, 1) if side == "black" else (SIZE - 2, SIZE - 1)
+    return sum(1 for r in rows for c in range(SIZE) if belongs(board[r][c], side))
+
+
+def _king_count(board: Board, side: str) -> int:
+    target = Piece.RED_KING if side == "red" else Piece.BLACK_KING
+    return sum(1 for row in board for cell in row if cell == target)
+
+
+def apply_progression_edges(config: AgentConfig, edge: str | None, board: Board,
+                            side: str, move_count: int, flux_state: dict):
+    """Board-conditional / flux edges (anchor, phantom, siege, flux).
+    Returns (effective_config, active: bool, detail: str). Never mutates input."""
+    if edge not in PROGRESSION_EDGES:
+        return config, False, ""
+    c = AgentConfig(**config.to_dict())
+
+    if edge == "anchor":
+        back = _count_back_row(board, side)
+        if back <= 0:
+            return config, False, ""
+        c.edge_affinity = min(100, config.edge_affinity + 3 * back)
+        c.king_priority = min(100, config.king_priority + 2 * back)
+        return c, True, f"{back} back-row"
+
+    if edge == "phantom":
+        counts = count_pieces(board)
+        mine = counts["red"] if side == "red" else counts["black"]
+        opp_c = counts["black"] if side == "red" else counts["red"]
+        if mine >= opp_c:
+            return config, False, ""
+        c.aggression = min(100, config.aggression + 20)
+        c.risk_tolerance = max(0, config.risk_tolerance - 15)
+        return c, True, "behind"
+
+    if edge == "siege":
+        if _king_count(board, side) < 2:
+            return config, False, ""
+        c.king_priority = max(0, config.king_priority - 30)
+        c.aggression = min(100, config.aggression + 30)
+        c.trade_down = min(100, config.trade_down + 25)
+        return c, True, "2+ kings"
+
+    if edge == "flux":
+        cycle = move_count // 8
+        if flux_state.get("cycle") != cycle:
+            flux_state["cycle"] = cycle
+            boost = random.choice(_SLIDERS)
+            reduce = random.choice([s for s in _SLIDERS if s != boost])
+            flux_state["boost"] = boost
+            flux_state["reduce"] = reduce
+        if (move_count % 8) >= 4:  # active only for the first 4 moves of each cycle
+            return config, False, ""
+        b, r = flux_state.get("boost"), flux_state.get("reduce")
+        if b:
+            setattr(c, b, min(100, getattr(config, b) + 30))
+        if r:
+            setattr(c, r, max(0, getattr(config, r) - 20))
+        return c, True, f"+{b} -{r}"
+
+    return config, False, ""
+
+
 def detect_phase(move_count: int, red_count: int, black_count: int) -> str:
     if red_count <= 4 or black_count <= 4:
         return "endgame"
@@ -212,7 +293,7 @@ def evaluate_position(board: Board, side: str, config: AgentConfig, phase: str) 
 
 
 def evaluate_move(board: Board, move: Move, config: AgentConfig, side: str,
-                  phase: str, overext_factor: float) -> float:
+                  phase: str, overext_factor: float, familiarity: float = 0.0) -> float:
     """Score a candidate move combining tactical value and resulting position."""
     pw = PHASE_WEIGHTS[phase]
 
@@ -267,7 +348,10 @@ def evaluate_move(board: Board, move: Move, config: AgentConfig, side: str,
     new_board = apply_move(board, move)
     pos_score = evaluate_position(new_board, side, config, phase)
 
-    score = tactical + pos_score
+    # matchup familiarity sharpens the deterministic signal vs the fixed noise floor;
+    # applied before jitter so familiarity=0 is byte-identical to baseline. Coefficient
+    # lives in familiarity.MAX_FAMILIARITY_BONUS (single source of truth).
+    score = (tactical + pos_score) * familiarity_eval_factor(familiarity)
 
     # randomness for variety
     score += (random.random() - 0.5) * 2.5
@@ -275,18 +359,35 @@ def evaluate_move(board: Board, move: Move, config: AgentConfig, side: str,
     return score
 
 
+# How strongly matchup familiarity sharpens move selection. The baseline picks
+# randomly between the top-2 scored moves (a 50/50 coin flip that injects variety).
+# A familiar agent instead favors its top-rated move: p(best) = 0.5 + familiarity*BIAS
+# (clamped to 1.0). At familiarity=0 this is exactly 0.5 (byte-identical to baseline);
+# the edge ramps in with experience and a deep veteran (familiarity >= ~0.7) plays its
+# best move every time. Tuned so familiarity-alone gives ~+4pp win rate and a fully
+# evolved+familiar veteran wins ~56% vs a base agent (real, capped well under 70%).
+# This is the real lever -- a uniform eval multiplier cannot change move ordering,
+# so it barely affects which move is actually played.
+FAMILIARITY_PICK_BIAS = 0.70
+
+
 def pick_move(board: Board, side: str, config: AgentConfig,
-              phase: str = "midgame") -> Move | None:
+              phase: str = "midgame", familiarity: float = 0.0) -> Move | None:
     moves = get_all_moves(board, side)
     if not moves:
         return None
 
     overext = calc_overextension_factor(config.aggression, config.risk_tolerance)
     scored = [
-        (m, evaluate_move(board, m, config, side, phase, overext))
+        (m, evaluate_move(board, m, config, side, phase, overext, familiarity))
         for m in moves
     ]
     scored.sort(key=lambda x: x[1], reverse=True)
 
     top_n = scored[:min(2, len(scored))]
+    if familiarity > 0 and len(top_n) == 2:
+        # known matchup -> play sharper: favor the higher-rated move over the coin flip
+        p_best = min(1.0, 0.5 + familiarity * FAMILIARITY_PICK_BIAS)
+        return top_n[0][0] if random.random() < p_best else top_n[1][0]
+    # familiarity=0 (or a single legal move) keeps the exact baseline RNG consumption
     return random.choice(top_n)[0]
