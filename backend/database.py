@@ -178,6 +178,29 @@ def init_db():
             total_hits INTEGER NOT NULL DEFAULT 0
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS rivalries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id INTEGER NOT NULL,
+            opponent_type TEXT NOT NULL,
+            opponent_label TEXT NOT NULL,
+            wins INTEGER NOT NULL DEFAULT 0,
+            losses INTEGER NOT NULL DEFAULT 0,
+            last_match_at TEXT NOT NULL,
+            is_nemesis INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(agent_id, opponent_type)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS agent_records (
+            agent_id INTEGER NOT NULL,
+            record_type TEXT NOT NULL,
+            value INTEGER NOT NULL DEFAULT 0,
+            match_id INTEGER,
+            set_at TEXT NOT NULL,
+            PRIMARY KEY (agent_id, record_type)
+        )
+    """)
     conn.execute("INSERT OR IGNORE INTO jackpot (id, pool) VALUES (1, 0)")
     conn.execute("INSERT OR IGNORE INTO wallet (id, balance) VALUES (1, 1000)")
     # migrations
@@ -195,6 +218,8 @@ def init_db():
         conn.execute("ALTER TABLE agents ADD COLUMN perk TEXT DEFAULT NULL")
     if "player_id" not in agent_cols:
         conn.execute("ALTER TABLE agents ADD COLUMN player_id INTEGER")
+    if "recent_results" not in agent_cols:
+        conn.execute("ALTER TABLE agents ADD COLUMN recent_results TEXT DEFAULT '[]'")
     conn.commit()
     _seed_starter_agents(conn)
     conn.close()
@@ -215,11 +240,29 @@ def _seed_starter_agents(conn):
 
 # --- agents CRUD ---
 
+def _calc_form(recent_results_json: str) -> str:
+    try:
+        results = json.loads(recent_results_json) if recent_results_json else []
+    except (json.JSONDecodeError, TypeError):
+        results = []
+    if len(results) < 5:
+        return "neutral"
+    recent_5 = results[-5:]
+    wins = sum(1 for r in recent_5 if r == "win")
+    losses = sum(1 for r in recent_5 if r == "loss")
+    if wins >= 4:
+        return "hot"
+    if losses >= 4:
+        return "cold"
+    return "neutral"
+
+
 def _agent_row_to_dict(r) -> dict:
     xp = r["xp"] if "xp" in r.keys() else 0
     level = r["level"] if "level" in r.keys() else 1
     perk = r["perk"] if "perk" in r.keys() else None
     next_xp = xp_for_next_level(level)
+    recent = r["recent_results"] if "recent_results" in r.keys() else "[]"
     return {
         "id": r["id"],
         "name": r["name"],
@@ -238,6 +281,7 @@ def _agent_row_to_dict(r) -> dict:
         "level": level,
         "perk": perk,
         "xp_next": next_xp,
+        "form": _calc_form(recent),
     }
 
 
@@ -328,7 +372,7 @@ def update_agent_after_match(agent_id: int, new_elo: float, result: str) -> dict
     wins_inc = 1 if result == "win" else 0
     losses_inc = 1 if result == "loss" else 0
     draws_inc = 1 if result == "draw" else 0
-    row = conn.execute("SELECT xp, level, name FROM agents WHERE id=?", (agent_id,)).fetchone()
+    row = conn.execute("SELECT xp, level, name, recent_results FROM agents WHERE id=?", (agent_id,)).fetchone()
     if not row:
         conn.close()
         return None
@@ -336,10 +380,18 @@ def update_agent_after_match(agent_id: int, new_elo: float, result: str) -> dict
     old_xp = row["xp"] if row["xp"] else 0
     new_xp = old_xp + 1
     new_level = xp_to_level(new_xp)
+    # update recent_results rolling window
+    try:
+        recent = json.loads(row["recent_results"]) if row["recent_results"] else []
+    except (json.JSONDecodeError, TypeError):
+        recent = []
+    recent.append(result)
+    if len(recent) > 10:
+        recent = recent[-10:]
     conn.execute("""
         UPDATE agents SET elo=?, wins=wins+?, losses=losses+?, draws=draws+?, matches=matches+1,
-        xp=?, level=?, updated_at=? WHERE id=?
-    """, (new_elo, wins_inc, losses_inc, draws_inc, new_xp, new_level, now, agent_id))
+        xp=?, level=?, recent_results=?, updated_at=? WHERE id=?
+    """, (new_elo, wins_inc, losses_inc, draws_inc, new_xp, new_level, json.dumps(recent), now, agent_id))
     conn.commit()
     conn.close()
     if new_level > old_level:
@@ -834,6 +886,74 @@ def calc_parlay_payout(correct: int, total: int, amount: int, total_odds: float)
     if mult > 0:
         return "consolation", int(amount * mult)
     return "bust", 0
+
+
+# --- rivalries ---
+
+def update_rivalry(agent_id: int, opponent_type: str, opponent_label: str, result: str):
+    conn = get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    existing = conn.execute("SELECT * FROM rivalries WHERE agent_id=? AND opponent_type=?", (agent_id, opponent_type)).fetchone()
+    if existing:
+        w = existing["wins"] + (1 if result == "win" else 0)
+        l = existing["losses"] + (1 if result == "loss" else 0)
+        is_nem = 1 if (l >= 3 and l > w) else 0
+        conn.execute("UPDATE rivalries SET wins=?, losses=?, last_match_at=?, is_nemesis=? WHERE id=?",
+                     (w, l, now, is_nem, existing["id"]))
+    else:
+        w = 1 if result == "win" else 0
+        l = 1 if result == "loss" else 0
+        conn.execute("INSERT INTO rivalries (agent_id, opponent_type, opponent_label, wins, losses, last_match_at, is_nemesis) VALUES (?,?,?,?,?,?,0)",
+                     (agent_id, opponent_type, opponent_label, w, l, now))
+    conn.commit()
+    conn.close()
+
+
+def get_rivalry(agent_id: int, opponent_type: str) -> dict | None:
+    conn = get_db()
+    r = conn.execute("SELECT * FROM rivalries WHERE agent_id=? AND opponent_type=?", (agent_id, opponent_type)).fetchone()
+    conn.close()
+    if not r:
+        return None
+    return {"opponent_type": r["opponent_type"], "opponent_label": r["opponent_label"],
+            "wins": r["wins"], "losses": r["losses"], "is_nemesis": bool(r["is_nemesis"])}
+
+
+def get_agent_rivalries(agent_id: int) -> list[dict]:
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM rivalries WHERE agent_id=? ORDER BY is_nemesis DESC, losses DESC", (agent_id,)).fetchall()
+    conn.close()
+    return [{"opponent_type": r["opponent_type"], "opponent_label": r["opponent_label"],
+             "wins": r["wins"], "losses": r["losses"], "is_nemesis": bool(r["is_nemesis"])} for r in rows]
+
+
+# --- agent records / personal bests ---
+
+def check_and_update_records(agent_id: int, records: dict, match_id: int | None = None) -> list[dict]:
+    """Compare records dict against stored. Returns list of new personal bests."""
+    conn = get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    new_bests = []
+    for rec_type, value in records.items():
+        if value <= 0:
+            continue
+        existing = conn.execute("SELECT value FROM agent_records WHERE agent_id=? AND record_type=?",
+                                (agent_id, rec_type)).fetchone()
+        old_val = existing["value"] if existing else 0
+        if value > old_val:
+            conn.execute("INSERT OR REPLACE INTO agent_records (agent_id, record_type, value, match_id, set_at) VALUES (?,?,?,?,?)",
+                         (agent_id, rec_type, value, match_id, now))
+            new_bests.append({"record": rec_type, "value": value, "previous": old_val})
+    conn.commit()
+    conn.close()
+    return new_bests
+
+
+def get_agent_records(agent_id: int) -> dict:
+    conn = get_db()
+    rows = conn.execute("SELECT record_type, value FROM agent_records WHERE agent_id=?", (agent_id,)).fetchall()
+    conn.close()
+    return {r["record_type"]: r["value"] for r in rows}
 
 
 init_db()

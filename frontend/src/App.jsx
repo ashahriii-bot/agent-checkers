@@ -557,16 +557,24 @@ function PerkSelector({ agentId, onSelect }) {
 
 // --- roster panel (match mode) ---
 
+function FormBadge({ form }) {
+  if (form === "hot") return <span style={{ fontSize: 9 }} title="Hot: 4+ wins in last 5">🔥</span>;
+  if (form === "cold") return <span style={{ fontSize: 9, opacity: 0.6 }} title="Cold: 4+ losses in last 5">🧊</span>;
+  return null;
+}
+
 function AgentCard({ agent, selected, onClick, compact }) {
   return (
     <div onClick={onClick} style={{
       padding: compact ? "4px 6px" : "6px 8px", background: selected ? "#161b22" : "#0d1117",
-      border: `1px solid ${selected ? "#2ecc71" : "#1a1f2b"}`, borderRadius: 4,
+      border: `1px solid ${selected ? "#2ecc71" : agent.form === "hot" ? "#e67e2244" : "#1a1f2b"}`, borderRadius: 4,
       cursor: onClick ? "pointer" : "default", marginBottom: 3, transition: "border-color 0.2s",
+      opacity: agent.form === "cold" ? 0.8 : 1,
     }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 4, overflow: "hidden" }}>
           <LevelBadge level={agent.level || 1} />
+          <FormBadge form={agent.form} />
           <span style={{ fontSize: 10, fontWeight: 700, color: selected ? "#2ecc71" : "#c8d0da", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{agent.name}</span>
         </div>
         <span style={{ fontSize: 10, fontWeight: 700, color: "#8892a0", flexShrink: 0 }}>{Math.round(agent.elo)}</span>
@@ -1115,13 +1123,31 @@ export default function App() {
             </div>
           )}
 
+          {/* win probability meter */}
+          {boards && result?.win_probability && (() => {
+            const wp = result.win_probability[currentStep] || 0.5;
+            const redPct = Math.round(wp * 100);
+            const blackPct = 100 - redPct;
+            return (
+              <div style={{ width: "100%", maxWidth: 380, marginBottom: 2 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 1 }}>
+                  <span style={{ fontSize: redPct >= 50 ? 10 : 8, fontWeight: redPct >= 50 ? 800 : 400, color: "#e74c3c" }}>{redPct}%</span>
+                  <span style={{ fontSize: blackPct >= 50 ? 10 : 8, fontWeight: blackPct >= 50 ? 800 : 400, color: "#ecf0f1" }}>{blackPct}%</span>
+                </div>
+                <div style={{ display: "flex", height: 6, borderRadius: 3, overflow: "hidden", background: "#1a1f2b" }}>
+                  <div style={{ width: `${redPct}%`, background: redPct > 60 ? "#e74c3c" : "#c0392b88", transition: "width 0.2s ease" }} />
+                  <div style={{ flex: 1, background: blackPct > 60 ? "#bdc3c7" : "#95a5a688", transition: "width 0.2s ease" }} />
+                </div>
+              </div>
+            );
+          })()}
           {/* material advantage bar */}
           {boards && (
             <div style={{ width: "100%", maxWidth: 380, display: "flex", alignItems: "center", gap: 4, marginBottom: 2 }}>
               <span style={{ fontSize: 8, fontWeight: 700, color: "#e74c3c", width: 14, textAlign: "right" }}>{counts.red}</span>
-              <div style={{ flex: 1, height: 6, background: "#1a1f2b", borderRadius: 3, overflow: "hidden", display: "flex" }}>
-                <div style={{ width: `${(counts.red / Math.max(counts.red + counts.black, 1)) * 100}%`, background: counts.red > counts.black + 1 ? "#e74c3c" : "#c0392b88", transition: "width 0.3s ease", borderRadius: "3px 0 0 3px" }} />
-                <div style={{ flex: 1, background: counts.black > counts.red + 1 ? "#bdc3c7" : "#95a5a688", transition: "width 0.3s ease", borderRadius: "0 3px 3px 0" }} />
+              <div style={{ flex: 1, height: 4, background: "#1a1f2b", borderRadius: 2, overflow: "hidden", display: "flex" }}>
+                <div style={{ width: `${(counts.red / Math.max(counts.red + counts.black, 1)) * 100}%`, background: counts.red > counts.black + 1 ? "#e74c3c" : "#c0392b88", transition: "width 0.3s ease" }} />
+                <div style={{ flex: 1, background: counts.black > counts.red + 1 ? "#bdc3c7" : "#95a5a688", transition: "width 0.3s ease" }} />
               </div>
               <span style={{ fontSize: 8, fontWeight: 700, color: "#ecf0f1", width: 14 }}>{counts.black}</span>
             </div>
@@ -1294,6 +1320,41 @@ export default function App() {
                 {lu.name} reached Level {lu.new_level}{lu.perk_unlocked ? " -- Choose a perk!" : ""}
               </div>
             ))}
+            {/* new personal bests */}
+            {isFinished && result.new_records && result.new_records.length > 0 && (
+              <div style={{ padding: "4px 10px", background: "rgba(255,215,0,0.06)", border: "1px solid rgba(255,215,0,0.15)", borderRadius: 4, fontSize: 8 }}>
+                <div style={{ color: "#4a5568", letterSpacing: 1, textTransform: "uppercase", marginBottom: 2 }}>{result.winner !== "red" ? "Loss, but..." : ""} New personal bests</div>
+                {result.new_records.map((r, i) => (
+                  <div key={i} style={{ color: "#ffd700" }}>🏆 {r.record.replace("_", " ")}: {r.value} {r.previous > 0 ? `(was ${r.previous})` : ""}</div>
+                ))}
+              </div>
+            )}
+            {/* rivalry update */}
+            {isFinished && result.rivalry && result.rivalry.is_nemesis && (
+              <div style={{ padding: "4px 10px", background: "rgba(231,76,60,0.08)", border: "1px solid rgba(231,76,60,0.2)", borderRadius: 4, fontSize: 8 }}>
+                <span style={{ color: "#e74c3c" }}>⚔ NEMESIS: {result.rivalry.opponent_label}</span>
+                <span style={{ color: "#4a5568", marginLeft: 6 }}>{result.rivalry.wins}W {result.rivalry.losses}L</span>
+              </div>
+            )}
+            {isFinished && result.rivalry && !result.rivalry.is_nemesis && result.rivalry.wins > 0 && result.rivalry.losses > 0 && (
+              <div style={{ padding: "4px 10px", fontSize: 8, color: "#4a5568" }}>
+                Rivalry with {result.rivalry.opponent_label}: {result.rivalry.wins}W {result.rivalry.losses}L
+              </div>
+            )}
+            {/* revenge offer */}
+            {isFinished && result.revenge_available && (
+              <div style={{ padding: "6px 10px", background: "rgba(230,126,34,0.08)", border: "1px solid rgba(230,126,34,0.25)", borderRadius: 4, textAlign: "center" }}>
+                <div style={{ fontSize: 9, color: "#e67e22", fontWeight: 700, letterSpacing: 1, marginBottom: 2 }}>⚔ REVENGE MATCH</div>
+                <div style={{ fontSize: 8, color: "#8892a0", marginBottom: 4 }}>Same opponent. Odds boosted 1.5x.</div>
+                <button onClick={async () => {
+                  const body = { agent_id: redAgent.id, opponent_config: result.revenge_available.opponent_config, opponent_perk: result.revenge_available.opponent_perk };
+                  try {
+                    const res = await fetch(`${API}/game/revenge`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+                    if (res.ok) { const d = await res.json(); setBoards(d.boards); setMoves(d.moves); setEvents(d.events || []); setResult(d); maxStepRef.current = d.boards.length - 1; stepRef.current = 0; setCurrentStep(0); playingRef.current = true; setPlaying(true); playNext(); loadWallet(); loadJackpot(); }
+                  } catch {}
+                }} style={{ padding: "4px 16px", borderRadius: 3, border: "none", background: "#e67e22", color: "#fff", fontWeight: 700, fontSize: 9, letterSpacing: 1, cursor: "pointer", fontFamily: "inherit" }}>ACCEPT REVENGE</button>
+              </div>
+            )}
           </div>
 
           {error && <p style={{ color: "#e74c3c", fontSize: 10, marginTop: 6 }}>{error}</p>}

@@ -33,6 +33,8 @@ from database import (
     get_jackpot, add_to_jackpot, hit_jackpot,
     increment_streak, reset_streak, get_streak_multiplier,
     save_parlay, calc_parlay_payout,
+    update_rivalry, get_rivalry, get_agent_rivalries,
+    check_and_update_records, get_agent_records,
 )
 
 app = FastAPI(title="Agent Checkers API", version="0.6.0")
@@ -274,10 +276,31 @@ def _run_game(red_cfg: AgentConfig, black_cfg: AgentConfig,
     if winner is None:
         winner = "draw"
     counts = count_pieces(board)
+
+    # win probability series (red's probability at each board state)
+    win_prob = []
+    for b in boards:
+        c = count_pieces(board_to_list(b) if not isinstance(b[0], list) else b)
+        rm = (c["red"] - c["red_kings"]) + c["red_kings"] * 1.7
+        bm = (c["black"] - c["black_kings"]) + c["black_kings"] * 1.7
+        total_m = rm + bm
+        if total_m == 0:
+            win_prob.append(0.5)
+        else:
+            raw = rm / total_m
+            adj = 1 / (1 + ((1 - raw) / max(raw, 0.01)) ** 1.8)
+            win_prob.append(round(max(0.05, min(0.95, adj)), 3))
+    # set final probabilities to 1.0/0.0 based on winner
+    if winner == "red":
+        win_prob[-1] = 1.0
+    elif winner == "black":
+        win_prob[-1] = 0.0
+
     return {
         "winner": winner, "move_count": move_count,
         "moves": moves, "boards": boards, "events": events,
         "final_red": counts["red"], "final_black": counts["black"],
+        "win_probability": win_prob,
     }
 
 
@@ -471,6 +494,104 @@ def api_match_odds(red_elo: float = 1200, black_elo: float = 1200):
 @app.get("/api/bets/history")
 def api_bet_history(limit: int = 20):
     return {"bets": get_bet_history(limit)}
+
+
+def _compute_records(game: dict, side: str) -> dict:
+    records = {"longest_match": game["move_count"]}
+    captures = sum(1 for m in game["moves"] if m["side"] == side and len(m.get("captures", [])) > 0)
+    records["most_captures"] = captures
+    # longest survival streak
+    max_streak = 0
+    cur_streak = 0
+    for m in game["moves"]:
+        if m["side"] != side:
+            if len(m.get("captures", [])) > 0:
+                cur_streak = 0
+            else:
+                cur_streak += 1
+                max_streak = max(max_streak, cur_streak)
+        else:
+            cur_streak += 1
+            max_streak = max(max_streak, cur_streak)
+    records["longest_survival"] = max_streak
+    if game["winner"] == side:
+        records["fastest_win"] = game["move_count"]
+    return records
+
+
+@app.post("/api/game/revenge")
+def api_revenge(body: dict):
+    agent_id = body.get("agent_id")
+    opponent_config = body.get("opponent_config")
+    opponent_perk = body.get("opponent_perk")
+    bet_amount = body.get("bet_amount", 0)
+    perk_override = body.get("perk")
+
+    if not agent_id or not opponent_config:
+        raise HTTPException(400, "agent_id and opponent_config required")
+    agent = get_agent(agent_id)
+    if not agent:
+        raise HTTPException(400, "agent not found")
+
+    player_cfg = AgentConfig(aggression=agent["aggression"], risk_tolerance=agent["risk_tolerance"],
+                             king_priority=agent["king_priority"], edge_affinity=agent["edge_affinity"],
+                             trade_down=agent["trade_down"])
+    opp_cfg = AgentConfig(**opponent_config)
+    player_perk = perk_override if perk_override else agent.get("perk")
+
+    game = _run_game(player_cfg, opp_cfg, red_perk=player_perk, black_perk=opponent_perk)
+
+    result_red = 1.0 if game["winner"] == "red" else (0.0 if game["winner"] == "black" else 0.5)
+    red_elo_after, _ = update_elo(agent["elo"], 1200, result_red)
+    red_result = "win" if game["winner"] == "red" else ("loss" if game["winner"] == "black" else "draw")
+    update_agent_after_match(agent_id, red_elo_after, red_result)
+
+    match_id = save_match(
+        red_config=player_cfg.to_dict(), black_config=opp_cfg.to_dict(),
+        winner=game["winner"], move_count=game["move_count"],
+        final_red=game["final_red"], final_black=game["final_black"],
+        moves=game["moves"], shrink_events=game["events"],
+        red_elo_before=agent["elo"], red_elo_after=red_elo_after,
+        black_elo_before=1200, black_elo_after=1200,
+        red_agent_id=agent_id,
+    )
+
+    bet_result = None
+    if bet_amount > 0:
+        odds = calculate_match_odds(agent["elo"], 1200)
+        boosted_odds = round(odds["red"] * 1.5, 2)
+        try:
+            bet_info = place_bet("revenge", "red", bet_amount, boosted_odds, match_id=match_id)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        won = game["winner"] == "red"
+        w = get_wallet()
+        streak_mult = get_streak_multiplier(w["win_streak"])
+        effective = round(boosted_odds * streak_mult, 2)
+        payout = int(bet_amount * effective) if won else 0
+        settle_bet(bet_info["bet_id"], "win" if won else "loss", payout)
+        add_to_jackpot(bet_amount)
+        if won:
+            increment_streak()
+        else:
+            reset_streak()
+        bet_result = {"amount": bet_amount, "odds": boosted_odds, "effective_odds": effective,
+                      "result": "win" if won else "loss", "payout": payout}
+
+    records = _compute_records(game, "red")
+    new_bests = check_and_update_records(agent_id, records, match_id)
+
+    return {"match_id": match_id, **game, "bet": bet_result, "new_records": new_bests}
+
+
+@app.get("/api/agents/{agent_id}/records")
+def api_agent_records(agent_id: int):
+    return get_agent_records(agent_id)
+
+
+@app.get("/api/agents/{agent_id}/rivalries")
+def api_agent_rivalries(agent_id: int):
+    return {"rivalries": get_agent_rivalries(agent_id)}
 
 
 @app.get("/api/jackpot")
@@ -742,6 +863,28 @@ def simulate_game(req: SimulateRequest):
     resp["bet"] = bet_result
     if bot_opponent:
         resp["bot_opponent"] = bot_opponent
+        # rivalry tracking for VS BOT
+        if red_agent and bot_opponent.get("coach_id"):
+            opp_type = f"coach:{bot_opponent['coach_id']}"
+            opp_label = bot_opponent["coach_name"]
+            update_rivalry(red_agent["id"], opp_type, opp_label, red_result)
+            rivalry = get_rivalry(red_agent["id"], opp_type)
+            if rivalry:
+                resp["rivalry"] = rivalry
+        # records
+        if red_agent:
+            records = _compute_records(game, "red")
+            new_bests = check_and_update_records(red_agent["id"], records, match_id)
+            if new_bests:
+                resp["new_records"] = new_bests
+        # revenge offer on loss
+        if game["winner"] == "black" and red_agent and bot_opponent:
+            resp["revenge_available"] = {
+                "opponent_config": {k: bot_opponent[k] for k in ("aggression", "risk_tolerance", "king_priority", "edge_affinity", "trade_down")},
+                "opponent_perk": bot_opponent.get("perk"),
+                "coach_id": bot_opponent.get("coach_id"),
+                "odds_boost": 1.5,
+            }
     return resp
 
 
