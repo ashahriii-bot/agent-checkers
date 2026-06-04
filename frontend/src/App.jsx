@@ -20,9 +20,9 @@ const TAG_COLORS = { UPSET: "#f39c12", COMEBACK: "#2ecc71", NAIL_BITER: "#3498db
 const TAG_LABELS = { UPSET: "UPSET", COMEBACK: "COMEBACK", NAIL_BITER: "NAIL-BITER", DOMINANT: "DOMINANT", LAST_STAND: "LAST STAND" };
 
 const PERK_INFO = {
-  rope_a_dope: { name: "ROPE-A-DOPE", color: "#3498db", icon: "⛨", short: "Tightens defense after being attacked", tag: "Strong vs aggressive agents" },
-  press: { name: "PRESS", color: "#e67e22", icon: "▶", short: "Forces action during stalemates", tag: "Strong vs defensive agents" },
-  momentum: { name: "MOMENTUM", color: "#2ecc71", icon: "⚡", short: "Captures breed more captures", tag: "Strong vs mid-range agents" },
+  rope_a_dope: { name: "COUNTER", color: "#3498db", icon: "🛡️", short: "Tightens defense after being attacked", tag: "Strong vs aggressive fighters" },
+  press: { name: "SURGE", color: "#e67e22", icon: "⚡", short: "Forces action during stalemates", tag: "Strong vs defensive fighters" },
+  momentum: { name: "FRENZY", color: "#2ecc71", icon: "🔥", short: "Captures breed more captures", tag: "Strong vs mid-range fighters" },
 };
 
 const ADJECTIVE_POOLS = {
@@ -528,7 +528,7 @@ function PerkSelector({ agentId, onSelect }) {
 
   return (
     <div style={{ padding: 8, background: "#0a0c10", border: "1px solid #ffd70033", borderRadius: 6, marginTop: 6 }}>
-      <div style={{ fontSize: 8, fontWeight: 700, color: "#ffd700", letterSpacing: 1, marginBottom: 6, textTransform: "uppercase" }}>Choose a Perk</div>
+      <div style={{ fontSize: 8, fontWeight: 700, color: "#ffd700", letterSpacing: 1, marginBottom: 6, textTransform: "uppercase" }}>Choose your Edge</div>
       {Object.entries(PERK_INFO).map(([key, info]) => (
         <div key={key} onClick={() => setChosen(key)} style={{
           padding: "6px 8px", marginBottom: 4, borderRadius: 4, cursor: "pointer",
@@ -550,7 +550,7 @@ function PerkSelector({ agentId, onSelect }) {
           fontSize: 8, fontWeight: 700, letterSpacing: 1, cursor: chosen ? "pointer" : "not-allowed",
         }}>{saving ? "..." : "CONFIRM"}</button>
       </div>
-      <div style={{ fontSize: 7, color: "#3a4450", marginTop: 3, textAlign: "center" }}>you can change your perk anytime</div>
+      <div style={{ fontSize: 7, color: "#3a4450", marginTop: 3, textAlign: "center" }}>you can change your edge anytime</div>
     </div>
   );
 }
@@ -1366,22 +1366,22 @@ export default function App() {
               const loserAgent = loser === "red" ? result.red_agent : result.black_agent;
               const loserCfg = loserAgent || {};
               let suggestion = "Tough loss. Try a different perk or adjust sliders for this matchup.";
-              if ((loserCfg.aggression || 50) > 70 && result.move_count < 60) suggestion = "Your agent overextended. Consider lowering risk tolerance or adding Rope-a-Dope.";
-              else if ((loserCfg.aggression || 50) < 30) suggestion = "Your agent was too passive. Consider raising aggression or adding Press.";
+              if ((loserCfg.aggression || 50) > 70 && result.move_count < 60) suggestion = "Your agent overextended. Consider lowering risk tolerance or adding Counter.";
+              else if ((loserCfg.aggression || 50) < 30) suggestion = "Your agent was too passive. Consider raising aggression or adding Surge.";
               else if (turningMove > 0 && turningMove < result.move_count * 0.4) suggestion = "Your agent fell behind early. Consider a more aggressive opening config.";
               else if (result.move_count > 80) suggestion = "Long match. Consider raising king priority for better endgame play.";
               return (
                 <div style={{ width: "100%", padding: "6px 10px", background: "#0a0c10", border: "1px solid #1a1f2b", borderRadius: 4, fontSize: 8, marginTop: 4 }}>
                   <div style={{ fontSize: 7, color: "#4a5568", letterSpacing: 1, textTransform: "uppercase", marginBottom: 3 }}>Post-match breakdown</div>
                   <div style={{ color: "#8892a0", marginBottom: 2 }}><span style={{ color: "#4a5568" }}>TURNING POINT:</span> {tpText}</div>
-                  {perkLines.length > 0 && <div style={{ color: "#8892a0", marginBottom: 2 }}><span style={{ color: "#4a5568" }}>PERKS:</span> {perkLines.join(". ")}</div>}
+                  {perkLines.length > 0 && <div style={{ color: "#8892a0", marginBottom: 2 }}><span style={{ color: "#4a5568" }}>EDGES:</span> {perkLines.join(". ")}</div>}
                   <div style={{ color: "#e67e22" }}><span style={{ color: "#4a5568" }}>TIP:</span> {suggestion}</div>
                 </div>
               );
             })()}
             {isFinished && result.level_ups && result.level_ups.map((lu, i) => (
               <div key={i} style={{ padding: "4px 10px", borderRadius: 4, fontSize: 9, letterSpacing: 1, textTransform: "uppercase", background: lu.perk_unlocked ? "rgba(255,215,0,0.12)" : "rgba(46,204,113,0.12)", border: `1px solid ${lu.perk_unlocked ? "rgba(255,215,0,0.3)" : "rgba(46,204,113,0.3)"}`, color: lu.perk_unlocked ? "#ffd700" : "#2ecc71" }}>
-                {lu.name} reached Level {lu.new_level}{lu.perk_unlocked ? " -- Choose a perk!" : ""}
+                {lu.name} reached Level {lu.new_level}{lu.perk_unlocked ? " -- Choose an edge!" : ""}
               </div>
             ))}
             {/* prop bet results */}
