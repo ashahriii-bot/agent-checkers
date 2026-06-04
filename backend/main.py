@@ -17,6 +17,7 @@ from engine import (
     board_to_list, shrink_board, apply_king_fatigue, Piece, is_king,
 )
 from ai import AgentConfig, pick_move, detect_phase, calc_overextension_factor, suggest_names, apply_perk_overrides
+from coaches import COACHES, generate_bot_agent, get_coach_list
 from database import (
     save_match, get_matches, get_match, get_leaderboard, get_agent_leaderboard,
     get_elo, update_elo, update_elo_record,
@@ -93,12 +94,17 @@ class ChampionBetSchema(BaseModel):
     amount: int = Field(ge=10)
 
 
+class VsBotSchema(BaseModel):
+    coach_id: str
+
+
 class SimulateRequest(BaseModel):
     red: Optional[AgentConfigSchema] = None
     black: Optional[AgentConfigSchema] = None
     red_agent_id: Optional[int] = None
     black_agent_id: Optional[int] = None
     bet: Optional[BetSchema] = None
+    vs_bot: Optional[VsBotSchema] = None
 
 
 class TournamentRequest(BaseModel):
@@ -106,6 +112,7 @@ class TournamentRequest(BaseModel):
     bracket_size: int = Field(default=8, ge=4, le=8)
     seeding: str = "elo"
     champion_bet: Optional[ChampionBetSchema] = None
+    vs_bot: Optional[VsBotSchema] = None
 
 
 # --- core game simulation (shared by single match and tournament) ---
@@ -446,6 +453,13 @@ def api_bet_history(limit: int = 20):
     return {"bets": get_bet_history(limit)}
 
 
+# --- coaches ---
+
+@app.get("/api/coaches")
+def api_list_coaches():
+    return {"coaches": get_coach_list()}
+
+
 # --- single match ---
 
 def _resolve_side(agent_id, config, label):
@@ -478,13 +492,40 @@ def api_set_perk(agent_id: int, body: dict):
 
 @app.post("/api/game/simulate")
 def simulate_game(req: SimulateRequest):
-    red_cfg, red_agent = _resolve_side(req.red_agent_id, req.red, "red")
-    black_cfg, black_agent = _resolve_side(req.black_agent_id, req.black, "black")
-    red_elo_before = red_agent["elo"] if red_agent else get_elo(red_cfg.config_key())
-    black_elo_before = black_agent["elo"] if black_agent else get_elo(black_cfg.config_key())
+    bot_opponent = None
 
-    red_perk = red_agent["perk"] if red_agent else None
-    black_perk = black_agent["perk"] if black_agent else None
+    if req.vs_bot:
+        coach_id = req.vs_bot.coach_id
+        if coach_id == "random":
+            coach_id = random.choice(list(COACHES.keys()))
+        coach = COACHES.get(coach_id)
+        if not coach:
+            raise HTTPException(400, f"unknown coach: {coach_id}")
+        red_cfg, red_agent = _resolve_side(req.red_agent_id, req.red, "red")
+        red_elo_before = red_agent["elo"] if red_agent else get_elo(red_cfg.config_key())
+        player_config = red_agent if red_agent else red_cfg.to_dict()
+        bot = generate_bot_agent(coach, red_elo_before, player_config=player_config)
+        black_cfg = AgentConfig(aggression=bot["aggression"], risk_tolerance=bot["risk_tolerance"],
+                                king_priority=bot["king_priority"], edge_affinity=bot["edge_affinity"],
+                                trade_down=bot["trade_down"])
+        black_agent = None
+        black_elo_before = bot["elo"]
+        black_perk = bot["perk"]
+        red_perk = red_agent["perk"] if red_agent else None
+        bot_opponent = {
+            "name": bot["name"], "coach_id": bot["coach_id"], "coach_name": bot["coach_name"],
+            "aggression": bot["aggression"], "risk_tolerance": bot["risk_tolerance"],
+            "king_priority": bot["king_priority"], "edge_affinity": bot["edge_affinity"],
+            "trade_down": bot["trade_down"], "elo": bot["elo"], "perk": bot["perk"],
+        }
+    else:
+        red_cfg, red_agent = _resolve_side(req.red_agent_id, req.red, "red")
+        black_cfg, black_agent = _resolve_side(req.black_agent_id, req.black, "black")
+        red_elo_before = red_agent["elo"] if red_agent else get_elo(red_cfg.config_key())
+        black_elo_before = black_agent["elo"] if black_agent else get_elo(black_cfg.config_key())
+        red_perk = red_agent["perk"] if red_agent else None
+        black_perk = black_agent["perk"] if black_agent else None
+
     game = _run_game(red_cfg, black_cfg, red_perk=red_perk, black_perk=black_perk)
 
     result_red = 1.0 if game["winner"] == "red" else (0.0 if game["winner"] == "black" else 0.5)
@@ -503,7 +544,7 @@ def simulate_game(req: SimulateRequest):
         lu = update_agent_after_match(black_agent["id"], black_elo_after, black_result)
         if lu:
             level_ups.append(lu)
-    else:
+    elif not bot_opponent:
         update_elo_record(black_cfg.config_key(), black_cfg.to_dict(), black_elo_after, black_result)
 
     match_id = save_match(
@@ -551,6 +592,8 @@ def simulate_game(req: SimulateRequest):
     if level_ups:
         resp["level_ups"] = level_ups
     resp["bet"] = bet_result
+    if bot_opponent:
+        resp["bot_opponent"] = bot_opponent
     return resp
 
 
@@ -579,9 +622,26 @@ def api_create_tournament(req: TournamentRequest):
         })
         used_names.add(a["name"])
 
-    # fill remaining slots with random agents
-    while len(participants) < req.bracket_size:
-        participants.append(_generate_random_agent(used_names))
+    # fill remaining slots
+    bot_coach = None
+    if req.vs_bot:
+        coach_id = req.vs_bot.coach_id
+        if coach_id == "random":
+            coach_id = random.choice(list(COACHES.keys()))
+        bot_coach = COACHES.get(coach_id)
+        if not bot_coach:
+            raise HTTPException(400, f"unknown coach: {coach_id}")
+        player_avg_elo = sum(p["elo"] for p in participants) / len(participants) if participants else 1200
+        while len(participants) < req.bracket_size:
+            bot = generate_bot_agent(bot_coach, player_avg_elo, used_names=used_names)
+            participants.append({
+                "name": bot["name"], "agent_id": None, "is_random": True, "is_bot": True,
+                "config": {k: bot[k] for k in ("aggression", "risk_tolerance", "king_priority", "edge_affinity", "trade_down")},
+                "elo": bot["elo"], "perk": bot["perk"], "coach_id": bot_coach.id, "coach_name": bot_coach.name,
+            })
+    else:
+        while len(participants) < req.bracket_size:
+            participants.append(_generate_random_agent(used_names))
 
     # seed
     if req.seeding == "elo":
@@ -766,6 +826,15 @@ def api_create_tournament(req: TournamentRequest):
             "result": "win" if won else "loss",
             "payout": payout, "net": payout - req.champion_bet.amount if won else -req.champion_bet.amount,
             "balance_after": settle_result["balance"], "bankrupt": settle_result["bankrupt"],
+        }
+
+    if bot_coach:
+        player_wins = sum(1 for m in all_match_data if not bracket_agents[m["winner_slot"]].get("is_bot"))
+        bot_wins = sum(1 for m in all_match_data if bracket_agents[m["winner_slot"]].get("is_bot"))
+        resp["teams"] = {
+            "player": {"wins": player_wins},
+            "bot": {"coach_id": bot_coach.id, "coach_name": bot_coach.name, "wins": bot_wins},
+            "team_result": "player" if player_wins > bot_wins else "bot" if bot_wins > player_wins else "split",
         }
 
     return resp

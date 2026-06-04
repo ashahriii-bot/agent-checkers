@@ -669,10 +669,13 @@ function RosterPanel({ side, color, selectedAgent, onSelect, roster, disabled, m
 
 export default function App() {
   const [appMode, setAppMode] = useState("match");
+  const [matchMode, setMatchMode] = useState("vsbot");
   const [showHelp, setShowHelp] = useState(true);
   const [wallet, setWallet] = useState({ balance: 1000 });
   const [currentBet, setCurrentBet] = useState(null);
   const [betOdds, setBetOdds] = useState(null);
+  const [coaches, setCoaches] = useState([]);
+  const [selectedCoach, setSelectedCoach] = useState(null);
   const [roster, setRoster] = useState([]);
   const [redAgent, setRedAgent] = useState(null);
   const [blackAgent, setBlackAgent] = useState(null);
@@ -700,16 +703,28 @@ export default function App() {
   const loadLeaderboard = async () => { try { const res = await fetch(`${API}/leaderboard?limit=15`); if (res.ok) { const d = await res.json(); setLeaderboard(d.agents || []); } } catch {} };
   const loadWallet = async () => { try { const res = await fetch(`${API}/wallet`); if (res.ok) setWallet(await res.json()); } catch {} };
   const loadOdds = async (rElo, bElo) => { try { const res = await fetch(`${API}/odds/match?red_elo=${rElo}&black_elo=${bElo}`); if (res.ok) setBetOdds(await res.json()); } catch {} };
+  const loadCoaches = async () => { try { const res = await fetch(`${API}/coaches`); if (res.ok) { const d = await res.json(); setCoaches(d.coaches); } } catch {} };
 
-  useEffect(() => { loadRoster(); loadHistory(); loadLeaderboard(); loadWallet(); }, []);
+  useEffect(() => { loadRoster(); loadHistory(); loadLeaderboard(); loadWallet(); loadCoaches(); }, []);
   useEffect(() => { if (roster.length >= 2 && !redAgent && !blackAgent && !boards) { setRedAgent(roster[0]); setBlackAgent(roster[1]); } }, [roster]);
-  useEffect(() => { if (redAgent && blackAgent) loadOdds(redAgent.elo, blackAgent.elo); }, [redAgent?.id, blackAgent?.id]);
+  useEffect(() => {
+    if (matchMode === "vsbot" && redAgent && selectedCoach) loadOdds(redAgent.elo, redAgent.elo);
+    else if (matchMode === "sandbox" && redAgent && blackAgent) loadOdds(redAgent.elo, blackAgent.elo);
+    else setBetOdds(null);
+  }, [redAgent?.id, blackAgent?.id, selectedCoach?.id, matchMode]);
 
   const startGame = async () => {
     if (!redAgent || !blackAgent) { setError("select agents for both sides"); return; }
     setError(null); setLoading(true); setResult(null); setBoards(null); setMoves(null); setEvents([]); setCurrentStep(0);
     try {
-      const body = { red_agent_id: redAgent.id, black_agent_id: blackAgent.id };
+      const body = {};
+      if (matchMode === "vsbot" && selectedCoach) {
+        body.red_agent_id = redAgent.id;
+        body.vs_bot = { coach_id: selectedCoach.id };
+      } else {
+        body.red_agent_id = redAgent.id;
+        body.black_agent_id = blackAgent.id;
+      }
       if (currentBet) body.bet = currentBet;
       const res = await fetch(`${API}/game/simulate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       if (!res.ok) throw new Error(`API error: ${res.status}`);
@@ -758,7 +773,7 @@ export default function App() {
   const blackElo = result?.elo?.black_after || null;
   const redEloDelta = result ? (result.elo.red_after - result.elo.red_before) : null;
   const blackEloDelta = result ? (result.elo.black_after - result.elo.black_before) : null;
-  const canGo = redAgent && blackAgent && !boards && !loading;
+  const canGo = redAgent && ((matchMode === "vsbot" && selectedCoach) || (matchMode === "sandbox" && blackAgent)) && !boards && !loading;
 
   if (appMode === "tournament") {
     return <Tournament roster={roster} onBack={() => { setAppMode("match"); loadRoster(); }} loadRoster={loadRoster} />;
@@ -796,6 +811,17 @@ export default function App() {
         </div>
       )}
 
+      {!boards && (
+        <div style={{ display: "flex", justifyContent: "center", gap: 4, marginBottom: 8 }}>
+          {["vsbot", "sandbox"].map(m => (
+            <button key={m} onClick={() => { setMatchMode(m); setCurrentBet(null); if (m === "vsbot") setBlackAgent(null); else setSelectedCoach(null); }}
+              style={{ padding: "3px 12px", fontSize: 8, fontWeight: 700, letterSpacing: 1, fontFamily: "inherit", cursor: "pointer", borderRadius: 3, textTransform: "uppercase", background: matchMode === m ? "#161b22" : "#0d1117", border: `1px solid ${matchMode === m ? "#2ecc71" : "#1a1f2b"}`, color: matchMode === m ? "#2ecc71" : "#4a5568" }}>
+              {m === "vsbot" ? "VS BOT" : "SANDBOX"}
+            </button>
+          ))}
+        </div>
+      )}
+
       <div style={{ display: "flex", gap: 12, maxWidth: 1060, margin: "0 auto", alignItems: "flex-start", flexWrap: "wrap", justifyContent: "center" }}>
         <div style={{ width: 220, flexShrink: 0 }}>
           <RosterPanel side="red" color="#e74c3c" selectedAgent={redAgent} onSelect={setRedAgent} roster={roster} disabled={playing || loading || !!boards} onRosterChange={loadRoster} matchElo={isFinished ? redElo : null} matchEloDelta={isFinished ? redEloDelta : null} />
@@ -811,11 +837,13 @@ export default function App() {
             </div>
           ) : null; })()}
 
-          {!boards && redAgent && blackAgent && (
+          {!boards && redAgent && (matchMode === "sandbox" ? blackAgent : selectedCoach) && (
             <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
               <span style={{ fontSize: 11, fontWeight: 800, color: "#e74c3c" }}>{redAgent.name}</span>
               <span style={{ fontSize: 9, color: "#4a5568" }}>vs</span>
-              <span style={{ fontSize: 11, fontWeight: 800, color: "#ecf0f1" }}>{blackAgent.name}</span>
+              <span style={{ fontSize: 11, fontWeight: 800, color: matchMode === "vsbot" ? "#e67e22" : "#ecf0f1" }}>
+                {matchMode === "vsbot" ? selectedCoach?.name : blackAgent?.name}
+              </span>
             </div>
           )}
 
@@ -975,7 +1003,65 @@ export default function App() {
         </div>
 
         <div style={{ width: 220, flexShrink: 0 }}>
-          <RosterPanel side="black" color="#ecf0f1" selectedAgent={blackAgent} onSelect={setBlackAgent} roster={roster} disabled={playing || loading || !!boards} onRosterChange={loadRoster} matchElo={isFinished ? blackElo : null} matchEloDelta={isFinished ? blackEloDelta : null} />
+          {matchMode === "sandbox" ? (
+            <RosterPanel side="black" color="#ecf0f1" selectedAgent={blackAgent} onSelect={setBlackAgent} roster={roster} disabled={playing || loading || !!boards} onRosterChange={loadRoster} matchElo={isFinished ? blackElo : null} matchEloDelta={isFinished ? blackEloDelta : null} />
+          ) : (
+            <div style={{ background: "#0d1117", border: "1px solid #e67e2233", borderRadius: 8, padding: 10, width: "100%" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+                <span style={{ fontSize: 9, letterSpacing: 2, textTransform: "uppercase", fontWeight: 700, color: "#e67e22" }}>OPPONENT</span>
+              </div>
+              {/* during/after match: show bot info */}
+              {boards && result?.bot_opponent && (
+                <div style={{ padding: "6px 8px", background: "#161b22", border: "1px solid #e67e2244", borderRadius: 4, marginBottom: 6 }}>
+                  <div style={{ fontSize: 12, fontWeight: 800, color: "#e67e22" }}>{result.bot_opponent.name}</div>
+                  <div style={{ fontSize: 8, color: "#4a5568", marginBottom: 4 }}>{result.bot_opponent.coach_name}</div>
+                  {isFinished ? (
+                    <>
+                      <MiniBars config={result.bot_opponent} />
+                      <div style={{ fontSize: 7, color: "#8892a0", marginTop: 2 }}>
+                        {SLIDER_KEYS.map(s => `${s.short}${result.bot_opponent[s.key]}`).join("  ")}
+                      </div>
+                      {result.bot_opponent.perk && <div style={{ marginTop: 2 }}><PerkBadge perk={result.bot_opponent.perk} /></div>}
+                    </>
+                  ) : (
+                    <div style={{ display: "flex", gap: 3, marginTop: 4 }}>
+                      {SLIDER_KEYS.map(s => <span key={s.key} style={{ flex: 1, textAlign: "center", fontSize: 14, color: "#21262d" }}>?</span>)}
+                    </div>
+                  )}
+                </div>
+              )}
+              {/* coach selector */}
+              {!boards && (
+                <div style={{ maxHeight: 280, overflowY: "auto" }}>
+                  {coaches.map(c => {
+                    const sel = selectedCoach?.id === c.id;
+                    const diffColor = c.difficulty === "easy" ? "#2ecc71" : c.difficulty === "medium" ? "#e67e22" : "#e74c3c";
+                    return (
+                      <div key={c.id} onClick={() => setSelectedCoach(c)} style={{
+                        padding: "6px 8px", marginBottom: 3, borderRadius: 4, cursor: "pointer",
+                        background: sel ? "#1a1510" : "#0d1117", border: `1px solid ${sel ? "#e67e2266" : "#1a1f2b"}`,
+                      }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                          <span style={{ fontSize: 10, fontWeight: 700, color: sel ? "#e67e22" : "#c8d0da" }}>{c.icon} {c.name}</span>
+                          <span style={{ fontSize: 7, fontWeight: 700, color: diffColor, textTransform: "uppercase" }}>{c.difficulty}</span>
+                        </div>
+                        <div style={{ fontSize: 8, color: "#8892a0", fontStyle: "italic" }}>"{c.title}"</div>
+                        {sel && <div style={{ fontSize: 7, color: "#4a5568", marginTop: 2 }}>{c.strategy}</div>}
+                      </div>
+                    );
+                  })}
+                  <div onClick={() => setSelectedCoach({ id: "random", name: "Random", title: "Surprise me", icon: "🎲" })}
+                    style={{ padding: "5px 8px", borderRadius: 4, cursor: "pointer", textAlign: "center",
+                      background: selectedCoach?.id === "random" ? "#1a1510" : "#0d1117",
+                      border: `1px solid ${selectedCoach?.id === "random" ? "#e67e2266" : "#1a1f2b"}`,
+                      fontSize: 8, color: "#4a5568", letterSpacing: 1, textTransform: "uppercase",
+                    }}>
+                    🎲 RANDOM OPPONENT
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>
