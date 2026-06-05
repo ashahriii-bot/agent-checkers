@@ -39,7 +39,7 @@ from database import (
     calculate_match_odds, calculate_tournament_odds,
     create_player, get_player, get_player_by_username, update_player_coins,
     get_jackpot, add_to_jackpot, hit_jackpot,
-    increment_streak, reset_streak, get_streak_multiplier,
+    increment_streak, reset_streak,
     save_parlay, calc_parlay_payout,
     update_rivalry, get_rivalry, get_agent_rivalries,
     check_and_update_records, get_agent_records,
@@ -809,17 +809,16 @@ def api_revenge(body: dict):
         except ValueError as e:
             raise HTTPException(400, str(e))
         won = game["winner"] == "red"
-        w = get_wallet()
-        streak_mult = get_streak_multiplier(w["win_streak"])
-        effective = round(boosted_odds * streak_mult, 2)
-        payout = int(bet_amount * effective) if won else 0
+        # base (revenge) odds only -- the win-streak no longer multiplies payout
+        payout = int(bet_amount * boosted_odds) if won else 0
         settle_bet(bet_info["bet_id"], "win" if won else "loss", payout)
         add_to_jackpot(bet_amount)
+        # streak counter is still tracked for engagement; it has no payout effect
         if won:
             increment_streak()
         else:
             reset_streak()
-        bet_result = {"amount": bet_amount, "odds": boosted_odds, "effective_odds": effective,
+        bet_result = {"amount": bet_amount, "odds": boosted_odds,
                       "result": "win" if won else "loss", "payout": payout}
 
     records = _compute_records(game, "red")
@@ -1308,15 +1307,13 @@ def _simulate_team_game(req: SimulateRequest):
         except ValueError as e:
             raise HTTPException(400, str(e))
         won = winner == req.bet.side
-        w = get_wallet()
-        streak_mult = get_streak_multiplier(w["win_streak"])
-        effective_odds = round(side_odds * streak_mult, 2)
-        payout = int(req.bet.amount * effective_odds) if won else 0
+        # base odds only -- streak heat bonus removed (no payout multiplier)
+        payout = int(req.bet.amount * side_odds) if won else 0
         settle_result = settle_bet(bet_info["bet_id"], "win" if won else "loss", payout)
         add_to_jackpot(req.bet.amount)
+        # streak counter still tracked for engagement; no payout effect
         streak_info = increment_streak() if won else reset_streak()
         bet_result = {"side": req.bet.side, "amount": req.bet.amount, "odds": side_odds,
-                      "streak_mult": streak_mult, "effective_odds": effective_odds,
                       "result": "win" if won else "loss", "payout": payout,
                       "net": payout - req.bet.amount if won else -req.bet.amount,
                       "balance_after": settle_result["balance"], "streak": streak_info}
@@ -1479,23 +1476,19 @@ def simulate_game(req: SimulateRequest):
         except ValueError as e:
             raise HTTPException(400, str(e))
         won = game["winner"] == req.bet.side
-        # streak multiplier
-        w = get_wallet()
-        streak_mult = get_streak_multiplier(w["win_streak"])
-        effective_odds = round(side_odds * streak_mult, 2)
-        payout = int(req.bet.amount * effective_odds) if won else 0
+        # base odds only -- streak heat bonus removed (no payout multiplier)
+        payout = int(req.bet.amount * side_odds) if won else 0
         settle_result = settle_bet(bet_info["bet_id"], "win" if won else "loss", payout)
         # jackpot contribution
         jp_add = add_to_jackpot(req.bet.amount)
-        # streak update
+        # streak counter still tracked for engagement; no payout effect
         if won:
             streak_info = increment_streak()
         else:
             streak_info = reset_streak()
         bet_result = {
             "bet_id": bet_info["bet_id"], "side": req.bet.side,
-            "amount": req.bet.amount, "odds": side_odds, "streak_mult": streak_mult,
-            "effective_odds": effective_odds,
+            "amount": req.bet.amount, "odds": side_odds,
             "result": "win" if won else "loss",
             "payout": payout, "net": payout - req.bet.amount if won else -req.bet.amount,
             "balance_after": settle_result["balance"], "bankrupt": settle_result["bankrupt"],
@@ -2034,20 +2027,20 @@ def api_settle_tournament_bets(body: dict):
     total_wagered = 0
     # all writes go through ONE connection -- the streak/jackpot helpers each open their
     # own connection and would deadlock against an open write transaction here (WAL allows
-    # one writer). The streak multiplier is read once up front (it applies to the slate).
-    from database import get_db, get_streak_multiplier, JACKPOT_RATE
+    # one writer).
+    from database import get_db, JACKPOT_RATE
     conn = get_db()
     row = conn.execute("SELECT balance, win_streak, best_streak FROM wallet WHERE id = 1").fetchone()
     win_streak = row["win_streak"] if row else 0
     best_streak = row["best_streak"] if row else 0
-    streak_mult = get_streak_multiplier(win_streak)
     jackpot_add = 0
     for b in bets:
         amount = b.get("amount", 0)
         odds = b.get("odds", 1.0)
         won = b.get("won", False)
-        effective_odds = odds * (2.0 if b.get("lucky") else 1.0) * (1.5 if b.get("heat") else 1.0) * streak_mult
-        effective_odds = round(effective_odds, 2)
+        # base odds only -- streak heat bonus removed. "lucky" (2x) is the separate
+        # lucky-match tournament feature and is unaffected.
+        effective_odds = round(odds * (2.0 if b.get("lucky") else 1.0), 2)
         payout = int(amount * effective_odds) if won else 0
         total_wagered += amount
         total_payout += payout

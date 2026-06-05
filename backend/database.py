@@ -1167,6 +1167,13 @@ def hit_jackpot() -> int:
 
 
 # --- streak ---
+#
+# NOTE: the win-streak is tracked purely for engagement (the visual "HOT STREAK"
+# counter, ON FIRE badge, and best-streak record). It MUST NOT multiply payouts.
+# The economy audit (docs/ECONOMY_AUDIT.md) found the old streak "heat bonus"
+# reversed the house edge from +5.1% to -3.1%. STREAK_MULTIPLIERS / the helper
+# below are retained for reference and informational display ONLY -- never wire
+# them into a payout / settlement calculation.
 
 STREAK_MULTIPLIERS = {0: 1.0, 3: 1.5, 5: 2.0, 7: 3.0, 10: 5.0}
 

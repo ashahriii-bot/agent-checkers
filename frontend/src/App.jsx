@@ -2046,7 +2046,7 @@ export default function App() {
           {wallet.win_streak >= 3 && (
             <span style={{ fontSize: 11, padding: "2px 6px", background: "#161b22", border: "1px solid #e67e2233", borderRadius: 4 }}>
               {wallet.win_streak >= 10 ? "💎" : wallet.win_streak >= 7 ? "🔥🔥🔥" : wallet.win_streak >= 5 ? "🔥🔥" : "🔥"}
-              <span style={{ fontSize: 8, color: "#e67e22", marginLeft: 2 }}>HOT STREAK {wallet.win_streak} ({wallet.win_streak >= 10 ? "5" : wallet.win_streak >= 7 ? "3" : wallet.win_streak >= 5 ? "2" : "1.5"}x HEAT)</span>
+              <span style={{ fontSize: 8, color: "#e67e22", marginLeft: 2 }}>HOT STREAK {wallet.win_streak}</span>
             </span>
           )}
           {jackpotPool > 0 && (
@@ -2160,7 +2160,6 @@ export default function App() {
           {canGo && !currentBet && betOdds && (
             <div style={{ width: "100%", padding: "8px 12px", background: "#0d1117", border: "1px solid #1a1f2b", borderRadius: 6, marginTop: 8 }}>
               <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 2, textTransform: "uppercase", textAlign: "center", marginBottom: 4 }}>Place your bet</div>
-              {wallet.win_streak >= 3 && <div style={{ fontSize: 8, color: "#e67e22", textAlign: "center", marginBottom: 4 }}>🔥 HEAT BONUS: {wallet.win_streak >= 10 ? "5" : wallet.win_streak >= 7 ? "3" : wallet.win_streak >= 5 ? "2" : "1.5"}x on all payouts</div>}
               <div style={{ display: "flex", justifyContent: "space-around", marginBottom: 6 }}>
                 <div style={{ textAlign: "center" }}>
                   <div style={{ fontSize: 8, color: "#e74c3c" }}>RED</div>
@@ -2263,9 +2262,6 @@ export default function App() {
                 <div style={{ fontSize: 9, color: "#8892a0" }}>{result.bet.amount} bet on {result.bet.side.toUpperCase()} at {result.bet.odds}x</div>
                 {result.bet.bankrupt && <div style={{ fontSize: 9, color: "#ffd700", marginTop: 2 }}>Bankrupt! Here's 500 coins to get back in the game.</div>}
                 {result.bet.streak && <div style={{ fontSize: 8, color: "#e67e22", marginTop: 2 }}>{result.bet.result === "win" ? `🔥 HOT STREAK: ${result.bet.streak.streak}` : "HOT STREAK broken"}</div>}
-                {result.bet.effective_odds && result.bet.effective_odds !== result.bet.odds && (
-                  <div style={{ fontSize: 8, color: "#4a5568", marginTop: 1 }}>HEAT BONUS: {result.bet.odds}x * {result.bet.streak_mult}x = {result.bet.effective_odds}x</div>
-                )}
               </div>
             )}
             {/* near-miss for lost bets */}

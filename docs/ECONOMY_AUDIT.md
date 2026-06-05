@@ -5,16 +5,16 @@
 **Two economies exist in the code — know which one you are launching:**
 
 1. **Real-money (USDC), as shipped** — `ws.py` settles multiplayer real-money matches as a **pot split**: both players stake, the winner takes `pot − 5% fee`. The house takes a flat 5% of the combined pot with **zero counterparty risk and no bankroll requirement** (it never pays out more than it collected). No variable odds, no streak bonus. This is solvent by construction.
-2. **Free-play (coins), and the model this audit simulates** — `main.py` runs the full **sportsbook**: variable odds where the house is the counterparty, plus the hot-streak heat multiplier, double-down, side-action props and the jackpot. This is the richer, more fun economy and the one the brief describes. The simulations below stress-test *this* model, because it is the candidate for real-money play and it already governs engagement.
+2. **Free-play (coins), and the model this audit simulates** — `main.py` runs the full **sportsbook**: variable odds where the house is the counterparty, double-down, side-action props and the jackpot (the hot-streak heat payout multiplier has been removed — the streak is now a visual-only counter). This is the richer, more fun economy and the one the brief describes. The simulations below stress-test *this* model, because it is the candidate for real-money play and it already governs engagement.
 
-Because the offered odds satisfy `p_win × odds = (1 − house_edge)`, the base house edge is exactly 5% on **every** matchup — only variance differs (an underdog win pays the house far more). The one thing that breaks this is the **streak heat bonus** (Sim 3), which hands enough back to flip the edge negative.
+Because the offered odds satisfy `p_win × odds = (1 − house_edge)`, the base house edge is exactly 5% on **every** matchup — only variance differs (an underdog win pays the house far more). The **streak heat bonus** that used to break this (Sim 3) has been **removed from settlement** — the win-streak is now a visual-only counter — so the edge holds at 5% through hot runs.
 
 ## TL;DR
 
 - **Sessions are long, not short.** A $10 bankroll at $0.50/bet lasts a **median of 270 matches** (mean 391.7). That is gambler's-ruin math: matches ≈ bankroll ÷ (edge × bet) = $10 ÷ (0.05 × $0.50) ≈ 400. The brief's fear of ~40-match sessions was based on flat-loss intuition; with winnings recycling under a 5% edge the real number is ~6–10× longer. **99.3% of sessions clear 50 matches.**
 - **Progression overlaps fine for the early hooks.** 99.3% of $10 sessions reach L5 (first edge), the average session reaches **L13** and 19 evolution cycles. L15 (second edge) is a long-haul goal (22.4%), as intended.
-- **🔴 CRITICAL: the hot-streak heat bonus reverses the house edge.** Realized hold is **5.13%** with main bets, but **-3.06%** once the heat multiplier is on — the house *loses money* during streaks. With double-down too it nets 2.91% (still below the 5% target). If the sportsbook model goes to real money as-is, the house bleeds. This is the single most important finding.
-- **Bankroll is fine under the safe models.** Main-bet sportsbook (heat fixed) and the shipped pot-split both hold ~5%; $500 survived **100%** of 100 runs with a 99th-pct dip of only $55.31. The danger is the heat bonus, not the player count.
+- **✅ RESOLVED: the hot-streak heat bonus has been removed.** It used to reverse the edge (plain 5.13% → **-3.37%** with the streak multiplier on), so it was stripped from settlement — payouts are now base-odds only and the win-streak is a **visual counter** (HOT STREAK badge, ON FIRE form, best-streak record all stay). The heat row now holds **5.38%**, equal to the base edge, regardless of streak. This was the single most important finding; it is fixed.
+- **Bankroll is fine.** With the heat bonus removed, the main-bet sportsbook and the shipped pot-split both hold ~5%; $500 survived **100%** of 100 runs with a 99th-pct dip of only $68.03. Reserve scales with whale bet size, not player count.
 
 ## Simulation 1 — Session duration ($10, $0.50/bet, main bet only)
 
@@ -43,55 +43,55 @@ Because the offered odds satisfy `p_win × odds = (1 − house_edge)`, the base 
 
 **Answer:** Side action **shortens** sessions (median 270 → 190) because $0.20 of props raises stake-per-match from $0.50 to $0.70 (+40%) at the same 5% edge, so the player bleeds ~40% faster. Long-shot wins (avg 33.9/session) add spikes but don't offset the volume. Still, 96.4% clear 50 matches — props are an *engagement/variance* feature, not a longevity one. Fine to keep; just don't sell it as 'more play'.
 
-## Simulation 3 — Streaks + double-down  🔴
+## Simulation 3 — Streaks + double-down  ✅
 
-Heat multipliers (live from code): `{0: 1.0, 3: 1.5, 5: 2.0, 7: 3.0, 10: 5.0}` — applied to the payout based on the streak you bring *into* the match. Double-down = 50% accept after a win, ~47% win per double (elo-matched bot, draws count as losses), up to 3 chains; a double win extends the streak, a loss resets it.
+Old heat multipliers (still in code for reference): `{0: 1.0, 3: 1.5, 5: 2.0, 7: 3.0, 10: 5.0}`. These are **no longer applied to payouts** — the streak multiplier was removed from settlement, so the win-streak is now a visual-only counter. The `heat` row below measures the live (no-multiplier) settlement; the *legacy* counterfactual shows what it would be if the multiplier were still on. Double-down = 50% accept after a win, ~47% win per double (elo-matched bot, draws count as losses), up to 3 chains; a double win extends the streak, a loss resets it.
 
 **Realized house hold by configuration (long no-ruin run — isolates edge erosion):**
 
 | Config | Realized hold | Median session | Hit 30k cap | 5+ streak |
 |---|---|---|---|---|
 | plain | **5.13%** | 253 | 0.0% | 86.1% |
-| heat | **-3.06%** 🔴 | 1293 | 40.0% | 88.1% |
-| double-down | **5.69%** | 106 | 0.0% | 70.5% |
-| both | **2.91%** | 124 | 0.0% | 72.9% |
+| heat | **5.38%** | 260 | 0.0% | 86.3% |
+| double-down | **5.43%** | 110 | 0.0% | 72.8% |
+| both | **5.64%** | 108 | 0.0% | 70.3% |
 
-**Answer — this is the critical finding.** The base edge is healthy (5.13%), and double-down on its own slightly *helps* the house (5.69%, because it is mildly −EV for the player). **But the heat multiplier reverses the edge to -3.06%** — the house pays out *more than it takes in*. The mechanism: a winning streak of 3+ pays 1.5×–5× the already fair-minus-5% odds, which on an even-money bet is a +40%–+400% player edge on those bets. Streaks are common (88.1% of sessions hit a 5+ run), so this is not a tail effect — it gives back ~8% of turnover on average and **flips a +5% book into a ~−3% book.** Symptom: with heat on, sessions stop ending (median hits the 30,000 cap) because the player's balance trends *up*. Combined with double-down it nets 2.91% — still under the 5% target.
-
-This is harmless today (heat runs on **free-play coins**, so it only inflates play-money balances). **But it is a hard blocker for putting the sportsbook model behind real USDC.** Fixes, cheapest first: (a) **cap the heat multiplier at ~1.25×–1.5× and/or apply it only to the *base stake*, not the full odds-payout**; (b) fund heat bonuses from a **separate marketing/jackpot pool** rather than the book; (c) require the streak to be on *real-money* competitive matches only and lower the tiers. Re-run this script after any change — the hold row is the acceptance test (it must stay positive).
+**Answer — resolved.** The streak heat bonus has been **removed from settlement**: payouts are base-odds only and the win-streak is now a visual-only counter (HOT STREAK badge, ON FIRE form, best-streak record). The `heat` row therefore holds **5.38%** — identical to the plain book (5.13%) — no matter how long the streak runs. For the record, with the multiplier still on it reversed the edge to **-3.37%** (and 3.16% stacked with double-down); that is why it was removed. Double-down stays and nets 5.43% (mildly player-negative). The `heat` hold row is the standing acceptance test — it must stay ≈ the base edge on every betting-math change.
 
 ## Simulation 4 — House revenue & bankroll (100 players, 30 days)
 
-*Main-bet sportsbook (no heat) — equivalent to the heat-fixed book or the shipped pot-split.*
+*Main-bet sportsbook at the base 5% edge (the streak heat bonus is removed) — equivalent on hold to the shipped pot-split.*
 
 | Metric | Value |
 |---|---|
-| Mean 30-day house revenue | **$1,303.07** |
-| Median 30-day house revenue | $1,303.98 |
-| Aggregate realized hold (100 runs) | 5.19% |
-| Revenue / day (mean) | $43.44 |
+| Mean 30-day house revenue | **$1,288.16** |
+| Median 30-day house revenue | $1,289.40 |
+| Aggregate realized hold (100 runs) | 5.13% |
+| Revenue / day (mean) | $42.94 |
 | Revenue / player / day | $0.43 |
 | Total wagered (30d, one run) | $25,125.00 |
-| Worst single-day house loss (one run) | $23.66 |
+| Worst single-day house loss (one run) | $20.66 |
 
 **Bankroll stress (100 runs, $500 start):**
 
 | Metric | Value |
 |---|---|
 | Runs where $500 went negative | **0.0%** |
-| 99th-pct max drawdown below start | $55.31 |
-| Worst-run / best-run revenue | $858.98 / $1,768.71 |
-| Forced 70%-player-win bad day | house P&L **$-283.61** (min intraday $-287.91) |
+| 99th-pct max drawdown below start | $68.03 |
+| Worst-run / best-run revenue | $609.63 / $1,860.13 |
+| Forced 70%-player-win bad day | house P&L **$-320.57** (min intraday $-327.15) |
 
 **Minimum safe starting bankroll (99% survival, by concurrency):**
 
 | Concurrent players | Min safe bankroll |
 |---|---|
-| 50 | $68.64 |
-| 100 | $65.55 |
-| 200 | $49.68 |
+| 50 | $54.58 |
+| 100 | $45.64 |
+| 200 | $43.07 |
 
-**Answer:** Under the clean 5% book the house earns a mean **$1,303.07/30d** (~$43.44/day) at 5.19% realized hold — exactly the design. **$500 is comfortably safe at this scale:** 0 of 100 runs went negative, the 99th-pct drawdown is only $55.31, and even a forced 70%-player-win day (whales hitting underdogs) bottoms out at $-287.91 — well inside $500. The min-safe figures are small because variance at these bet sizes is low. **The caveat that matters:** these numbers assume no heat bonus. Turn heat on (Sim 3) and realized hold goes to -3.06%–2.91%, at which point the bankroll *trends down*, not up — no reserve survives a negative-edge book indefinitely. **Fix the heat bonus, then $500–$1,000 is ample for 100 players.**
+**Answer:** Under the clean 5% book the house earns a mean **$1,288.16/30d** (~$42.94/day) at 5.13% realized hold — exactly the design. **$500 is comfortably safe at this scale:** 0 of 100 runs went negative, the 99th-pct drawdown is only $68.03, and even a forced 70%-player-win day (whales hitting underdogs) bottoms out at $-327.15 — well inside $500. The min-safe figures are small because variance at these bet sizes is low.
+
+This is robust now that the streak heat bonus is removed: the `heat` configuration holds 5.38% (it would have been -3.37% under the old multiplier), so the bankroll trends *up* through hot runs. **$500–$1,000 is ample for 100 players.**
 
 ## Simulation 5 — Progression overlap
 
@@ -118,8 +118,8 @@ Cell = % of 1,000 sessions lasting 50+ matches. **Bold** = smallest deposit clea
 | Bet size | $5.00 | $10.00 | $15.00 | $20.00 | $25.00 | $50.00 |
 |---|---|---|---|---|---|---|
 | $0.10 | **100.0%** | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
-| $0.25 | **98.8%** | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
-| $0.50 | 74.8% | **99.1%** | 100.0% | 100.0% | 100.0% | 100.0% |
+| $0.25 | **97.5%** | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
+| $0.50 | 73.4% | **98.2%** | 100.0% | 100.0% | 100.0% | 100.0% |
 
 | Bet size | Min viable deposit |
 |---|---|
@@ -127,24 +127,24 @@ Cell = % of 1,000 sessions lasting 50+ matches. **Bold** = smallest deposit clea
 | $0.25 | $5.00 |
 | $0.50 | $10.00 |
 
-**Answer:** Even at the **$0.50** default, **$10** already clears the 75% bar (99.1% of $10 sessions reach 50 matches). A **$5** deposit is enough at $0.10–$0.25 bets. So the recommended minimum is **$10**, and a lower default bet ($0.10) makes even a $5 deposit comfortably satisfying. There is no need to push a larger deposit.
+**Answer:** Even at the **$0.50** default, **$10** already clears the 75% bar (98.2% of $10 sessions reach 50 matches). A **$5** deposit is enough at $0.10–$0.25 bets. So the recommended minimum is **$10**, and a lower default bet ($0.10) makes even a $5 deposit comfortably satisfying. There is no need to push a larger deposit.
 
 ## Simulation 7 — Whale vs casual distribution (100 players, 30 days)
 
 | Segment | Players | Deposit | Bet | House revenue | % of revenue | Active at d30 |
 |---|---|---|---|---|---|---|
-| casual | 70 | $10.00 | $0.25 | $183.55 | 11% | 70/70 |
-| regular | 20 | $20.00 | $0.50 | $183.38 | 11% | 20/20 |
-| whale | 10 | $100.00 | $2.00 | $1,246.31 | 77% | 10/10 |
+| casual | 70 | $10.00 | $0.25 | $152.87 | 12% | 70/70 |
+| regular | 20 | $20.00 | $0.50 | $299.93 | 24% | 20/20 |
+| whale | 10 | $100.00 | $2.00 | $813.97 | 64% | 10/10 |
 
 | Money flow (30d) | Value |
 |---|---|
-| Total player deposits | $3,040.00 |
-| Withdrawable balances remaining | $1,426.76 |
-| House take (deposits − remaining) | $1,613.24 |
-| House betting P&L (reconciles) | $1,613.24 |
+| Total player deposits | $3,000.00 |
+| Withdrawable balances remaining | $1,733.23 |
+| House take (deposits − remaining) | $1,266.77 |
+| House betting P&L (reconciles) | $1,266.77 |
 
-**Answer:** Revenue is **whale-dominated** — 10 whales drive **77%** of house revenue at 10% of headcount; casuals contribute 11% and churn first (their 3-reload cap). Average LTV (house revenue per player): casual $2.62, regular $9.17, whale $124.63. This is a normal, healthy whale-funded model **and the bankroll absorbs the whale variance fine** (0.0% ruin at $500) — *as long as the heat bonus is fixed*. With heat on, whales on streaks are exactly who drains the book fastest.
+**Answer:** Revenue is **whale-dominated** — 10 whales drive **64%** of house revenue at 10% of headcount; casuals contribute 12% and churn first (their 3-reload cap). Average LTV (house revenue per player): casual $2.18, regular $15.00, whale $81.40. This is a normal, healthy whale-funded model **and the bankroll absorbs the whale variance fine** (0.0% ruin at $500). (Under the old heat multiplier, whales on streaks were exactly who drained the book fastest — removing the streak payout multiplier closed that hole.)
 
 ## Simulation 8 — Jackpot pool economics (3% contribution)
 
@@ -163,9 +163,9 @@ Cell = % of 1,000 sessions lasting 50+ matches. **Bold** = smallest deposit clea
 
 **1. Bet-size tiers / default.** The $0.01–$10 range is good. Default **$0.25** is reasonable; **$0.10** for brand-new players is a nice-to-have (it turns a $5 deposit into a 50+ match session) but not required — even $0.50 on $10 gives a median 270 matches. Surface higher tiers as 'raise the stakes' once a player has a cushion. **Bet size is a comfort dial, not a survival fix** — sessions are already long.
 
-**2. House edge.** Keep **5%**. Realized hold lands at 5.19% and yields a mean $1,303.07/30d from 100 players. 3% would lengthen sessions ~40% but is unnecessary given they're already long; 7% needlessly shortens them. 5% is right. The edge that actually matters is keeping it **positive** — see rec 7.
+**2. House edge.** Keep **5%**. Realized hold lands at 5.13% and yields a mean $1,288.16/30d from 100 players. 3% would lengthen sessions ~40% but is unnecessary given they're already long; 7% needlessly shortens them. 5% is right. The edge that actually matters is keeping it **positive** — see rec 7.
 
-**3. Minimum deposit.** **$10.** It clears the 'one evolution cycle' bar at every bet tier (99.1% even at $0.50). $5 works if you also default the bet to $0.10–$0.25. No need to ask for more.
+**3. Minimum deposit.** **$10.** It clears the 'one evolution cycle' bar at every bet tier (98.2% even at $0.50). $5 works if you also default the bet to $0.10–$0.25. No need to ask for more.
 
 **4. Free chips.** Yes, but for **reach and L15+ progression**, not survival. A daily free-play allotment (~20–40 matches) lets churned players keep climbing the ladder and keeps the agent-evolution loop alive between deposits. Critically, **let progression (XP/evolution/familiarity) accrue on free play** so the L15 long tail is reachable without spending.
 
@@ -173,19 +173,19 @@ Cell = % of 1,000 sessions lasting 50+ matches. **Bold** = smallest deposit clea
 
 **6. Side action.** It shortens sessions (median 270→190) by adding 40% more 5%-edge volume. Keep it for variety. A **slightly lower prop edge (3%)** would make side bets feel like flavor rather than a faster drain, and the long-shot props supply the dopamine spikes.
 
-**7. Streaks / double-down — 🔴 fix before real-money sportsbook.** **The heat multiplier reverses the house edge** (plain 5.13% → with heat -3.06%). Double-down alone is fine (+5.69%, mildly player-negative). On free-play coins this only inflates play balances, but it is a **hard blocker** for a real-money sportsbook. Fix by capping the multiplier (≤~1.5×), applying it to the base stake only, or funding it from a separate bonus pool. The `heat` hold row in this script is your acceptance test — it must stay positive.
+**7. Streaks / double-down — ✅ heat bonus removed.** The streak **heat bonus has been removed** from settlement — payouts are base-odds only and the win-streak is now a visual-only counter (HOT STREAK badge, ON FIRE form, best-streak record). It previously reversed the edge (plain 5.13% → -3.37% with the multiplier on), which is why it was removed; the `heat` row now holds 5.38%. Double-down stays (+5.43%, mildly player-negative). The `heat` hold row is the standing acceptance test — it must stay ≈ the base edge on any future betting-math change.
 
-**8. House bankroll sizing.** Under a **positive-edge** book, the reserve need is small: 50→$68.64, 100→$65.55, 200→$49.68 for 99% survival; a practical $1,000.00 float for 100 players is very safe. These scale with **whale bet size**, not headcount. **None of this holds if the edge is negative** (rec 7) — a negative-edge book needs an infinite bankroll. Note the shipped real-money pot-split needs **no reserve at all** (it only pays out collected stakes).
+**8. House bankroll sizing.** Under a **positive-edge** book, the reserve need is small: 50→$54.58, 100→$45.64, 200→$43.07 for 99% survival; a practical $1,000.00 float for 100 players is very safe. These scale with **whale bet size**, not headcount. **None of this holds if the edge is ever negative** — a negative-edge book needs an infinite bankroll, which is exactly why the streak heat bonus was removed (rec 7); keep any future payout boost off the base book. Note the shipped real-money pot-split needs **no reserve at all** (it only pays out collected stakes).
 
 **9. Underdog exposure.** Underdog wins pay 2.4×–3.5×, so they dominate downside variance and the bad-day stress. If you run the variable-odds book for real money, **cap max stake on 2.5×+ underdog selections** (e.g. ½ the favorite max) to bound single-bet exposure. (Irrelevant for the pot-split model, which has no odds.)
 
-**10. Multiplayer vs VS BOT.** Different economics by design. **VS BOT** is the variable-odds book (house is counterparty, carries the heat-bonus risk). **Real-money multiplayer is the pot-split** — two players fund the pot, house rakes 5%, zero counterparty risk and double the rake per match. Multiplayer is strictly the safer, more profitable real-money mode; lean there for USDC and keep VS BOT on free-play coins until the heat bonus is fixed.
+**10. Multiplayer vs VS BOT.** Different economics by design. **VS BOT** is the variable-odds book (the house is the counterparty and carries the odds variance; with the streak heat bonus removed it is now a clean 5% book). **Real-money multiplayer is the pot-split** — two players fund the pot, house rakes 5%, zero counterparty risk and double the rake per match. Multiplayer is strictly the safer, more profitable real-money mode; lean there for USDC.
 
 ## Red flags before real-money launch
 
-1. **🔴 Heat bonus flips the house edge negative (5.13% → -3.06%) — critical.** Do not put the variable-odds book behind real money until the heat multiplier is capped or separately funded. (Harmless on free-play coins today.)
-2. **Decide which real-money model you are launching.** The shipped USDC path is a safe 5% pot-split with no bankroll risk; the brief describes the richer variable-odds sportsbook. They behave very differently. Don't accidentally ship the sportsbook math (with heat) on USDC.
+1. **✅ Heat bonus removed (was the critical blocker).** The streak multiplier that flipped the edge negative (plain 5.13% → -3.37% with it on) has been stripped from settlement; the `heat` row now holds 5.38%. Keep that row ≈ the base edge on any future betting-math change — it is the standing acceptance test.
+2. **Decide which real-money model you are launching.** The shipped USDC path is a safe 5% pot-split with no bankroll risk; the brief describes the richer variable-odds sportsbook. They behave very differently — re-confirm the realized hold with this script before putting the variable-odds book on USDC, and keep any new payout boost off the base book.
 3. **Jackpot + edge stack to ~8% drag.** Fine, but seed the pool ($25–$50) so it isn't trivial at launch volume, and remember the combined drag when reasoning about retention.
 4. **Side action accelerates losses** (median 270→190). Keep it, but frame it as variety, not 'more play'.
 
-**Bottom line:** the economy is healthier than the brief feared — sessions are long (median 270), progression hooks land early (99.3% reach L5), and the shipped real-money model is solvent by construction. The **one must-fix is the heat-streak bonus**, which silently turns the sportsbook into a money-loser. Fix that and the variable-odds book is launch-ready on a modest reserve.
+**Bottom line:** the economy is healthier than the brief feared — sessions are long (median 270), progression hooks land early (99.3% reach L5), and the shipped real-money model is solvent by construction. The one critical bug — the heat-streak bonus that silently turned the sportsbook into a money-loser — has been **removed** (the streak is now a visual-only counter). With that fixed the variable-odds book holds its 5% edge and is launch-ready on a modest reserve.

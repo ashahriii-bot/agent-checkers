@@ -69,6 +69,14 @@ PROP_LONG = (4.5, round((1 - HOUSE_EDGE) / 4.5, 4))     # long shot (e.g. The Co
 DOUBLE_WIN_P = 0.47   # double-or-nothing vs an elo-matched bot (0.50 raw * 0.94 non-draw)
 MAX_SESSION = 30000   # hard cap so a hot session can't loop forever
 
+# Whether the LIVE settlement code applies the win-streak ("heat") payout multiplier.
+# This audit originally found that multiplier reversed the house edge (+5% -> -3%), so it
+# was REMOVED from settlement (main.py: payout = bet * base_odds; the streak is now a
+# visual-only counter). This flag mirrors that: the `heat` hold row therefore equals the
+# base edge. Flip to True to reproduce the pre-fix diagnosis (the counterfactual the
+# report still reports as the "before" number).
+HEAT_BONUS_IN_SETTLEMENT = False
+
 
 def pct(sorted_vals, q):
     if not sorted_vals:
@@ -155,11 +163,16 @@ def run_sim2(n=1000, start=1000, bet=50, side=10):
 # ============================================================================
 # SIM 3 - streaks + double-down
 # ============================================================================
-def _heat_session(balance, bet, use_heat, use_dd, max_matches=MAX_SESSION):
+def _heat_session(balance, bet, use_heat, use_dd, max_matches=MAX_SESSION, heat_in_settlement=None):
     """Faithful streak+double-down session. Returns (matches, staked, returned, max_streak).
-    Heat multiplier uses the INCOMING streak (real code computes it before the win);
+    Heat multiplier uses the INCOMING streak (real code computed it before the win);
     double-down is 50%-accept double-or-nothing on the winnings, ~47% win, max 3 chains,
-    a double win increments the streak and a double loss resets it."""
+    a double win increments the streak and a double loss resets it.
+
+    heat_in_settlement: None -> mirror the live code via HEAT_BONUS_IN_SETTLEMENT (the
+    streak multiplier has been removed, so this is False and the heat row == base edge).
+    Pass True to force the multiplier on and reproduce the pre-fix counterfactual."""
+    heat_on = HEAT_BONUS_IN_SETTLEMENT if heat_in_settlement is None else heat_in_settlement
     matches = 0
     streak = 0
     staked = 0
@@ -170,7 +183,7 @@ def _heat_session(balance, bet, use_heat, use_dd, max_matches=MAX_SESSION):
         balance -= bet
         staked += bet
         matches += 1
-        mult = get_streak_multiplier(streak) if use_heat else 1.0   # streak coming IN
+        mult = get_streak_multiplier(streak) if (use_heat and heat_on) else 1.0   # streak coming IN
         if random.random() < p:
             payout = int(bet * odds * mult)
             balance += payout
@@ -198,9 +211,10 @@ def _heat_session(balance, bet, use_heat, use_dd, max_matches=MAX_SESSION):
     return matches, staked, returned, max_streak
 
 
-def measure_hold(use_heat, use_dd, n_matches=400000, bet=50):
+def measure_hold(use_heat, use_dd, n_matches=400000, bet=50, heat_in_settlement=None):
     """Realized house hold (%) over a long no-ruin run -- isolates edge erosion."""
-    _, staked, returned, _ = _heat_session(10 ** 13, bet, use_heat, use_dd, max_matches=n_matches)
+    _, staked, returned, _ = _heat_session(10 ** 13, bet, use_heat, use_dd,
+                                            max_matches=n_matches, heat_in_settlement=heat_in_settlement)
     return round(100 * (staked - returned) / staked, 2)
 
 
@@ -226,6 +240,13 @@ def run_sim3(n=1000, start=1000, bet=50):
             "cap_hit_pct": round(100 * cap_hits / n, 1),
             "pct_streak5": round(100 * streak5 / n, 1),
         }
+    # Counterfactual: what the heat / heat+double-down hold WOULD be if the (now-removed)
+    # streak multiplier were still in settlement. Documents the "before" in the report.
+    out["legacy"] = {
+        "heat_hold": measure_hold(True, False, heat_in_settlement=True),
+        "both_hold": measure_hold(True, True, heat_in_settlement=True),
+        "removed": not HEAT_BONUS_IN_SETTLEMENT,
+    }
     return out
 
 
@@ -475,6 +496,9 @@ def build_report(s1, s2, s3, s47, msb, badday, s5, s6, s8):
     both_hold = s3["both"]["hold"]
     dd_hold = s3["double-down"]["hold"]
     heat_breaks = heat_hold < 0
+    heat_removed = s3["legacy"]["removed"]
+    legacy_heat = s3["legacy"]["heat_hold"]   # what the heat row WOULD be with the multiplier on
+    legacy_both = s3["legacy"]["both_hold"]
     L = []
     w = L.append
     w("# Agent Checkers — Betting Economy Audit")
@@ -490,15 +514,23 @@ def build_report(s1, s2, s3, s47, msb, badday, s5, s6, s8):
       "the combined pot with **zero counterparty risk and no bankroll requirement** (it never pays out "
       "more than it collected). No variable odds, no streak bonus. This is solvent by construction.")
     w("2. **Free-play (coins), and the model this audit simulates** — `main.py` runs the full "
-      "**sportsbook**: variable odds where the house is the counterparty, plus the hot-streak heat "
-      "multiplier, double-down, side-action props and the jackpot. This is the richer, more fun economy "
-      "and the one the brief describes. The simulations below stress-test *this* model, because it is "
+      "**sportsbook**: variable odds where the house is the counterparty, double-down, side-action props "
+      "and the jackpot" + (" (the hot-streak heat payout multiplier has been removed — the streak is now "
+      "a visual-only counter)" if heat_removed else ", plus the hot-streak heat multiplier") + ". This is "
+      "the richer, more fun economy and the one the brief describes. The simulations below stress-test "
+      "*this* model, because it is "
       "the candidate for real-money play and it already governs engagement.")
     w("")
-    w("Because the offered odds satisfy `p_win × odds = (1 − house_edge)`, the base house edge is exactly "
-      "5% on **every** matchup — only variance differs (an underdog win pays the house far more). The "
-      "one thing that breaks this is the **streak heat bonus** (Sim 3), which hands enough back to flip "
-      "the edge negative.")
+    if heat_removed:
+        w("Because the offered odds satisfy `p_win × odds = (1 − house_edge)`, the base house edge is exactly "
+          "5% on **every** matchup — only variance differs (an underdog win pays the house far more). The "
+          "**streak heat bonus** that used to break this (Sim 3) has been **removed from settlement** — the "
+          "win-streak is now a visual-only counter — so the edge holds at 5% through hot runs.")
+    else:
+        w("Because the offered odds satisfy `p_win × odds = (1 − house_edge)`, the base house edge is exactly "
+          "5% on **every** matchup — only variance differs (an underdog win pays the house far more). The "
+          "one thing that breaks this is the **streak heat bonus** (Sim 3), which hands enough back to flip "
+          "the edge negative.")
     w("")
 
     # ---- executive summary ----
@@ -513,15 +545,27 @@ def build_report(s1, s2, s3, s47, msb, badday, s5, s6, s8):
       f"L5 (first edge), the average session reaches **L{s5['mean']['level']}** and "
       f"{s5['mean']['evolution_cycles']} evolution cycles. L15 (second edge) is a long-haul goal "
       f"({s5['pct_reach_L15']}%), as intended.")
-    w(f"- **🔴 CRITICAL: the hot-streak heat bonus reverses the house edge.** Realized hold is "
-      f"**{plain_hold}%** with main bets, but **{heat_hold}%** once the heat multiplier is on — the "
-      f"house *loses money* during streaks. With double-down too it nets {both_hold}% (still below the "
-      f"5% target). If the sportsbook model goes to real money as-is, the house bleeds. This is the "
-      f"single most important finding.")
-    w(f"- **Bankroll is fine under the safe models.** Main-bet sportsbook (heat fixed) and the shipped "
-      f"pot-split both hold ~5%; $500 survived **{100 - s47['pct_negative_at_500']:.0f}%** of 100 runs "
-      f"with a 99th-pct dip of only {d(s47['p99_drawdown'])}. The danger is the heat bonus, not the "
-      f"player count.")
+    if heat_removed:
+        w(f"- **✅ RESOLVED: the hot-streak heat bonus has been removed.** It used to reverse the edge "
+          f"(plain {plain_hold}% → **{legacy_heat}%** with the streak multiplier on), so it was stripped "
+          f"from settlement — payouts are now base-odds only and the win-streak is a **visual counter** "
+          f"(HOT STREAK badge, ON FIRE form, best-streak record all stay). The heat row now holds "
+          f"**{heat_hold}%**, equal to the base edge, regardless of streak. This was the single most "
+          f"important finding; it is fixed.")
+        w(f"- **Bankroll is fine.** With the heat bonus removed, the main-bet sportsbook and the shipped "
+          f"pot-split both hold ~5%; $500 survived **{100 - s47['pct_negative_at_500']:.0f}%** of 100 runs "
+          f"with a 99th-pct dip of only {d(s47['p99_drawdown'])}. Reserve scales with whale bet size, not "
+          f"player count.")
+    else:
+        w(f"- **🔴 CRITICAL: the hot-streak heat bonus reverses the house edge.** Realized hold is "
+          f"**{plain_hold}%** with main bets, but **{heat_hold}%** once the heat multiplier is on — the "
+          f"house *loses money* during streaks. With double-down too it nets {both_hold}% (still below the "
+          f"5% target). If the sportsbook model goes to real money as-is, the house bleeds. This is the "
+          f"single most important finding.")
+        w(f"- **Bankroll is fine under the safe models.** Main-bet sportsbook (heat fixed) and the shipped "
+          f"pot-split both hold ~5%; $500 survived **{100 - s47['pct_negative_at_500']:.0f}%** of 100 runs "
+          f"with a 99th-pct dip of only {d(s47['p99_drawdown'])}. The danger is the heat bonus, not the "
+          f"player count.")
     w("")
 
     # ---- SIM 1 ----
@@ -565,12 +609,20 @@ def build_report(s1, s2, s3, s47, msb, badday, s5, s6, s8):
     w("")
 
     # ---- SIM 3 (the headline) ----
-    w("## Simulation 3 — Streaks + double-down  🔴")
+    w("## Simulation 3 — Streaks + double-down" + ("  ✅" if heat_removed else "  🔴"))
     w("")
-    w(f"Heat multipliers (live from code): `{STREAK_MULTIPLIERS}` — applied to the payout based on the "
-      f"streak you bring *into* the match. Double-down = 50% accept after a win, ~{DOUBLE_WIN_P:.0%} win "
-      f"per double (elo-matched bot, draws count as losses), up to 3 chains; a double win extends the "
-      f"streak, a loss resets it.")
+    if heat_removed:
+        w(f"Old heat multipliers (still in code for reference): `{STREAK_MULTIPLIERS}`. These are **no "
+          f"longer applied to payouts** — the streak multiplier was removed from settlement, so the win-"
+          f"streak is now a visual-only counter. The `heat` row below measures the live (no-multiplier) "
+          f"settlement; the *legacy* counterfactual shows what it would be if the multiplier were still on. "
+          f"Double-down = 50% accept after a win, ~{DOUBLE_WIN_P:.0%} win per double (elo-matched bot, draws "
+          f"count as losses), up to 3 chains; a double win extends the streak, a loss resets it.")
+    else:
+        w(f"Heat multipliers (live from code): `{STREAK_MULTIPLIERS}` — applied to the payout based on the "
+          f"streak you bring *into* the match. Double-down = 50% accept after a win, ~{DOUBLE_WIN_P:.0%} win "
+          f"per double (elo-matched bot, draws count as losses), up to 3 chains; a double win extends the "
+          f"streak, a loss resets it.")
     w("")
     w("**Realized house hold by configuration (long no-ruin run — isolates edge erosion):**")
     w("")
@@ -600,6 +652,15 @@ def build_report(s1, s2, s3, s47, msb, badday, s5, s6, s8):
           "marketing/jackpot pool** rather than the book; (c) require the streak to be on *real-money* "
           "competitive matches only and lower the tiers. Re-run this script after any change — the hold "
           "row is the acceptance test (it must stay positive).")
+    elif heat_removed:
+        w(f"**Answer — resolved.** The streak heat bonus has been **removed from settlement**: payouts are "
+          f"base-odds only and the win-streak is now a visual-only counter (HOT STREAK badge, ON FIRE form, "
+          f"best-streak record). The `heat` row therefore holds **{heat_hold}%** — identical to the plain "
+          f"book ({plain_hold}%) — no matter how long the streak runs. For the record, with the multiplier "
+          f"still on it reversed the edge to **{legacy_heat}%** (and {legacy_both}% stacked with "
+          f"double-down); that is why it was removed. Double-down stays and nets {dd_hold}% (mildly "
+          f"player-negative). The `heat` hold row is the standing acceptance test — it must stay ≈ the base "
+          f"edge on every betting-math change.")
     else:
         w(f"**Answer:** With corrected timing the heat bonus only modestly dents the edge "
           f"(plain {plain_hold}% → heat {heat_hold}%); double-down nets {dd_hold}%. Streaks create "
@@ -610,7 +671,8 @@ def build_report(s1, s2, s3, s47, msb, badday, s5, s6, s8):
     # ---- SIM 4 ----
     w("## Simulation 4 — House revenue & bankroll (100 players, 30 days)")
     w("")
-    w("*Main-bet sportsbook (no heat) — equivalent to the heat-fixed book or the shipped pot-split.*")
+    w("*Main-bet sportsbook at the base 5% edge (the streak heat bonus is removed) — equivalent on hold "
+      "to the shipped pot-split.*")
     w("")
     w("| Metric | Value |")
     w("|---|---|")
@@ -644,10 +706,17 @@ def build_report(s1, s2, s3, s47, msb, badday, s5, s6, s8):
       f"design. **$500 is comfortably safe at this scale:** 0 of 100 runs went negative, the 99th-pct "
       f"drawdown is only {d(s47['p99_drawdown'])}, and even a forced 70%-player-win day (whales hitting "
       f"underdogs) bottoms out at {d(badday[1])} — well inside $500. The min-safe figures are small "
-      f"because variance at these bet sizes is low. **The caveat that matters:** these numbers assume "
-      f"no heat bonus. Turn heat on (Sim 3) and realized hold goes to {heat_hold}%–{both_hold}%, at "
-      f"which point the bankroll *trends down*, not up — no reserve survives a negative-edge book "
-      f"indefinitely. **Fix the heat bonus, then $500–$1,000 is ample for 100 players.**")
+      f"because variance at these bet sizes is low.")
+    w("")
+    if heat_removed:
+        w(f"This is robust now that the streak heat bonus is removed: the `heat` configuration holds "
+          f"{heat_hold}% (it would have been {legacy_heat}% under the old multiplier), so the bankroll "
+          f"trends *up* through hot runs. **$500–$1,000 is ample for 100 players.**")
+    else:
+        w(f"**The caveat that matters:** these numbers assume no heat bonus. Turn heat on (Sim 3) and "
+          f"realized hold goes to {heat_hold}%–{both_hold}%, at which point the bankroll *trends down*, "
+          f"not up — no reserve survives a negative-edge book indefinitely. **Fix the heat bonus, then "
+          f"$500–$1,000 is ample for 100 players.**")
     w("")
 
     # ---- SIM 5 ----
@@ -728,8 +797,8 @@ def build_report(s1, s2, s3, s47, msb, badday, s5, s6, s8):
       f"revenue per player): casual {d(round(seg_rev['casual']/70))}, regular "
       f"{d(round(seg_rev['regular']/20))}, whale {d(round(seg_rev['whale']/10))}. This is a normal, "
       f"healthy whale-funded model **and the bankroll absorbs the whale variance fine** "
-      f"({s47['pct_negative_at_500']}% ruin at $500) — *as long as the heat bonus is fixed*. With heat "
-      f"on, whales on streaks are exactly who drains the book fastest.")
+      f"({s47['pct_negative_at_500']}% ruin at $500). (Under the old heat multiplier, whales on streaks "
+      f"were exactly who drained the book fastest — removing the streak payout multiplier closed that hole.)")
     w("")
 
     # ---- SIM 8 ----
@@ -788,31 +857,39 @@ def build_report(s1, s2, s3, s47, msb, badday, s5, s6, s8):
          f"It shortens sessions (median {s1['median']}→{s2['median']}) by adding 40% more 5%-edge "
          f"volume. Keep it for variety. A **slightly lower prop edge (3%)** would make side bets feel "
          f"like flavor rather than a faster drain, and the long-shot props supply the dopamine spikes."),
-        ("7. Streaks / double-down — 🔴 fix before real-money sportsbook",
-         f"**The heat multiplier reverses the house edge** (plain {plain_hold}% → with heat "
-         f"{heat_hold}%). Double-down alone is fine (+{dd_hold}%, mildly player-negative). On free-play "
-         f"coins this only inflates play balances, but it is a **hard blocker** for a real-money "
-         f"sportsbook. Fix by capping the multiplier (≤~1.5×), applying it to the base stake only, or "
-         f"funding it from a separate bonus pool. The `heat` hold row in this script is your acceptance "
-         f"test — it must stay positive."),
+        ("7. Streaks / double-down — ✅ heat bonus removed" if heat_removed else
+         "7. Streaks / double-down — 🔴 fix before real-money sportsbook",
+         (f"The streak **heat bonus has been removed** from settlement — payouts are base-odds only and the "
+          f"win-streak is now a visual-only counter (HOT STREAK badge, ON FIRE form, best-streak record). "
+          f"It previously reversed the edge (plain {plain_hold}% → {legacy_heat}% with the multiplier on), "
+          f"which is why it was removed; the `heat` row now holds {heat_hold}%. Double-down stays "
+          f"(+{dd_hold}%, mildly player-negative). The `heat` hold row is the standing acceptance test — it "
+          f"must stay ≈ the base edge on any future betting-math change.") if heat_removed else
+         (f"**The heat multiplier reverses the house edge** (plain {plain_hold}% → with heat "
+          f"{heat_hold}%). Double-down alone is fine (+{dd_hold}%, mildly player-negative). On free-play "
+          f"coins this only inflates play balances, but it is a **hard blocker** for a real-money "
+          f"sportsbook. Fix by capping the multiplier (≤~1.5×), applying it to the base stake only, or "
+          f"funding it from a separate bonus pool. The `heat` hold row in this script is your acceptance "
+          f"test — it must stay positive.")),
         ("8. House bankroll sizing",
          f"Under a **positive-edge** book, the reserve need is small: 50→{d(msb[50])}, 100→{d(msb[100])}, "
          f"200→{d(msb[200])} for 99% survival; a practical {d(max(msb[100]*3, 100000))} float for 100 "
-         f"players is very safe. These scale with **whale bet size**, not headcount. **None of this "
-         f"holds if the edge is negative** (rec 7) — a negative-edge book needs an infinite bankroll. "
-         f"Note the shipped real-money pot-split needs **no reserve at all** (it only pays out collected "
-         f"stakes)."),
+         f"players is very safe. These scale with **whale bet size**, not headcount. **None of this holds "
+         f"if the edge is ever negative** — a negative-edge book needs an infinite bankroll, which is "
+         f"exactly why the streak heat bonus was removed (rec 7); keep any future payout boost off the base "
+         f"book. Note the shipped real-money pot-split needs **no reserve at all** (it only pays out "
+         f"collected stakes)."),
         ("9. Underdog exposure",
          "Underdog wins pay 2.4×–3.5×, so they dominate downside variance and the bad-day stress. If you "
          "run the variable-odds book for real money, **cap max stake on 2.5×+ underdog selections** "
          "(e.g. ½ the favorite max) to bound single-bet exposure. (Irrelevant for the pot-split model, "
          "which has no odds.)"),
         ("10. Multiplayer vs VS BOT",
-         "Different economics by design. **VS BOT** is the variable-odds book (house is counterparty, "
-         "carries the heat-bonus risk). **Real-money multiplayer is the pot-split** — two players fund "
-         "the pot, house rakes 5%, zero counterparty risk and double the rake per match. Multiplayer is "
-         "strictly the safer, more profitable real-money mode; lean there for USDC and keep VS BOT on "
-         "free-play coins until the heat bonus is fixed."),
+         "Different economics by design. **VS BOT** is the variable-odds book (the house is the "
+         "counterparty and carries the odds variance; with the streak heat bonus removed it is now a clean "
+         "5% book). **Real-money multiplayer is the pot-split** — two players fund the pot, house rakes 5%, "
+         "zero counterparty risk and double the rake per match. Multiplayer is strictly the safer, more "
+         "profitable real-money mode; lean there for USDC."),
     ]
     for title, body in recs:
         w(f"**{title}.** {body}")
@@ -821,22 +898,37 @@ def build_report(s1, s2, s3, s47, msb, badday, s5, s6, s8):
     # ---- red flags ----
     w("## Red flags before real-money launch")
     w("")
-    w(f"1. **🔴 Heat bonus flips the house edge negative ({plain_hold}% → {heat_hold}%) — critical.** "
-      f"Do not put the variable-odds book behind real money until the heat multiplier is capped or "
-      f"separately funded. (Harmless on free-play coins today.)")
+    if heat_removed:
+        w(f"1. **✅ Heat bonus removed (was the critical blocker).** The streak multiplier that flipped the "
+          f"edge negative (plain {plain_hold}% → {legacy_heat}% with it on) has been stripped from "
+          f"settlement; the `heat` row now holds {heat_hold}%. Keep that row ≈ the base edge on any future "
+          f"betting-math change — it is the standing acceptance test.")
+    else:
+        w(f"1. **🔴 Heat bonus flips the house edge negative ({plain_hold}% → {heat_hold}%) — critical.** "
+          f"Do not put the variable-odds book behind real money until the heat multiplier is capped or "
+          f"separately funded. (Harmless on free-play coins today.)")
     w(f"2. **Decide which real-money model you are launching.** The shipped USDC path is a safe 5% "
       f"pot-split with no bankroll risk; the brief describes the richer variable-odds sportsbook. They "
-      f"behave very differently. Don't accidentally ship the sportsbook math (with heat) on USDC.")
+      f"behave very differently — re-confirm the realized hold with this script before putting the "
+      f"variable-odds book on USDC, and keep any new payout boost off the base book.")
     w(f"3. **Jackpot + edge stack to ~8% drag.** Fine, but seed the pool ($25–$50) so it isn't trivial "
       f"at launch volume, and remember the combined drag when reasoning about retention.")
     w(f"4. **Side action accelerates losses** (median {s1['median']}→{s2['median']}). Keep it, but frame "
       f"it as variety, not 'more play'.")
     w("")
-    w(f"**Bottom line:** the economy is healthier than the brief feared — sessions are long "
-      f"(median {s1['median']}), progression hooks land early ({s5['pct_reach_L5']}% reach L5), and the "
-      f"shipped real-money model is solvent by construction. The **one must-fix is the heat-streak "
-      f"bonus**, which silently turns the sportsbook into a money-loser. Fix that and the variable-odds "
-      f"book is launch-ready on a modest reserve.")
+    if heat_removed:
+        w(f"**Bottom line:** the economy is healthier than the brief feared — sessions are long "
+          f"(median {s1['median']}), progression hooks land early ({s5['pct_reach_L5']}% reach L5), and the "
+          f"shipped real-money model is solvent by construction. The one critical bug — the heat-streak "
+          f"bonus that silently turned the sportsbook into a money-loser — has been **removed** (the streak "
+          f"is now a visual-only counter). With that fixed the variable-odds book holds its 5% edge and is "
+          f"launch-ready on a modest reserve.")
+    else:
+        w(f"**Bottom line:** the economy is healthier than the brief feared — sessions are long "
+          f"(median {s1['median']}), progression hooks land early ({s5['pct_reach_L5']}% reach L5), and the "
+          f"shipped real-money model is solvent by construction. The **one must-fix is the heat-streak "
+          f"bonus**, which silently turns the sportsbook into a money-loser. Fix that and the variable-odds "
+          f"book is launch-ready on a modest reserve.")
     w("")
     return "\n".join(L)
 
