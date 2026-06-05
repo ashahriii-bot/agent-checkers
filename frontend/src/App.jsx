@@ -1933,6 +1933,7 @@ export default function App() {
   const [wallet, setWallet] = useState({ balance: 1000, win_streak: 0 });
   const [jackpotPool, setJackpotPool] = useState(0);
   const [currentBet, setCurrentBet] = useState(null);
+  const [betChoice, setBetChoice] = useState(100);  // selected stake for VS BOT / sandbox free-play bets
   const [propBets, setPropBets] = useState([]);
   const [propOdds, setPropOdds] = useState(null);
   const [betOdds, setBetOdds] = useState(null);
@@ -2097,6 +2098,9 @@ export default function App() {
             {muted ? "🔇" : "🔊"}
           </button>
         </div>
+        <div style={{ fontSize: "clamp(10px, 2.6vw, 13px)", color: "#8892a0", marginTop: 6, letterSpacing: 1, maxWidth: 520, marginLeft: "auto", marginRight: "auto" }}>
+          Configure AI agents. Watch them fight. Bet on the outcome.
+        </div>
         <div style={{ display: "flex", justifyContent: "center", flexWrap: "wrap", gap: 6, marginTop: 6 }}>
           <button onClick={() => setAppMode("match")} style={{ padding: "4px 16px", fontSize: 9, fontWeight: 700, letterSpacing: 2, fontFamily: "inherit", cursor: "pointer", background: "#161b22", border: "1px solid #2ecc71", color: "#2ecc71", borderRadius: 3, textTransform: "uppercase" }}>MATCH</button>
           <button onClick={() => setAppMode("tournament")} style={{ padding: "4px 16px", fontSize: 9, fontWeight: 700, letterSpacing: 2, fontFamily: "inherit", cursor: "pointer", background: "#0d1117", border: "1px solid #f39c1266", color: "#f39c12", borderRadius: 3, textTransform: "uppercase" }}>TOURNAMENT</button>
@@ -2129,6 +2133,14 @@ export default function App() {
               {m === "vsbot" ? "VS BOT" : "SANDBOX"}
             </button>
           ))}
+        </div>
+      )}
+
+      {!boards && !loading && redAgent && (matchMode === "vsbot" ? !selectedCoach : !blackAgent) && (
+        <div style={{ textAlign: "center", marginBottom: 10, fontSize: 11, color: "#e67e22", letterSpacing: 1 }}>
+          {matchMode === "vsbot"
+            ? "👇 Pick an opponent below, then hit WATCH to start your first match"
+            : "👇 Pick a second agent (black) below, then hit WATCH to start"}
         </div>
       )}
 
@@ -2182,7 +2194,17 @@ export default function App() {
 
             {/* board with overlaid event banners */}
             <div style={{ position: "relative" }}>
-              <BoardGrid board={board} lastMove={lastMove} redLevel={redAgent?.level || 1} blackLevel={blackAgent?.level || 1} />
+              {board ? (
+                <BoardGrid board={board} lastMove={lastMove} redLevel={redAgent?.level || 1} blackLevel={blackAgent?.level || 1} />
+              ) : (
+                /* pre-match: a compact placeholder instead of a full empty board, so the
+                   opponent picker stays near the top (critical on mobile / first run). */
+                <div style={{ width: "100%", maxWidth: 380, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "center", border: "1px dashed #1a1f2b", borderRadius: 8, background: "#0a0c10", padding: "26px 16px" }}>
+                  <div style={{ textAlign: "center", color: "#3a4450", fontSize: 10, letterSpacing: 1, lineHeight: 1.6 }}>
+                    {canGo ? "▶ Press WATCH or GO — the match plays out here" : "Pick your agent + an opponent — the match plays out here"}
+                  </div>
+                </div>
+              )}
               {/* overlay banners: position absolute, no layout shift */}
               {activeShrinkEvent && <div style={{ position: "absolute", top: 0, left: 0, right: 0, padding: "6px 12px", background: "rgba(231,76,60,0.88)", borderRadius: "6px 6px 0 0", fontSize: 10, color: "#fff", letterSpacing: 1, textTransform: "uppercase", textAlign: "center", zIndex: 10 }}>board shrinking: {activeShrinkEvent.killed.length} squares eliminated</div>}
               {activeFatigueEvent && <div style={{ position: "absolute", top: 0, left: 0, right: 0, padding: "6px 12px", background: "rgba(241,196,15,0.88)", borderRadius: "6px 6px 0 0", fontSize: 10, color: "#0d1117", letterSpacing: 1, textTransform: "uppercase", textAlign: "center", zIndex: 10 }}>king fatigue: idle kings demoted</div>}
@@ -2216,10 +2238,7 @@ export default function App() {
               </div>
               <div style={{ display: "flex", gap: 4, justifyContent: "center", marginBottom: 6 }}>
                 {[10, 50, 100, 250].filter(a => a <= wallet.balance).map(amt => (
-                  <button key={amt} onClick={() => {
-                    setCurrentBet(prev => prev?.amount === amt ? { ...prev } : null);
-                    setCurrentBet(null);
-                  }} style={{ fontSize: 8, padding: "2px 8px", borderRadius: 3, background: "#161b22", border: "1px solid #21262d", color: "#8892a0", cursor: "pointer", fontFamily: "inherit" }}>{amt}</button>
+                  <button key={amt} onClick={() => setBetChoice(amt)} style={{ fontSize: 8, padding: "2px 8px", borderRadius: 3, background: betChoice === amt ? "#9b59b622" : "#161b22", border: `1px solid ${betChoice === amt ? "#9b59b6" : "#21262d"}`, color: betChoice === amt ? "#9b59b6" : "#8892a0", cursor: "pointer", fontFamily: "inherit" }}>{amt}</button>
                 ))}
               </div>
               <div style={{ display: "flex", gap: 4, justifyContent: "center" }}>
@@ -2227,7 +2246,7 @@ export default function App() {
                   const colors = { red: "#e74c3c", black: "#ecf0f1", draw: "#4a5568" };
                   return [10, 50, 100, 250].filter(a => a <= wallet.balance).length > 0 ? (
                     <button key={side} onClick={() => {
-                      const amt = Math.min(100, wallet.balance);
+                      const amt = Math.min(betChoice, wallet.balance);
                       setCurrentBet({ side, amount: amt });
                     }} style={{ padding: "4px 12px", borderRadius: 3, border: `1px solid ${colors[side]}44`, background: "transparent", color: colors[side], fontSize: 8, fontWeight: 700, letterSpacing: 1, cursor: "pointer", fontFamily: "inherit", textTransform: "uppercase" }}>BET {side.toUpperCase()}</button>
                   ) : null;
