@@ -1021,7 +1021,7 @@ function RosterPanel({ side, color, selectedAgent, onSelect, roster, disabled, m
             </div>
           </div>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginTop: 2 }}>
-            <span style={{ fontSize: 13, fontWeight: 800, color: "#8892a0" }}>{Math.round(selectedAgent.elo)} <span style={{ fontSize: 8, fontWeight: 400 }}>ELO</span></span>
+            <span style={{ fontSize: 14, fontWeight: 800, color: "#8892a0" }}>{Math.round(selectedAgent.elo)} <span style={{ fontSize: 8, fontWeight: 400 }}>ELO</span></span>
             <span style={{ fontSize: 7, color: "#4a5568" }}>{selectedAgent.wins}W {selectedAgent.losses}L {selectedAgent.draws}D</span>
           </div>
           <XpBar xp={selectedAgent.xp || 0} xpNext={selectedAgent.xp_next} xpCurrent={selectedAgent.xp_current || 0} level={selectedAgent.level || 1} />
@@ -2058,7 +2058,7 @@ export default function App() {
             {muted ? "🔇" : "🔊"}
           </button>
         </div>
-        <div style={{ display: "flex", justifyContent: "center", gap: 6, marginTop: 6 }}>
+        <div style={{ display: "flex", justifyContent: "center", flexWrap: "wrap", gap: 6, marginTop: 6 }}>
           <button onClick={() => setAppMode("match")} style={{ padding: "4px 16px", fontSize: 9, fontWeight: 700, letterSpacing: 2, fontFamily: "inherit", cursor: "pointer", background: "#161b22", border: "1px solid #2ecc71", color: "#2ecc71", borderRadius: 3, textTransform: "uppercase" }}>MATCH</button>
           <button onClick={() => setAppMode("tournament")} style={{ padding: "4px 16px", fontSize: 9, fontWeight: 700, letterSpacing: 2, fontFamily: "inherit", cursor: "pointer", background: "#0d1117", border: "1px solid #f39c1266", color: "#f39c12", borderRadius: 3, textTransform: "uppercase" }}>TOURNAMENT</button>
           <button onClick={() => setAppMode("multiplayer")} style={{ padding: "4px 16px", fontSize: 9, fontWeight: 700, letterSpacing: 2, fontFamily: "inherit", cursor: "pointer", background: "#0d1117", border: "1px solid #9b59b666", color: "#9b59b6", borderRadius: 3, textTransform: "uppercase" }}>MULTIPLAYER</button>
@@ -2072,9 +2072,9 @@ export default function App() {
             <span style={{ fontSize: 8, fontWeight: 700, letterSpacing: 2, color: "#4a5568", textTransform: "uppercase" }}>How it works</span>
             <button onClick={() => setShowHelp(false)} style={{ fontSize: 8, background: "none", border: "none", color: "#4a5568", cursor: "pointer", fontFamily: "inherit" }}>X</button>
           </div>
-          <div>1. Pick two AI agents from your roster (or create your own)</div>
-          <div>2. Each agent has a personality: aggressive, defensive, reckless, calculated</div>
-          <div>3. Hit GO and watch them play checkers against each other. Best personality wins.</div>
+          <div>1. Pick your agent, then choose an opponent — a coach bot, or another agent in Sandbox.</div>
+          <div>2. Each agent has 5 personality sliders: aggression, risk, king priority, edge play, trade-down.</div>
+          <div>3. Optionally bet on the winner, then watch them play it out. Best personality wins.</div>
         </div>
       ) : (
         <div style={{ textAlign: "center", marginBottom: 8 }}>
@@ -2192,7 +2192,7 @@ export default function App() {
                     }} style={{ padding: "4px 12px", borderRadius: 3, border: `1px solid ${colors[side]}44`, background: "transparent", color: colors[side], fontSize: 8, fontWeight: 700, letterSpacing: 1, cursor: "pointer", fontFamily: "inherit", textTransform: "uppercase" }}>BET {side.toUpperCase()}</button>
                   ) : null;
                 })}
-                <button onClick={startGame} style={{ padding: "4px 16px", borderRadius: 3, border: "1px solid #2ecc71", background: "transparent", color: "#2ecc71", fontSize: 8, fontWeight: 700, letterSpacing: 1, cursor: "pointer", fontFamily: "inherit" }}>SKIP</button>
+                <button onClick={startGame} title="Start the match without betting" style={{ padding: "4px 16px", borderRadius: 3, border: "1px solid #2ecc71", background: "transparent", color: "#2ecc71", fontSize: 8, fontWeight: 700, letterSpacing: 1, cursor: "pointer", fontFamily: "inherit" }}>WATCH ▶</button>
               </div>
               <div style={{ textAlign: "center", fontSize: 7, color: "#3a4450", marginTop: 4 }}>Balance: {wallet.balance?.toLocaleString()}</div>
             </div>
@@ -2288,7 +2288,7 @@ export default function App() {
             })()}
             {isFinished && (
               <>
-                <span style={{ fontSize: 14, fontWeight: 800, letterSpacing: 2, textTransform: "uppercase", color: result.winner === "red" ? "#e74c3c" : result.winner === "black" ? "#ecf0f1" : "#f39c12" }}>{result.winner === "draw" ? "DRAW" : `${result.winner === "red" ? (result.red_agent?.name || "RED") : (result.black_agent?.name || "BLACK")} wins`}</span>
+                <span style={{ fontSize: 14, fontWeight: 800, letterSpacing: 2, textTransform: "uppercase", color: result.winner === "red" ? "#e74c3c" : result.winner === "black" ? "#ecf0f1" : "#f39c12" }}>{result.winner === "draw" ? "DRAW" : `${result.winner === "red" ? (result.red_agent?.name || "RED") : (result.black_agent?.name || result.bot_opponent?.name || "BLACK")} wins`}</span>
                 <button onClick={resetGame} style={{ padding: "7px 18px", borderRadius: 6, border: "1px solid #2ecc71", background: "transparent", color: "#2ecc71", fontWeight: 700, fontSize: 10, letterSpacing: 2, textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit" }}>REMATCH</button>
               </>
             )}

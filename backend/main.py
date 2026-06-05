@@ -1516,11 +1516,9 @@ def simulate_game(req: SimulateRequest):
             raise HTTPException(400, "maximum 4 prop bets per match")
         # deduct all prop bet amounts
         prop_inputs = []
+        # prop odds depend only on the two configs + perks -- compute once, not once per bet
+        all_props = calculate_prop_odds(red_cfg.to_dict(), black_cfg.to_dict(), red_perk, black_perk)
         for pb in req.prop_bets:
-            # find the odds for this prop
-            rc = red_cfg.to_dict()
-            bc = black_cfg.to_dict()
-            all_props = calculate_prop_odds(rc, bc, red_perk if 'red_perk' in dir() else None, black_perk if 'black_perk' in dir() else None)
             prop_def = next((p for p in all_props if p["type"] == pb.type), None)
             if not prop_def:
                 continue

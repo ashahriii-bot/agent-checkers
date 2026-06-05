@@ -217,6 +217,10 @@ def generate_mirror_agent(player_config: dict, player_edge: str | None = None) -
     current_read["detected_weakness"] = weakness
     current_read["player_archetype"] = profile["archetype"]
 
+    # series record from the player's perspective (draws fold into the player side for display)
+    mirror_wins = round(profile.get("mirror_win_rate", 0.0) * (total or 0))
+    player_wins = max(0, (total or 0) - mirror_wins)
+
     return {
         "name": name, "config": counter, "edge": mirror_edge,
         "adaptation_level": adaptation,
@@ -225,7 +229,7 @@ def generate_mirror_agent(player_config: dict, player_edge: str | None = None) -
         "strategy_description": _describe_strategy(counter, mirror_edge, profile),
         "milestone": milestone,
         "bout_number": (total or 0) + 1,
-        "series_record": f"You {profile.get('total_bouts', 0) - sum(1 for _ in [] if True)} - ? Mirror",
+        "series_record": f"You {player_wins} - {mirror_wins} Mirror",
     }
 
 
