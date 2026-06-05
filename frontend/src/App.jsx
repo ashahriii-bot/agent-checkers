@@ -1499,6 +1499,89 @@ function TeamDynamicsBreakdown({ result }) {
   );
 }
 
+function MatchPlayback({ game, redTeam, blackTeam, autoPlay = true, onFinish, compact = false }) {
+  const [step, setStep] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const playRef = useRef(false), stepRef = useRef(0), maxRef = useRef(0), doneRef = useRef(false);
+
+  const playNext = () => {
+    if (!playRef.current) return;
+    if (stepRef.current >= maxRef.current) { playRef.current = false; setPlaying(false); return; }
+    stepRef.current += 1; setStep(stepRef.current);
+    setTimeout(playNext, compact ? 280 : 350);
+  };
+  useEffect(() => {
+    doneRef.current = false;
+    maxRef.current = (game.boards?.length || 1) - 1;
+    stepRef.current = 0; setStep(0);
+    if (autoPlay) { playRef.current = true; setPlaying(true); playNext(); }
+    else { playRef.current = false; setPlaying(false); }
+    return () => { playRef.current = false; };
+  }, [game]);
+
+  const maxStep = (game.boards?.length || 1) - 1;
+  useEffect(() => {
+    if (step >= maxStep && !doneRef.current) { doneRef.current = true; onFinish && onFinish(game); }
+  }, [step, maxStep]);
+
+  const pause = () => { playRef.current = false; setPlaying(false); };
+  const resume = () => { if (stepRef.current >= maxRef.current) return; playRef.current = true; setPlaying(true); playNext(); };
+  const jumpEnd = () => { playRef.current = false; setPlaying(false); stepRef.current = maxRef.current; setStep(maxRef.current); };
+  const scrub = (e) => { const v = parseInt(e.target.value); playRef.current = false; setPlaying(false); stepRef.current = v; setStep(v); };
+
+  const isFinished = step >= maxStep;
+  const board = game.boards[step];
+  const moves = game.moves || [];
+  const events = game.events || [];
+  const influence = game.influence_per_move || [];
+  const lastMove = step > 0 ? moves[step - 1] : null;
+  const curInf = step > 0 ? influence[step - 1] : null;
+  const td = game.team_dynamics || {};
+  let flashColor = null;
+  if (curInf) {
+    if (curInf.score_a > curInf.score_b * 1.3) flashColor = AGENT_A_COLOR;
+    else if (curInf.score_b > curInf.score_a * 1.3) flashColor = AGENT_B_COLOR;
+  }
+  const fired = { red: {}, black: {} };
+  if (lastMove) for (const e of events) if (e.type === "perk_activate" && e.move === step && e.agent) fired[e.side][e.agent] = true;
+  const movingTeam = lastMove?.side === "black" ? blackTeam : redTeam;
+
+  return (
+    <div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr auto 1fr", gap: 12, alignItems: "start" }}>
+        <TeamPanel side="red" color="#e74c3c" team={redTeam} dynamics={isFinished ? td.red : null} firedThisMove={fired.red} />
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
+          <BoardGrid board={board} lastMove={lastMove} maxWidth={compact ? 320 : 360} redLevel={redTeam?.agent_a?.level || 1} blackLevel={blackTeam?.agent_a?.level || 1} flashColor={flashColor} />
+          <div style={{ fontSize: 8, color: "#4a5568" }}>Move {step}/{maxStep}{isFinished && game.winner ? ` · ${game.winner.toUpperCase()} WINS` : ""}</div>
+          <input type="range" min={0} max={maxStep} value={step} onChange={scrub} style={{ width: "100%", accentColor: "#1abc9c" }} />
+          <div style={{ display: "flex", gap: 8 }}>
+            {playing ? <button onClick={pause} style={{ fontSize: 10, padding: "4px 14px", borderRadius: 4, border: "1px solid #e67e22", background: "transparent", color: "#e67e22", cursor: "pointer", fontFamily: "inherit" }}>❚❚ PAUSE</button>
+              : <button onClick={resume} style={{ fontSize: 10, padding: "4px 14px", borderRadius: 4, border: "1px solid #2ecc71", background: "transparent", color: "#2ecc71", cursor: "pointer", fontFamily: "inherit" }}>▶ PLAY</button>}
+            <button onClick={jumpEnd} style={{ fontSize: 10, padding: "4px 14px", borderRadius: 4, border: "1px solid #21262d", background: "transparent", color: "#8892a0", cursor: "pointer", fontFamily: "inherit" }}>▶▶ SKIP</button>
+          </div>
+        </div>
+        <TeamPanel side="black" color="#ecf0f1" team={blackTeam} dynamics={isFinished ? td.black : null} firedThisMove={fired.black} />
+      </div>
+      <div style={{ maxWidth: 360, margin: "8px auto 0" }}>
+        <div style={{ fontSize: 7, color: "#4a5568", letterSpacing: 1, marginBottom: 2 }}>{lastMove ? `MOVE ${step} INFLUENCE · ${lastMove.side.toUpperCase()} TEAM` : "INFLUENCE"}</div>
+        <InfluenceIndicator inf={curInf} nameA={movingTeam?.agent_a?.name || "A"} nameB={movingTeam?.agent_b?.name || "B"} />
+        <div style={{ marginTop: 6 }}>
+          <div style={{ fontSize: 7, color: "#4a5568", marginBottom: 1 }}>RED TEAM DYNAMICS (full match)</div>
+          <TeamDynamicsBar dyn={td.red} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function matchupOdds(rElo, bElo) {
+  const pRed = 1 / (1 + Math.pow(10, ((bElo || 1200) - (rElo || 1200)) / 400));
+  return {
+    red: Math.round((1 / (pRed * 0.94)) * 100) / 100,
+    black: Math.round((1 / ((1 - pRed) * 0.94)) * 100) / 100,
+  };
+}
+
 function TagTeam({ roster, onBack, loadRoster, loadWallet }) {
   const [subMode, setSubMode] = useState("match");
   const [agentA, setAgentA] = useState(null);
@@ -1507,38 +1590,28 @@ function TagTeam({ roster, onBack, loadRoster, loadWallet }) {
   const [coach, setCoach] = useState("professor");
   const [oppA, setOppA] = useState(null);
   const [oppB, setOppB] = useState(null);
-  const [betSide, setBetSide] = useState(null);
+  const [betSide, setBetSide] = useState(null);   // single-match main bet: null | "red" | "black"
   const [betAmt, setBetAmt] = useState(50);
-  const [props, setProps] = useState({});  // {alpha_dog:"agent_a", ...}
-  // playback
-  const [boards, setBoards] = useState(null);
-  const [moves, setMoves] = useState(null);
-  const [events, setEvents] = useState([]);
-  const [influence, setInfluence] = useState([]);
-  const [result, setResult] = useState(null);
-  const [step, setStep] = useState(0);
-  const [playing, setPlaying] = useState(false);
+  const [props, setProps] = useState({});          // {alpha_dog:"agent_a", ...}
+  const [result, setResult] = useState(null);       // single-match simulate response
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState(null);
+  // tournament (live bet -> watch -> advance)
   const [tourney, setTourney] = useState(null);
-  const playRef = useRef(false), stepRef = useRef(0), maxRef = useRef(0);
+  const [liveIdx, setLiveIdx] = useState(-1);        // index into the flat match queue
+  const [livePhase, setLivePhase] = useState("bet"); // bet | watch | summary
+  const [watchDone, setWatchDone] = useState(false);
+  const [tBetSide, setTBetSide] = useState(null);
+  const [tBetAmt, setTBetAmt] = useState(50);
+  const [tSettle, setTSettle] = useState(null);
+  const betsRef = useRef([]);                        // placed-bet records (synchronous, no stale closure)
 
   const div = clientDiversity(agentA, agentB);
   const combinedElo = agentA && agentB ? Math.round(((agentA.elo + agentB.elo) / 2) * div.bonus) : 0;
   const ready = agentA && agentB && agentA.id !== agentB.id && (oppMode === "vsbot" || (oppA && oppB && oppA.id !== oppB.id));
+  const teamReady = agentA && agentB && agentA.id !== agentB.id;
 
-  const playNext = () => {
-    if (!playRef.current) return;
-    if (stepRef.current >= maxRef.current) { playRef.current = false; setPlaying(false); return; }
-    stepRef.current += 1; setStep(stepRef.current);
-    setTimeout(playNext, 350);
-  };
-  const pause = () => { playRef.current = false; setPlaying(false); };
-  const resume = () => { if (stepRef.current >= maxRef.current) return; playRef.current = true; setPlaying(true); playNext(); };
-  const jumpEnd = () => { playRef.current = false; setPlaying(false); stepRef.current = maxRef.current; setStep(maxRef.current); };
-  const scrub = (e) => { const v = parseInt(e.target.value); playRef.current = false; setPlaying(false); stepRef.current = v; setStep(v); };
-
-  const reset = () => { setBoards(null); setMoves(null); setEvents([]); setInfluence([]); setResult(null); setStep(0); playRef.current = false; setPlaying(false); };
+  const reset = () => { setResult(null); setBetSide(null); setProps({}); };
 
   const start = async () => {
     setErr(null); setLoading(true);
@@ -1551,40 +1624,47 @@ function TagTeam({ roster, onBack, loadRoster, loadWallet }) {
     try {
       const res = await fetch(`${API}/game/simulate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       if (!res.ok) { const e = await res.json(); setErr(e.detail || "error"); setLoading(false); return; }
-      const d = await res.json();
-      setBoards(d.boards); setMoves(d.moves); setEvents(d.events || []); setInfluence(d.influence_per_move || []); setResult(d);
-      maxRef.current = d.boards.length - 1; stepRef.current = 0; setStep(0); playRef.current = true; setPlaying(true);
-      setLoading(false); playNext(); loadWallet && loadWallet();
+      setResult(await res.json()); setLoading(false); loadWallet && loadWallet();
     } catch (e) { setErr(String(e)); setLoading(false); }
   };
 
+  const matchQueue = tourney ? tourney.rounds.flatMap((r) => r.matches.map((m) => ({ ...m, roundName: r.name }))) : [];
+  const curMatch = liveIdx >= 0 && liveIdx < matchQueue.length ? matchQueue[liveIdx] : null;
+
   const runTourney = async () => {
-    setErr(null); setLoading(true); setTourney(null);
+    setErr(null); setLoading(true); setTourney(null); setTSettle(null); betsRef.current = [];
     try {
       const res = await fetch(`${API}/tournaments/team`, { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ team: { agent_a_id: agentA.id, agent_b_id: agentB.id }, vs_bot: { coach_id: coach }, seeding: "elo" }) });
       if (!res.ok) { const e = await res.json(); setErr(e.detail || "error"); setLoading(false); return; }
-      setTourney(await res.json()); setLoading(false); loadWallet && loadWallet();
+      setTourney(await res.json()); setLiveIdx(0); setLivePhase("bet"); setWatchDone(false); setTBetSide(null); setLoading(false);
     } catch (e) { setErr(String(e)); setLoading(false); }
   };
 
-  const isFinished = result && step >= maxRef.current;
-  const board = boards ? boards[step] : null;
-  const lastMove = boards && step > 0 ? moves[step - 1] : null;
-  const curInf = boards && step > 0 ? influence[step - 1] : null;
-  // dominant-agent flash (1.3x decisive rule, per spec)
-  let flashColor = null;
-  if (curInf) {
-    if (curInf.score_a > curInf.score_b * 1.3) flashColor = AGENT_A_COLOR;
-    else if (curInf.score_b > curInf.score_a * 1.3) flashColor = AGENT_B_COLOR;
-  }
-  // which agent's edge fired on the current move
-  const firedThisMove = { red: {}, black: {} };
-  if (lastMove) {
-    for (const e of events) {
-      if (e.type === "perk_activate" && e.move === step && e.agent) firedThisMove[e.side][e.agent] = true;
+  const watchMatch = () => { setWatchDone(false); setLivePhase("watch"); };
+
+  const nextMatch = async () => {
+    // record this match's bet into the ref (synchronous; survives re-renders)
+    if (tBetSide && curMatch) {
+      const odds = matchupOdds(curMatch.red_elo, curMatch.black_elo)[tBetSide];
+      betsRef.current.push({ amount: tBetAmt, odds, won: curMatch.game.winner === tBetSide });
     }
-  }
+    const nxt = liveIdx + 1;
+    setTBetSide(null); setWatchDone(false);
+    if (nxt >= matchQueue.length) {
+      setLivePhase("summary");
+      if (betsRef.current.length) {
+        try {
+          const res = await fetch(`${API}/bets/tournament-settle`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ bets: betsRef.current }) });
+          if (res.ok) { setTSettle(await res.json()); loadWallet && loadWallet(); }
+        } catch {}
+      }
+    } else {
+      setLiveIdx(nxt); setLivePhase("bet");
+    }
+  };
+
+  const resetTourney = () => { setTourney(null); setLiveIdx(-1); betsRef.current = []; setTSettle(null); setTBetSide(null); setLivePhase("bet"); };
 
   const pickRow = (label, val, setVal, color, exclude) => (
     <div style={{ flex: 1 }}>
@@ -1599,20 +1679,29 @@ function TagTeam({ roster, onBack, loadRoster, loadWallet }) {
     </div>
   );
 
+  // compact bet/prop controls for the single match
+  const propBtn = (type, sel, label) => (
+    <button onClick={() => setProps((p) => ({ ...p, [type]: p[type] === sel ? null : sel }))}
+      style={{ flex: 1, fontSize: 8, padding: "3px", borderRadius: 3, cursor: "pointer", fontFamily: "inherit",
+        background: props[type] === sel ? "#161b22" : "#0d1117", border: `1px solid ${props[type] === sel ? "#1abc9c" : "#21262d"}`, color: props[type] === sel ? "#1abc9c" : "#4a5568" }}>{label}</button>
+  );
+
+  const playerSlotInCur = curMatch ? (curMatch.red_is_player ? "red" : curMatch.black_is_player ? "black" : null) : null;
+
   return (
     <div style={{ maxWidth: 1000, margin: "0 auto", padding: "0 12px" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", margin: "8px 0" }}>
         <button onClick={onBack} style={{ fontSize: 9, background: "none", border: "1px solid #21262d", color: "#8892a0", borderRadius: 3, padding: "3px 10px", cursor: "pointer", fontFamily: "inherit" }}>← BACK</button>
         <div style={{ display: "flex", gap: 6 }}>
-          <button onClick={() => { setSubMode("match"); setTourney(null); }} style={{ fontSize: 9, fontWeight: 700, letterSpacing: 1, padding: "3px 12px", borderRadius: 3, cursor: "pointer", fontFamily: "inherit", background: subMode === "match" ? "#161b22" : "#0d1117", border: `1px solid ${subMode === "match" ? "#1abc9c" : "#21262d"}`, color: subMode === "match" ? "#1abc9c" : "#4a5568" }}>SINGLE MATCH</button>
+          <button onClick={() => { setSubMode("match"); resetTourney(); }} style={{ fontSize: 9, fontWeight: 700, letterSpacing: 1, padding: "3px 12px", borderRadius: 3, cursor: "pointer", fontFamily: "inherit", background: subMode === "match" ? "#161b22" : "#0d1117", border: `1px solid ${subMode === "match" ? "#1abc9c" : "#21262d"}`, color: subMode === "match" ? "#1abc9c" : "#4a5568" }}>SINGLE MATCH</button>
           <button onClick={() => { setSubMode("tournament"); reset(); }} style={{ fontSize: 9, fontWeight: 700, letterSpacing: 1, padding: "3px 12px", borderRadius: 3, cursor: "pointer", fontFamily: "inherit", background: subMode === "tournament" ? "#161b22" : "#0d1117", border: `1px solid ${subMode === "tournament" ? "#f39c12" : "#21262d"}`, color: subMode === "tournament" ? "#f39c12" : "#4a5568" }}>TOURNAMENT</button>
         </div>
       </div>
       <h2 style={{ textAlign: "center", fontSize: 16, letterSpacing: 4, color: "#1abc9c", margin: "4px 0 12px" }}>TAG TEAM 2v2</h2>
       {err && <div style={{ color: "#e74c3c", fontSize: 9, textAlign: "center", marginBottom: 6 }}>{err}</div>}
 
-      {/* TEAM SELECTION (shown when no active match/tourney) */}
-      {!boards && !tourney && (
+      {/* TEAM SELECTION */}
+      {!result && !tourney && (
         <div style={{ background: "#0d1117", border: "1px solid #21262d", borderRadius: 8, padding: 14, maxWidth: 560, margin: "0 auto" }}>
           <div style={{ fontSize: 9, color: "#8892a0", letterSpacing: 2, marginBottom: 8 }}>SELECT YOUR TEAM</div>
           <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
@@ -1649,6 +1738,21 @@ function TagTeam({ roster, onBack, loadRoster, loadWallet }) {
                   {pickRow("OPP B", oppB, setOppB, "#ecf0f1", oppA)}
                 </div>
               )}
+              {/* main bet (optional) */}
+              <div style={{ background: "#0a0c10", border: "1px solid #1a1f2b", borderRadius: 6, padding: 8, marginBottom: 8 }}>
+                <div style={{ fontSize: 7, color: "#4a5568", letterSpacing: 1, marginBottom: 4 }}>BET (optional)</div>
+                <div style={{ display: "flex", gap: 6, marginBottom: betSide ? 6 : 0 }}>
+                  {[["none", "NO BET", "#4a5568"], ["red", "RED", "#e74c3c"], ["black", "BLACK", "#ecf0f1"]].map(([v, lbl, col]) => (
+                    <button key={v} onClick={() => setBetSide(v === "none" ? null : v)} style={{ flex: 1, fontSize: 8, padding: "3px", borderRadius: 3, cursor: "pointer", fontFamily: "inherit", background: (betSide === v || (v === "none" && !betSide)) ? "#161b22" : "#0d1117", border: `1px solid ${(betSide === v || (v === "none" && !betSide)) ? col : "#21262d"}`, color: (betSide === v || (v === "none" && !betSide)) ? col : "#4a5568" }}>{lbl}</button>
+                  ))}
+                </div>
+                {betSide && <input type="number" value={betAmt} min={10} onChange={(e) => setBetAmt(Math.max(10, parseInt(e.target.value) || 10))} style={{ width: "100%", padding: "4px", fontSize: 9, background: "#0d1117", color: "#c8d0da", border: "1px solid #21262d", borderRadius: 4, fontFamily: "inherit" }} />}
+                {/* 2v2 side action props */}
+                <div style={{ fontSize: 7, color: "#4a5568", letterSpacing: 1, margin: "6px 0 3px" }}>SIDE ACTION (30 each)</div>
+                <div style={{ display: "flex", gap: 4, marginBottom: 3 }}><span style={{ fontSize: 7, color: "#6b7280", width: 60 }}>Alpha Dog</span>{propBtn("alpha_dog", "agent_a", "Agent A")}{propBtn("alpha_dog", "agent_b", "Agent B")}</div>
+                <div style={{ display: "flex", gap: 4, marginBottom: 3 }}><span style={{ fontSize: 7, color: "#6b7280", width: 60 }}>Team Clash</span>{propBtn("team_clash", "over", "Over 50%")}{propBtn("team_clash", "under", "Under 50%")}</div>
+                <div style={{ display: "flex", gap: 4 }}><span style={{ fontSize: 7, color: "#6b7280", width: 60 }}>Double Edge</span>{propBtn("double_edge", "yes", "Both fire")}{propBtn("double_edge", "no", "Not both")}</div>
+              </div>
               <button disabled={!ready || loading} onClick={start} style={{ width: "100%", padding: "9px", borderRadius: 6, border: "none", background: ready ? "linear-gradient(135deg,#1abc9c,#16a085)" : "#1a1f2b", color: ready ? "#fff" : "#4a5568", fontWeight: 800, fontSize: 12, letterSpacing: 3, cursor: ready ? "pointer" : "default", fontFamily: "inherit" }}>{loading ? "..." : "TAG TEAM FIGHT"}</button>
             </>
           )}
@@ -1660,96 +1764,121 @@ function TagTeam({ roster, onBack, loadRoster, loadWallet }) {
                 <option value="professor">All Professor teams</option>
                 <option value="shark">All Shark teams</option>
               </select>
-              <button disabled={!agentA || !agentB || agentA.id === agentB.id || loading} onClick={runTourney} style={{ width: "100%", padding: "9px", borderRadius: 6, border: "none", background: (agentA && agentB && agentA.id !== agentB.id) ? "linear-gradient(135deg,#f39c12,#e67e22)" : "#1a1f2b", color: (agentA && agentB && agentA.id !== agentB.id) ? "#fff" : "#4a5568", fontWeight: 800, fontSize: 12, letterSpacing: 3, cursor: "pointer", fontFamily: "inherit" }}>{loading ? "..." : "RUN 4-TEAM BRACKET"}</button>
+              <div style={{ fontSize: 8, color: "#6b7280", marginBottom: 8, textAlign: "center" }}>You'll bet on each match, then watch it play out live.</div>
+              <button disabled={!teamReady || loading} onClick={runTourney} style={{ width: "100%", padding: "9px", borderRadius: 6, border: "none", background: teamReady ? "linear-gradient(135deg,#f39c12,#e67e22)" : "#1a1f2b", color: teamReady ? "#fff" : "#4a5568", fontWeight: 800, fontSize: 12, letterSpacing: 3, cursor: teamReady ? "pointer" : "default", fontFamily: "inherit" }}>{loading ? "..." : "ENTER 4-TEAM BRACKET"}</button>
             </>
           )}
         </div>
       )}
 
-      {/* MATCH PLAYBACK */}
-      {boards && (
+      {/* SINGLE-MATCH PLAYBACK */}
+      {result && (
         <div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr auto 1fr", gap: 12, alignItems: "start" }}>
-            <TeamPanel side="red" color="#e74c3c" team={result.red_team} dynamics={isFinished ? result.team_dynamics?.red : null} firedThisMove={firedThisMove.red} />
-            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
-              <BoardGrid board={board} lastMove={lastMove} maxWidth={360} redLevel={result.red_team?.agent_a?.level || 1} blackLevel={result.black_team?.agent_a?.level || 1} flashColor={flashColor} />
-              <div style={{ fontSize: 8, color: "#4a5568" }}>Move {step}/{maxRef.current} {result.winner && step >= maxRef.current ? `· ${result.winner.toUpperCase()} WINS` : ""}</div>
-              <input type="range" min={0} max={maxRef.current} value={step} onChange={scrub} style={{ width: "100%", accentColor: "#1abc9c" }} />
-              <div style={{ display: "flex", gap: 8 }}>
-                {playing ? <button onClick={pause} style={{ fontSize: 10, padding: "4px 14px", borderRadius: 4, border: "1px solid #e67e22", background: "transparent", color: "#e67e22", cursor: "pointer", fontFamily: "inherit" }}>❚❚ PAUSE</button>
-                  : <button onClick={resume} style={{ fontSize: 10, padding: "4px 14px", borderRadius: 4, border: "1px solid #2ecc71", background: "transparent", color: "#2ecc71", cursor: "pointer", fontFamily: "inherit" }}>▶ PLAY</button>}
-                <button onClick={jumpEnd} style={{ fontSize: 10, padding: "4px 14px", borderRadius: 4, border: "1px solid #21262d", background: "transparent", color: "#8892a0", cursor: "pointer", fontFamily: "inherit" }}>▶▶ END</button>
-                <button onClick={reset} style={{ fontSize: 10, padding: "4px 14px", borderRadius: 4, border: "1px solid #21262d", background: "transparent", color: "#8892a0", cursor: "pointer", fontFamily: "inherit" }}>NEW</button>
+          <MatchPlayback key="single" game={result} redTeam={result.red_team} blackTeam={result.black_team} />
+          <div style={{ maxWidth: 560, margin: "8px auto 0" }}>
+            {result.bet && <div style={{ textAlign: "center", fontSize: 11, fontWeight: 800, color: result.bet.result === "win" ? "#2ecc71" : "#e74c3c" }}>Bet: {result.bet.result === "win" ? `+${result.bet.payout}` : result.bet.net} coins</div>}
+            {result.prop_results && result.prop_results.length > 0 && (
+              <div style={{ width: "100%", padding: "4px 8px", background: "#0a0c10", border: "1px solid #1a1f2b", borderRadius: 4, fontSize: 8, marginTop: 4 }}>
+                <div style={{ fontSize: 7, color: "#4a5568", letterSpacing: 1, marginBottom: 2 }}>SIDE ACTION</div>
+                {result.prop_results.map((pr, i) => (
+                  <div key={i} style={{ display: "flex", justifyContent: "space-between", color: pr.result === "win" ? "#2ecc71" : "#e74c3c" }}>
+                    <span>{pr.result === "win" ? "✅" : "❌"} {pr.label}: {pr.selection}</span>
+                    <span style={{ color: "#6b7280" }}>{pr.detail}</span>
+                  </div>
+                ))}
               </div>
-            </div>
-            <TeamPanel side="black" color="#ecf0f1" team={result.black_team} dynamics={isFinished ? result.team_dynamics?.black : null} firedThisMove={firedThisMove.black} />
-          </div>
-          {/* influence indicator + dynamics bar for the team that just moved */}
-          <div style={{ maxWidth: 360, margin: "8px auto 0" }}>
-            <div style={{ fontSize: 7, color: "#4a5568", letterSpacing: 1, marginBottom: 2 }}>
-              {lastMove ? `MOVE ${step} INFLUENCE · ${lastMove.side.toUpperCase()} TEAM` : "INFLUENCE"}
-            </div>
-            <InfluenceIndicator inf={curInf}
-              nameA={(lastMove?.side === "black" ? result.black_team : result.red_team)?.agent_a?.name || "A"}
-              nameB={(lastMove?.side === "black" ? result.black_team : result.red_team)?.agent_b?.name || "B"} />
-            <div style={{ marginTop: 6 }}>
-              <div style={{ fontSize: 7, color: "#4a5568", marginBottom: 1 }}>TEAM DYNAMICS (your team, full match)</div>
-              <TeamDynamicsBar dyn={result.team_dynamics?.red} />
+            )}
+            {result.mirror_data && <div style={{ fontSize: 8, color: "#9b59b6", textAlign: "center", marginTop: 4 }}>🪞 {result.mirror_data.mirror_strategy} (read: {result.mirror_data.pair_read})</div>}
+            <TeamDynamicsBreakdown result={result} />
+            <div style={{ textAlign: "center", marginTop: 8 }}>
+              <button onClick={reset} style={{ fontSize: 10, padding: "5px 18px", borderRadius: 4, border: "1px solid #1abc9c", background: "transparent", color: "#1abc9c", cursor: "pointer", fontFamily: "inherit", letterSpacing: 1 }}>NEW MATCH</button>
             </div>
           </div>
-          {/* post-match */}
-          {isFinished && (
-            <div style={{ maxWidth: 560, margin: "0 auto" }}>
-              {result.bet && <div style={{ textAlign: "center", fontSize: 11, fontWeight: 800, color: result.bet.result === "win" ? "#2ecc71" : "#e74c3c", marginTop: 6 }}>{result.bet.result === "win" ? `+${result.bet.payout}` : result.bet.net} coins</div>}
-              {result.prop_results && result.prop_results.length > 0 && (
-                <div style={{ width: "100%", padding: "4px 8px", background: "#0a0c10", border: "1px solid #1a1f2b", borderRadius: 4, fontSize: 8, marginTop: 4 }}>
-                  <div style={{ fontSize: 7, color: "#4a5568", letterSpacing: 1, marginBottom: 2 }}>SIDE ACTION</div>
-                  {result.prop_results.map((pr, i) => (
-                    <div key={i} style={{ display: "flex", justifyContent: "space-between", color: pr.result === "win" ? "#2ecc71" : "#e74c3c" }}>
-                      <span>{pr.result === "win" ? "✅" : "❌"} {pr.label}: {pr.selection}</span>
-                      <span style={{ color: "#6b7280" }}>{pr.detail}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-              {result.mirror_data && <div style={{ fontSize: 8, color: "#9b59b6", textAlign: "center", marginTop: 4 }}>🪞 {result.mirror_data.mirror_strategy} (read: {result.mirror_data.pair_read})</div>}
-              <TeamDynamicsBreakdown result={result} />
-            </div>
-          )}
         </div>
       )}
 
-      {/* TOURNAMENT BRACKET */}
+      {/* LIVE TOURNAMENT */}
       {tourney && (
-        <div style={{ maxWidth: 700, margin: "0 auto" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-            <div style={{ fontSize: 10, color: "#f39c12", letterSpacing: 2 }}>2v2 BRACKET</div>
-            <button onClick={() => setTourney(null)} style={{ fontSize: 8, background: "none", border: "1px solid #21262d", color: "#8892a0", borderRadius: 3, padding: "2px 8px", cursor: "pointer", fontFamily: "inherit" }}>NEW</button>
-          </div>
+        <div style={{ maxWidth: 760, margin: "0 auto" }}>
+          {/* seeded bracket overview */}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10 }}>
             {tourney.bracket.map((t) => (
-              <div key={t.slot} style={{ padding: 8, borderRadius: 6, background: t.is_player ? "rgba(26,188,156,0.1)" : "#0d1117", border: `1px solid ${t.is_player ? "#1abc9c" : "#21262d"}` }}>
+              <div key={t.slot} style={{ padding: 7, borderRadius: 6, background: t.is_player ? "rgba(26,188,156,0.1)" : "#0d1117", border: `1px solid ${t.is_player ? "#1abc9c" : "#21262d"}` }}>
                 <div style={{ fontSize: 9, fontWeight: 700, color: t.is_player ? "#1abc9c" : "#c8d0da" }}>#{t.seed} {t.agent_a} + {t.agent_b}{t.is_player ? " (YOU)" : ""}</div>
-                <div style={{ fontSize: 7, color: "#6b7280" }}>{t.coach_name || "your team"} · diversity {t.diversity_pct}% ({t.diversity_bonus}x) · elo {t.team_elo}</div>
+                <div style={{ fontSize: 7, color: "#6b7280" }}>{t.coach_name || "your team"} · div {t.diversity_pct}% ({t.diversity_bonus}x) · elo {t.team_elo}</div>
               </div>
             ))}
           </div>
-          {tourney.rounds.map((rd) => (
-            <div key={rd.round} style={{ marginBottom: 8 }}>
-              <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 1, marginBottom: 3 }}>{rd.name}</div>
-              {rd.matches.map((m, i) => (
-                <div key={i} style={{ fontSize: 9, color: "#8892a0", padding: "3px 8px", background: "#0a0c10", borderRadius: 4, marginBottom: 3 }}>
-                  <span style={{ color: m.winner_name === m.red_name ? "#2ecc71" : "#8892a0" }}>{m.red_name}</span>
+          {/* match list reveals as you watch */}
+          <div style={{ marginBottom: 10 }}>
+            {matchQueue.map((m, gi) => {
+              const watched = gi < liveIdx || livePhase === "summary";
+              const active = gi === liveIdx && livePhase !== "summary";
+              // a later-round match's participants are spoilers until we reach it (feeders unplayed)
+              const firstRound = tourney.rounds[0] && m.roundName === tourney.rounds[0].name;
+              const known = gi <= liveIdx || firstRound;
+              const ip = known && (m.red_is_player || m.black_is_player);
+              const redLbl = known ? m.red_name : "TBD";
+              const blackLbl = known ? m.black_name : "TBD";
+              return (
+                <div key={gi} style={{ fontSize: 9, padding: "3px 8px", background: active ? "rgba(243,156,18,0.1)" : "#0a0c10", border: `1px solid ${active ? "#f39c12" : "#161b22"}`, borderRadius: 4, marginBottom: 3 }}>
+                  <span style={{ fontSize: 7, color: "#4a5568" }}>{m.roundName}{ip ? " · YOUR MATCH" : ""}  </span>
+                  <span style={{ color: watched && m.winner_name === m.red_name ? "#2ecc71" : "#8892a0" }}>{redLbl}</span>
                   <span style={{ color: "#4a5568" }}> vs </span>
-                  <span style={{ color: m.winner_name === m.black_name ? "#2ecc71" : "#8892a0" }}>{m.black_name}</span>
-                  <span style={{ color: "#6b7280", fontSize: 7 }}> · {m.game.winner} won in {m.game.move_count}</span>
+                  <span style={{ color: watched && m.winner_name === m.black_name ? "#2ecc71" : "#8892a0" }}>{blackLbl}</span>
+                  {watched ? <span style={{ color: "#6b7280", fontSize: 7 }}> · {m.game.winner} in {m.game.move_count}</span> : active ? <span style={{ color: "#f39c12", fontSize: 7 }}> · ▶ NOW</span> : <span style={{ color: "#3a4450", fontSize: 7 }}> · {known ? "upcoming" : "awaiting semis"}</span>}
                 </div>
-              ))}
-            </div>
-          ))}
-          <div style={{ textAlign: "center", fontSize: 12, fontWeight: 800, color: tourney.champion.is_player ? "#2ecc71" : "#f39c12", marginTop: 6 }}>
-            🏆 {tourney.champion.name}{tourney.champion.is_player ? " — YOU WIN!" : ""}
+              );
+            })}
           </div>
+
+          {/* BET phase */}
+          {livePhase === "bet" && curMatch && (() => {
+            const odds = matchupOdds(curMatch.red_elo, curMatch.black_elo);
+            return (
+              <div style={{ background: "#0d1117", border: "1px solid #f39c1244", borderRadius: 8, padding: 12, maxWidth: 460, margin: "0 auto" }}>
+                <div style={{ fontSize: 8, color: "#f39c12", letterSpacing: 1, marginBottom: 4 }}>{curMatch.roundName} — PLACE YOUR BET{playerSlotInCur ? " · YOUR MATCH" : ""}</div>
+                <div style={{ fontSize: 10, color: "#c8d0da", marginBottom: 8 }}>
+                  <span style={{ color: "#e74c3c" }}>{curMatch.red_name}</span> ({odds.red}x) <span style={{ color: "#4a5568" }}>vs</span> <span style={{ color: "#ecf0f1" }}>{curMatch.black_name}</span> ({odds.black}x)
+                </div>
+                <div style={{ display: "flex", gap: 6, marginBottom: tBetSide ? 6 : 0 }}>
+                  {[["none", "SKIP", "#4a5568"], ["red", `RED ${odds.red}x`, "#e74c3c"], ["black", `BLACK ${odds.black}x`, "#ecf0f1"]].map(([v, lbl, col]) => (
+                    <button key={v} onClick={() => setTBetSide(v === "none" ? null : v)} style={{ flex: 1, fontSize: 9, padding: "5px", borderRadius: 4, cursor: "pointer", fontFamily: "inherit", background: (tBetSide === v || (v === "none" && !tBetSide)) ? "#161b22" : "#0d1117", border: `1px solid ${(tBetSide === v || (v === "none" && !tBetSide)) ? col : "#21262d"}`, color: (tBetSide === v || (v === "none" && !tBetSide)) ? col : "#4a5568" }}>{lbl}</button>
+                  ))}
+                </div>
+                {tBetSide && <input type="number" value={tBetAmt} min={10} onChange={(e) => setTBetAmt(Math.max(10, parseInt(e.target.value) || 10))} style={{ width: "100%", padding: "5px", fontSize: 9, background: "#0d1117", color: "#c8d0da", border: "1px solid #21262d", borderRadius: 4, fontFamily: "inherit", marginBottom: 6 }} />}
+                <button onClick={watchMatch} style={{ width: "100%", padding: "8px", borderRadius: 6, border: "none", background: "linear-gradient(135deg,#1abc9c,#16a085)", color: "#fff", fontWeight: 800, fontSize: 11, letterSpacing: 2, cursor: "pointer", fontFamily: "inherit", marginTop: 6 }}>▶ WATCH MATCH</button>
+              </div>
+            );
+          })()}
+
+          {/* WATCH phase */}
+          {livePhase === "watch" && curMatch && (
+            <div>
+              <MatchPlayback key={liveIdx} game={curMatch.game} redTeam={curMatch.red_team} blackTeam={curMatch.black_team} compact onFinish={() => setWatchDone(true)} />
+              {watchDone && (
+                <div style={{ textAlign: "center", marginTop: 8 }}>
+                  <div style={{ fontSize: 11, fontWeight: 800, color: "#c8d0da" }}>{curMatch.winner_name} wins</div>
+                  {tBetSide && <div style={{ fontSize: 10, fontWeight: 700, color: curMatch.game.winner === tBetSide ? "#2ecc71" : "#e74c3c", marginTop: 2 }}>{curMatch.game.winner === tBetSide ? `Bet won +${Math.floor(tBetAmt * matchupOdds(curMatch.red_elo, curMatch.black_elo)[tBetSide])}` : `Bet lost -${tBetAmt}`}</div>}
+                  <button onClick={nextMatch} style={{ fontSize: 11, padding: "6px 20px", borderRadius: 4, border: "none", background: "linear-gradient(135deg,#f39c12,#e67e22)", color: "#fff", fontWeight: 800, letterSpacing: 2, cursor: "pointer", fontFamily: "inherit", marginTop: 8 }}>{liveIdx + 1 >= matchQueue.length ? "SEE RESULTS" : "NEXT MATCH ▶"}</button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* SUMMARY */}
+          {livePhase === "summary" && (
+            <div style={{ textAlign: "center", maxWidth: 460, margin: "0 auto" }}>
+              <div style={{ fontSize: 14, fontWeight: 800, color: tourney.champion.is_player ? "#2ecc71" : "#f39c12", marginBottom: 6 }}>🏆 {tourney.champion.name}{tourney.champion.is_player ? " — YOU WIN!" : ""}</div>
+              {tSettle ? (
+                <div style={{ padding: "8px 16px", background: tSettle.net >= 0 ? "rgba(46,204,113,0.1)" : "rgba(231,76,60,0.1)", border: `1px solid ${tSettle.net >= 0 ? "rgba(46,204,113,0.3)" : "rgba(231,76,60,0.3)"}`, borderRadius: 6, marginBottom: 10 }}>
+                  <div style={{ fontSize: 16, fontWeight: 800, color: tSettle.net >= 0 ? "#2ecc71" : "#e74c3c" }}>{tSettle.net >= 0 ? "+" : ""}{tSettle.net} coins</div>
+                  <div style={{ fontSize: 8, color: "#4a5568" }}>tournament P&L · balance {tSettle.balance}</div>
+                </div>
+              ) : <div style={{ fontSize: 9, color: "#4a5568", marginBottom: 10 }}>No bets placed</div>}
+              <button onClick={resetTourney} style={{ fontSize: 10, padding: "6px 20px", borderRadius: 4, border: "1px solid #f39c12", background: "transparent", color: "#f39c12", cursor: "pointer", fontFamily: "inherit", letterSpacing: 1 }}>NEW BRACKET</button>
+            </div>
+          )}
         </div>
       )}
     </div>

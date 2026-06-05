@@ -1998,6 +1998,11 @@ def api_create_team_tournament(req: TeamTournamentRequest):
                 "red_name": red_t["name"], "black_name": black_t["name"],
                 "winner_name": bracket[winner_slot]["name"], "round_name": rname,
                 "red_diversity": red_t["diversity_bonus"], "black_diversity": black_t["diversity_bonus"],
+                "red_elo": round(re_before, 1), "black_elo": round(be_before, 1),
+                "red_is_player": red_t["is_player"], "black_is_player": black_t["is_player"],
+                # full team summaries so the client can render live playback (agent names/perks)
+                "red_team": _team_summary(red_t["agent_a"], red_t["agent_b"], red_t["diversity_bonus"], red_t["diversity_frac"]),
+                "black_team": _team_summary(black_t["agent_a"], black_t["agent_b"], black_t["diversity_bonus"], black_t["diversity_frac"]),
                 "game": game, "team_dynamics": game["team_dynamics"],
             })
         rounds_output.append({"round": round_idx + 1, "name": rname, "matches": round_matches})
@@ -2027,41 +2032,39 @@ def api_settle_tournament_bets(body: dict):
     results = []
     total_payout = 0
     total_wagered = 0
-    from database import get_db, add_to_jackpot, get_wallet, get_streak_multiplier, increment_streak, reset_streak
-    from datetime import datetime, timezone
+    # all writes go through ONE connection -- the streak/jackpot helpers each open their
+    # own connection and would deadlock against an open write transaction here (WAL allows
+    # one writer). The streak multiplier is read once up front (it applies to the slate).
+    from database import get_db, get_streak_multiplier, JACKPOT_RATE
     conn = get_db()
-    now = datetime.now(timezone.utc).isoformat()
+    row = conn.execute("SELECT balance, win_streak, best_streak FROM wallet WHERE id = 1").fetchone()
+    win_streak = row["win_streak"] if row else 0
+    best_streak = row["best_streak"] if row else 0
+    streak_mult = get_streak_multiplier(win_streak)
+    jackpot_add = 0
     for b in bets:
         amount = b.get("amount", 0)
         odds = b.get("odds", 1.0)
         won = b.get("won", False)
-        is_lucky = b.get("lucky", False)
-        is_heat = b.get("heat", False)
-        effective_odds = odds
-        if is_lucky:
-            effective_odds *= 2.0
-        if is_heat:
-            effective_odds *= 1.5
-        # streak
-        w = get_wallet()
-        streak_mult = get_streak_multiplier(w["win_streak"])
-        effective_odds = round(effective_odds * streak_mult, 2)
+        effective_odds = odds * (2.0 if b.get("lucky") else 1.0) * (1.5 if b.get("heat") else 1.0) * streak_mult
+        effective_odds = round(effective_odds, 2)
         payout = int(amount * effective_odds) if won else 0
         total_wagered += amount
         total_payout += payout
-        # deduct and settle
         conn.execute("UPDATE wallet SET balance = balance - ? WHERE id = 1", (amount,))
         if payout > 0:
             conn.execute("UPDATE wallet SET balance = balance + ? WHERE id = 1", (payout,))
-        add_to_jackpot(amount)
+        jackpot_add += max(1, int(amount * JACKPOT_RATE))
         results.append({"amount": amount, "odds": odds, "effective_odds": effective_odds, "won": won, "payout": payout})
-    # streak update: if any bet lost, reset; otherwise increment by wins count
+    conn.execute("UPDATE jackpot SET pool = pool + ? WHERE id = 1", (jackpot_add,))
+    # streak: any loss resets; an all-win slate extends by the number of wins
     wins_count = sum(1 for r in results if r["won"])
     losses = sum(1 for r in results if not r["won"])
     if losses > 0:
-        reset_streak()
+        conn.execute("UPDATE wallet SET win_streak = 0 WHERE id = 1")
     elif wins_count > 0:
-        increment_streak(wins_count)
+        new_streak = win_streak + wins_count
+        conn.execute("UPDATE wallet SET win_streak = ?, best_streak = ? WHERE id = 1", (new_streak, max(new_streak, best_streak)))
     conn.commit()
     final_w = conn.execute("SELECT balance FROM wallet WHERE id = 1").fetchone()
     conn.close()
