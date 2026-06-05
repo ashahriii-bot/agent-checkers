@@ -18,6 +18,19 @@ from familiarity import categorize_opponent
 from matchmaking import queue, online, QueueEntry
 from crypto import crypto_service, micros_to_usdc
 
+import logging
+import sys
+
+# Dedicated stdout logger so multiplayer steps + tracebacks are always visible in
+# uvicorn/Railway logs (independent of whatever root logging config is active).
+log = logging.getLogger("ac.ws")
+if not log.handlers:
+    _h = logging.StreamHandler(sys.stdout)
+    _h.setFormatter(logging.Formatter("%(asctime)s [ws] %(levelname)s %(message)s"))
+    log.addHandler(_h)
+    log.setLevel(logging.INFO)
+    log.propagate = False
+
 REAL_MIN_MICROS = 10_000        # $0.01
 REAL_MAX_MICROS = 10_000_000    # $10.00
 REAL_HOUSE_FEE_BPS = 500        # 5%
@@ -53,6 +66,7 @@ def _ensure_matchmaker():
 
 
 async def _matchmaker_loop():
+    log.info("matchmaker loop started")
     while True:
         await asyncio.sleep(3)
         try:
@@ -62,22 +76,25 @@ async def _matchmaker_loop():
                 if not pair:
                     break
                 red_entry, black_entry = pair
+                log.info("matcher: pairing player %s (elo %s) vs player %s (elo %s)",
+                         red_entry.player_id, red_entry.agent_elo, black_entry.player_id, black_entry.agent_elo)
                 online.set_status(red_entry.player_id, "in_match")
                 online.set_status(black_entry.player_id, "in_match")
                 asyncio.create_task(_run_multiplayer_match(red_entry, black_entry))
             # 2) time out anyone who has waited too long with no opponent
             for e in await queue.pop_timed_out():
                 online.set_status(e.player_id, "idle")
+                log.info("matcher: timing out player %s (no opponent)", e.player_id)
                 try:
                     await e.websocket.send_json({
                         "type": "queue_timeout",
                         "message": "No opponents found. Try again later.",
                     })
                 except Exception:
-                    pass
+                    log.exception("matcher: failed to send queue_timeout to %s", e.player_id)
         except Exception:
-            # never let the matchmaker die on a transient error
-            pass
+            # never let the matchmaker die on a transient error — but DO log it
+            log.exception("matchmaker loop iteration failed")
 
 
 @router.websocket("/ws/play")
@@ -101,50 +118,70 @@ async def ws_play(ws: WebSocket):
 
     display_name = player["display_name"]
     online.connect(player_id, display_name, ws)
+    log.info("connect: player %s (%s); online=%d", player_id, display_name, online.count)
 
     try:
         await ws.send_json({"type": "connected", "player_id": player_id, "display_name": display_name})
 
         while True:
             raw = await ws.receive_text()
-            msg = json.loads(raw)
-            msg_type = msg.get("type")
+            try:
+                msg = json.loads(raw)
+                msg_type = msg.get("type")
+                log.info("recv: player %s msg=%s", player_id, msg_type)
 
-            if msg_type == "queue_join":
-                await _handle_queue_join(ws, player_id, display_name, msg)
+                if msg_type == "queue_join":
+                    await _handle_queue_join(ws, player_id, display_name, msg)
 
-            elif msg_type == "queue_cancel":
-                await queue.remove(player_id)
-                online.set_status(player_id, "idle")
-                await ws.send_json({"type": "queue_cancelled"})
+                elif msg_type == "queue_cancel":
+                    await queue.remove(player_id)
+                    online.set_status(player_id, "idle")
+                    await ws.send_json({"type": "queue_cancelled"})
 
-            elif msg_type == "ping":
-                await ws.send_json({"type": "pong"})
+                elif msg_type == "ping":
+                    await ws.send_json({"type": "pong"})
+
+            except WebSocketDisconnect:
+                raise
+            except Exception:
+                # A single bad message must NOT tear down the socket (that was the
+                # "both go offline" bug). Log the full traceback, notify, keep going.
+                log.exception("handler error: player %s raw=%r", player_id, raw[:200])
+                try:
+                    await ws.send_json({"type": "error", "message": "internal error — please try again"})
+                except Exception:
+                    pass
 
     except WebSocketDisconnect:
-        pass
+        log.info("disconnect: player %s", player_id)
     except Exception:
-        pass
+        log.exception("connection loop crashed: player %s", player_id)
     finally:
         await queue.remove_by_ws(ws)
         online.disconnect(player_id)
+        log.info("cleanup: player %s; online=%d", player_id, online.count)
 
 
 async def _handle_queue_join(ws: WebSocket, player_id: int, display_name: str, msg: dict):
     agent_id = msg.get("agent_id")
     bet_amount = msg.get("bet_amount", 0)
     mode = msg.get("mode", "free")
+    log.info("queue_join: player %s agent_id=%s mode=%s bet=%s", player_id, agent_id, mode, bet_amount)
 
     agent = get_agent(agent_id)
     if not agent:
+        log.info("queue_join: agent %s not found for player %s", agent_id, player_id)
         await ws.send_json({"type": "error", "message": "agent not found"})
         return
     if agent.get("player_id") and agent["player_id"] != player_id:
         await ws.send_json({"type": "error", "message": "not your agent"})
         return
 
+    # Free play has NO eligibility gate — brand-new starter agents can queue. The
+    # level/matches requirement applies ONLY to real-money (USDC) play.
     bet_micros = 0
     if mode == "real":
+        log.info("queue_join: real-money path player %s (agent level=%s matches=%s)", player_id, agent.get("level"), agent.get("matches"))
         if not crypto_service.available:
             await ws.send_json({"type": "error", "message": "real play is not available"})
             return
@@ -174,15 +211,17 @@ async def _handle_queue_join(ws: WebSocket, player_id: int, display_name: str, m
 
     if match_pair:
         red_entry, black_entry = match_pair
+        log.info("queue_join: INSTANT match player %s vs player %s", red_entry.player_id, black_entry.player_id)
         online.set_status(red_entry.player_id, "in_match")
         online.set_status(black_entry.player_id, "in_match")
         await _run_multiplayer_match(red_entry, black_entry)
     else:
+        log.info("queue_join: player %s queued; queue size=%d", player_id, queue.size)
         # immediate status so the lobby reflects the queue at once, then stream updates
         try:
             await ws.send_json({"type": "queue_status", **(await queue.get_status(player_id))})
         except Exception:
-            pass
+            log.exception("queue_join: failed sending immediate status to %s", player_id)
         asyncio.create_task(_queue_wait_loop(ws, player_id))
 
 
@@ -202,9 +241,29 @@ async def _queue_wait_loop(ws: WebSocket, player_id: int):
 
 
 async def _run_multiplayer_match(red: QueueEntry, black: QueueEntry):
+    """Resilient wrapper. A failure inside the match must NOT (a) tear down the joining
+    player's socket — the instant-match path awaits this inline — nor (b) vanish silently
+    in the background path. Log the full traceback and tell both players to requeue."""
+    try:
+        await _run_multiplayer_match_inner(red, black)
+    except Exception:
+        log.exception("MATCH FAILED: red_player=%s red_agent=%s black_player=%s black_agent=%s",
+                      red.player_id, red.agent_id, black.player_id, black.agent_id)
+        for e in (red, black):
+            online.set_status(e.player_id, "idle")
+            try:
+                await e.websocket.send_json({"type": "error", "message": "the match failed to start — please queue again"})
+            except Exception:
+                pass
+
+
+async def _run_multiplayer_match_inner(red: QueueEntry, black: QueueEntry):
     """Simulate match, settle bets, send results to both players."""
+    log.info("match: start red_agent=%s black_agent=%s", red.agent_id, black.agent_id)
     red_agent = get_agent(red.agent_id)
     black_agent = get_agent(black.agent_id)
+    if not red_agent or not black_agent:
+        raise RuntimeError(f"agent row missing: red={red.agent_id} found={bool(red_agent)}, black={black.agent_id} found={bool(black_agent)}")
 
     # notify match found
     odds = calculate_match_odds(red.agent_elo, black.agent_elo)
@@ -237,9 +296,11 @@ async def _run_multiplayer_match(red: QueueEntry, black: QueueEntry):
     red_fam = get_familiarity_score(red.agent_id, red_type)
     black_fam = get_familiarity_score(black.agent_id, black_type)
 
+    log.info("match: running game (red_perk=%s black_perk=%s)", red_agent.get("perk"), black_agent.get("perk"))
     game = run_game(red_cfg, black_cfg,
                     red_perk=red_agent.get("perk"), black_perk=black_agent.get("perk"),
                     red_familiarity=red_fam, black_familiarity=black_fam)
+    log.info("match: game done winner=%s moves=%s", game.get("winner"), game.get("move_count"))
 
     # elo update
     result_red = 1.0 if game["winner"] == "red" else (0.0 if game["winner"] == "black" else 0.5)
@@ -341,7 +402,8 @@ async def _run_multiplayer_match(red: QueueEntry, black: QueueEntry):
 
         try:
             await entry.websocket.send_json(result_msg)
+            log.info("match: result sent to player %s (side=%s won=%s)", entry.player_id, side, won)
         except Exception:
-            pass
+            log.exception("match: failed sending result to player %s", entry.player_id)
 
         online.set_status(entry.player_id, "idle")
