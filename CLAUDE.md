@@ -66,4 +66,11 @@ build matchup familiarity (`familiarity.py`, `FAMILIARITY_PICK_BIAS` in `ai.py`)
   opponent is in `bot_opponent`, not `black_agent` (which is null).
 - Tournaments use **ephemeral** ELO and (by design) do not currently accrue evolution/familiarity/records — see CHANGELOG
   for the list of known cross-mode wiring gaps that are intentionally deferred.
+- **Multiplayer** is 1v1 over `WS /ws/play?token=<JWT>` (`ws.py`). The frontend derives `wss://<window.location.host>/...` —
+  prod is same-origin (FastAPI serves SPA + WS together), so **local dev needs the vite `/ws` proxy with `ws: true`** or the
+  socket never reaches uvicorn. Matchmaking (`matchmaking.py`) is elo-banded (±100→200→400→any at 0/15/30/60s) with a 120s
+  timeout; a background `_matchmaker_loop` in `ws.py` re-scans the queue so widening actually fires for *waiting* players
+  (`queue.add()` only re-checks the newcomer). Real-money matches only within the same bet tier.
+- **Real-money (USDC) betting is multiplayer-only.** VS BOT / sandbox are free-play coins; `/api/game/simulate` rejects a
+  `bet.mode == "real"` with 400. The FREE/REAL toggle renders only in the multiplayer lobby (and only when `crypto.enabled`).
 - This is **not** a Next.js/Vercel project; ignore any auto-suggested Vercel/Next tooling.

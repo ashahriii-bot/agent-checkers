@@ -38,9 +38,52 @@ def _get_run_game():
     return _run_game_fn
 
 
+# --- background matchmaker ---------------------------------------------------
+# queue.add() matches on join, but two players who are OUT of elo band at join
+# never re-evaluate as their bands widen with wait time. This loop periodically
+# re-scans the whole queue so widening actually takes effect, and times players
+# out after MATCH_TIMEOUT_SECONDS with a "no opponents" message.
+_matchmaker_task = None
+
+
+def _ensure_matchmaker():
+    global _matchmaker_task
+    if _matchmaker_task is None:
+        _matchmaker_task = asyncio.create_task(_matchmaker_loop())
+
+
+async def _matchmaker_loop():
+    while True:
+        await asyncio.sleep(3)
+        try:
+            # 1) pair everyone currently within band (bands widen over time)
+            while True:
+                pair = await queue.pop_ready_match()
+                if not pair:
+                    break
+                red_entry, black_entry = pair
+                online.set_status(red_entry.player_id, "in_match")
+                online.set_status(black_entry.player_id, "in_match")
+                asyncio.create_task(_run_multiplayer_match(red_entry, black_entry))
+            # 2) time out anyone who has waited too long with no opponent
+            for e in await queue.pop_timed_out():
+                online.set_status(e.player_id, "idle")
+                try:
+                    await e.websocket.send_json({
+                        "type": "queue_timeout",
+                        "message": "No opponents found. Try again later.",
+                    })
+                except Exception:
+                    pass
+        except Exception:
+            # never let the matchmaker die on a transient error
+            pass
+
+
 @router.websocket("/ws/play")
 async def ws_play(ws: WebSocket):
     await ws.accept()
+    _ensure_matchmaker()
     token = ws.query_params.get("token", "")
     try:
         payload = decode_token(token)
@@ -135,23 +178,25 @@ async def _handle_queue_join(ws: WebSocket, player_id: int, display_name: str, m
         online.set_status(black_entry.player_id, "in_match")
         await _run_multiplayer_match(red_entry, black_entry)
     else:
-        # start background task to send status updates and check for timeout
+        # immediate status so the lobby reflects the queue at once, then stream updates
+        try:
+            await ws.send_json({"type": "queue_status", **(await queue.get_status(player_id))})
+        except Exception:
+            pass
         asyncio.create_task(_queue_wait_loop(ws, player_id))
 
 
 async def _queue_wait_loop(ws: WebSocket, player_id: int):
-    """Send queue status updates. Offer bot fallback after 60s."""
-    start = time.time()
+    """Stream queue status (position, wait, current elo band, players in queue) to a
+    waiting player until they're matched, cancel, or time out. Matching and the 120s
+    timeout themselves are handled by the global _matchmaker_loop."""
     while True:
-        await asyncio.sleep(5)
+        await asyncio.sleep(2)
         status = await queue.get_status(player_id)
         if status["position"] == 0:
-            return  # no longer in queue (matched or cancelled)
+            return  # no longer in queue (matched, cancelled, or timed out)
         try:
             await ws.send_json({"type": "queue_status", **status})
-            if time.time() - start > 60:
-                await ws.send_json({"type": "bot_fallback", "message": "No opponent found. Play VS BOT instead?"})
-                return
         except Exception:
             return
 

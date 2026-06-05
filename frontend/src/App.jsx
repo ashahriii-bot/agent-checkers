@@ -613,7 +613,10 @@ function LiveTournament({ data, onBack, onNewTournament }) {
     <div style={{ maxWidth: 700, margin: "0 auto", padding: "12px" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
         <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 4, textTransform: "uppercase", color: "#f39c12" }}>{isFinal ? "THE FINAL" : roundName}</h2>
-        <span style={{ fontSize: 8, color: "#4a5568" }}>{phase === "betting" ? "PLACE YOUR BETS" : phase === "revealing" ? "REVEALING..." : "COMPLETE"}</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 8, color: "#4a5568" }}>{phase === "betting" ? "PLACE YOUR BETS" : phase === "revealing" ? "REVEALING..." : "COMPLETE"}</span>
+          <button onClick={onNewTournament} title="Leave this tournament and return to setup" style={{ fontSize: 8, background: "none", border: "1px solid #e74c3c44", color: "#e74c3c", borderRadius: 3, padding: "3px 10px", cursor: "pointer", fontFamily: "inherit", letterSpacing: 1 }}>EXIT TOURNAMENT</button>
+        </div>
       </div>
 
       {/* P&L bar */}
@@ -1120,6 +1123,8 @@ function MultiplayerLobby({ roster, onBack }) {
   const [matchResult, setMatchResult] = useState(null);
   const [matchFound, setMatchFound] = useState(null);
   const [onlineCount, setOnlineCount] = useState(0);
+  const [queuedCount, setQueuedCount] = useState(0);
+  const [notice, setNotice] = useState(null);
   const [crypto, setCrypto] = useState({ enabled: false, bet_tiers_usdc: [], min_bet_usdc: 0.01, max_bet_usdc: 10 });
   const [playMode, setPlayMode] = useState("free");  // "free" | "real"
   const [realBal, setRealBal] = useState(null);       // { usdc, wallet_address } or null
@@ -1138,7 +1143,10 @@ function MultiplayerLobby({ roster, onBack }) {
 
   // poll online count
   useEffect(() => {
-    const poll = () => fetch(`${API}/players/online`).then(r => r.json()).then(d => setOnlineCount(d.count)).catch(() => {});
+    const poll = () => fetch(`${API}/players/online`).then(r => r.json()).then(d => {
+      setOnlineCount(d.count);
+      setQueuedCount((d.players || []).filter(p => p.status === "in_queue").length);
+    }).catch(() => {});
     poll();
     const iv = setInterval(poll, 10000);
     return () => clearInterval(iv);
@@ -1167,9 +1175,10 @@ function MultiplayerLobby({ roster, onBack }) {
       const msg = JSON.parse(e.data);
       if (msg.type === "connected") setWsStatus("connected");
       if (msg.type === "queue_status") setQueueStatus(msg);
-      if (msg.type === "match_found") setMatchFound(msg);
+      if (msg.type === "match_found") { setMatchFound(msg); setNotice(null); }
       if (msg.type === "match_result") { setMatchResult(msg); setMatchFound(null); setQueueStatus(null); if (msg.mode === "real") loadRealBalance(); }
-      if (msg.type === "bot_fallback") setQueueStatus({ ...queueStatus, bot_fallback: true });
+      if (msg.type === "queue_timeout") { setQueueStatus(null); setNotice(msg.message || "No opponents found. Try again later."); }
+      if (msg.type === "error") { setQueueStatus(null); setNotice(msg.message || "Something went wrong."); }
       if (msg.type === "queue_cancelled") setQueueStatus(null);
     };
   };
@@ -1178,6 +1187,7 @@ function MultiplayerLobby({ roster, onBack }) {
 
   const joinQueue = () => {
     if (!selectedAgent || !wsRef.current) return;
+    setNotice(null);
     const join = playMode === "real"
       ? { type: "queue_join", agent_id: selectedAgent.id, bet_amount: realBet, mode: "real" }
       : { type: "queue_join", agent_id: selectedAgent.id, bet_amount: betAmount, mode: "free" };
@@ -1244,7 +1254,7 @@ function MultiplayerLobby({ roster, onBack }) {
           </div>
         )}
         <div style={{ textAlign: "center", fontSize: 9, color: "#8892a0", marginBottom: 12 }}>
-          Elo: {matchResult.elo_change.before} -> {matchResult.elo_change.after} ({matchResult.elo_change.delta > 0 ? "+" : ""}{matchResult.elo_change.delta})
+          Elo: {matchResult.elo_change.before} → {matchResult.elo_change.after} ({matchResult.elo_change.delta > 0 ? "+" : ""}{matchResult.elo_change.delta})
         </div>
         <div style={{ padding: "8px 12px", background: "#0d1117", border: "1px solid #1a1f2b", borderRadius: 6, marginBottom: 12 }}>
           <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 1, marginBottom: 4, textTransform: "uppercase" }}>Opponent revealed</div>
@@ -1289,12 +1299,13 @@ function MultiplayerLobby({ roster, onBack }) {
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
         <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 4, color: "#9b59b6", textTransform: "uppercase" }}>Multiplayer</h2>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <span style={{ fontSize: 8, color: "#4a5568" }}>Online: {onlineCount}</span>
+          <span style={{ fontSize: 9, color: "#8892a0" }}>👥 {onlineCount} online{queuedCount > 0 ? ` · ${queuedCount} queuing` : ""}</span>
           <span style={{ fontSize: 8, color: wsStatus === "connected" ? "#2ecc71" : "#e74c3c" }}>{wsStatus === "connected" ? "CONNECTED" : "OFFLINE"}</span>
           <button onClick={onBack} style={{ fontSize: 8, background: "none", border: "1px solid #21262d", color: "#4a5568", borderRadius: 3, padding: "3px 10px", cursor: "pointer", fontFamily: "inherit" }}>BACK</button>
         </div>
       </div>
       <div style={{ fontSize: 9, color: "#8892a0", marginBottom: 8 }}>Logged in as {player?.display_name}</div>
+      {notice && <div style={{ fontSize: 9, color: "#e67e22", background: "#1a1510", border: "1px solid #e67e2233", borderRadius: 4, padding: "5px 8px", marginBottom: 8 }}>{notice}</div>}
 
       {/* mode toggle: REAL only appears when the server has real play configured */}
       {crypto.enabled && (
@@ -1366,10 +1377,15 @@ function MultiplayerLobby({ roster, onBack }) {
 
       {queueStatus && (
         <div style={{ textAlign: "center", padding: "12px", background: "#0d1117", border: "1px solid #9b59b633", borderRadius: 6, marginTop: 8 }}>
-          <div style={{ fontSize: 11, color: "#9b59b6", letterSpacing: 2, marginBottom: 4 }}>SEARCHING...</div>
-          <div style={{ fontSize: 9, color: "#4a5568" }}>Wait: {queueStatus.wait_time}s | Elo range: {queueStatus.elo_range || 200}</div>
-          {queueStatus.bot_fallback && <div style={{ fontSize: 9, color: "#e67e22", marginTop: 4 }}>No opponent found. Try VS BOT from the main menu.</div>}
-          <button onClick={cancelQueue} style={{ marginTop: 8, padding: "4px 16px", borderRadius: 3, border: "1px solid #e74c3c44", background: "transparent", color: "#e74c3c", fontSize: 8, cursor: "pointer", fontFamily: "inherit", letterSpacing: 1 }}>CANCEL</button>
+          <div style={{ fontSize: 11, color: "#9b59b6", letterSpacing: 2, marginBottom: 6 }}>SEARCHING FOR OPPONENT...</div>
+          <div style={{ fontSize: 9, color: "#8892a0", marginBottom: 2 }}>Your agent: <span style={{ color: "#c8d0da", fontWeight: 700 }}>{selectedAgent?.name}</span> ({selectedAgent?.elo} elo)</div>
+          <div style={{ fontSize: 9, color: "#8892a0", marginBottom: 2 }}>
+            {queueStatus.matching_anyone
+              ? "Search range: any opponent"
+              : `Search range: ± ${queueStatus.elo_range ?? 100} elo${queueStatus.widen_in > 0 ? ` (widening in ${queueStatus.widen_in}s)` : ""}`}
+          </div>
+          <div style={{ fontSize: 9, color: "#8892a0" }}>Players in queue: <span style={{ color: "#9b59b6", fontWeight: 700 }}>{queueStatus.players_in_queue ?? 1}</span>{typeof queueStatus.wait_time === "number" ? ` · ${queueStatus.wait_time}s waited` : ""}</div>
+          <button onClick={cancelQueue} style={{ marginTop: 10, padding: "4px 16px", borderRadius: 3, border: "1px solid #e74c3c44", background: "transparent", color: "#e74c3c", fontSize: 8, cursor: "pointer", fontFamily: "inherit", letterSpacing: 1 }}>CANCEL</button>
         </div>
       )}
     </div>
@@ -1688,6 +1704,17 @@ function TagTeam({ roster, onBack, loadRoster, loadWallet }) {
 
   const playerSlotInCur = curMatch ? (curMatch.red_is_player ? "red" : curMatch.black_is_player ? "black" : null) : null;
 
+  // --- tournament elimination tracking (single-elim: lose once = out) ---
+  const playerTeamName = (m) => (m.red_is_player ? m.red_name : m.black_is_player ? m.black_name : null);
+  const watchedCount = watchDone ? liveIdx + 1 : liveIdx;   // matches fully watched so far
+  const lossMatch = matchQueue.slice(0, Math.max(0, watchedCount)).find((m) => {
+    const ptn = playerTeamName(m);
+    return ptn && m.winner_name !== ptn;
+  });
+  const playerEliminated = !!lossMatch;
+  const tourneyHasRemaining = liveIdx + 1 < matchQueue.length;
+  const pendingBetCount = betsRef.current.length + (tBetSide ? 1 : 0);
+
   return (
     <div style={{ maxWidth: 1000, margin: "0 auto", padding: "0 12px" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", margin: "8px 0" }}>
@@ -1860,7 +1887,19 @@ function TagTeam({ roster, onBack, loadRoster, loadWallet }) {
                 <div style={{ textAlign: "center", marginTop: 8 }}>
                   <div style={{ fontSize: 11, fontWeight: 800, color: "#c8d0da" }}>{curMatch.winner_name} wins</div>
                   {tBetSide && <div style={{ fontSize: 10, fontWeight: 700, color: curMatch.game.winner === tBetSide ? "#2ecc71" : "#e74c3c", marginTop: 2 }}>{curMatch.game.winner === tBetSide ? `Bet won +${Math.floor(tBetAmt * matchupOdds(curMatch.red_elo, curMatch.black_elo)[tBetSide])}` : `Bet lost -${tBetAmt}`}</div>}
-                  <button onClick={nextMatch} style={{ fontSize: 11, padding: "6px 20px", borderRadius: 4, border: "none", background: "linear-gradient(135deg,#f39c12,#e67e22)", color: "#fff", fontWeight: 800, letterSpacing: 2, cursor: "pointer", fontFamily: "inherit", marginTop: 8 }}>{liveIdx + 1 >= matchQueue.length ? "SEE RESULTS" : "NEXT MATCH ▶"}</button>
+                  {playerEliminated && tourneyHasRemaining ? (
+                    <div style={{ marginTop: 10, padding: "10px 12px", background: "rgba(231,76,60,0.08)", border: "1px solid #e74c3c44", borderRadius: 6 }}>
+                      <div style={{ fontSize: 11, fontWeight: 800, color: "#e74c3c", letterSpacing: 1 }}>YOUR TEAM WAS ELIMINATED</div>
+                      {lossMatch && <div style={{ fontSize: 9, color: "#8892a0", marginTop: 3 }}>{playerTeamName(lossMatch)} lost to {lossMatch.winner_name}</div>}
+                      {pendingBetCount > 0 && <div style={{ fontSize: 8, color: "#e67e22", marginTop: 5 }}>You have active bets on this tournament. Exiting will forfeit pending winnings.</div>}
+                      <div style={{ display: "flex", gap: 8, justifyContent: "center", marginTop: 10 }}>
+                        <button onClick={nextMatch} style={{ fontSize: 10, padding: "6px 16px", borderRadius: 4, border: "1px solid #f39c12", background: "transparent", color: "#f39c12", fontWeight: 700, letterSpacing: 1, cursor: "pointer", fontFamily: "inherit" }}>WATCH REMAINING</button>
+                        <button onClick={resetTourney} style={{ fontSize: 10, padding: "6px 16px", borderRadius: 4, border: "none", background: "linear-gradient(135deg,#e74c3c,#c0392b)", color: "#fff", fontWeight: 800, letterSpacing: 1, cursor: "pointer", fontFamily: "inherit" }}>EXIT TOURNAMENT</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <button onClick={nextMatch} style={{ fontSize: 11, padding: "6px 20px", borderRadius: 4, border: "none", background: "linear-gradient(135deg,#f39c12,#e67e22)", color: "#fff", fontWeight: 800, letterSpacing: 2, cursor: "pointer", fontFamily: "inherit", marginTop: 8 }}>{liveIdx + 1 >= matchQueue.length ? "SEE RESULTS" : "NEXT MATCH ▶"}</button>
+                  )}
                 </div>
               )}
             </div>
@@ -2159,7 +2198,8 @@ export default function App() {
           {/* betting panel / bet indicator */}
           {canGo && !currentBet && betOdds && (
             <div style={{ width: "100%", padding: "8px 12px", background: "#0d1117", border: "1px solid #1a1f2b", borderRadius: 6, marginTop: 8 }}>
-              <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 2, textTransform: "uppercase", textAlign: "center", marginBottom: 4 }}>Place your bet</div>
+              <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 2, textTransform: "uppercase", textAlign: "center", marginBottom: 2 }}>Place your bet</div>
+              <div style={{ fontSize: 7, color: "#6b7280", textAlign: "center", marginBottom: 4 }}>Practice chips — free play. Real stakes are in Multiplayer.</div>
               <div style={{ display: "flex", justifyContent: "space-around", marginBottom: 6 }}>
                 <div style={{ textAlign: "center" }}>
                   <div style={{ fontSize: 8, color: "#e74c3c" }}>RED</div>

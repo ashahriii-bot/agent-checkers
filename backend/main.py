@@ -114,6 +114,7 @@ class UpdateAgentRequest(BaseModel):
 class BetSchema(BaseModel):
     side: str
     amount: int = Field(ge=10)
+    mode: str = "free"   # free-play coins only; "real" is rejected here (multiplayer-exclusive)
 
 
 class ChampionBetSchema(BaseModel):
@@ -1350,6 +1351,10 @@ def _simulate_team_game(req: SimulateRequest):
 
 @app.post("/api/game/simulate")
 def simulate_game(req: SimulateRequest):
+    # Real-money (USDC) betting is exclusive to multiplayer (human vs human, pot-split in
+    # ws.py). VS BOT / sandbox are training mode and settle in free-play coins only.
+    if req.bet and getattr(req.bet, "mode", "free") == "real":
+        raise HTTPException(400, "Real-money bets are only available in multiplayer matches.")
     if req.mode == "2v2":
         return _simulate_team_game(req)
     bot_opponent = None
