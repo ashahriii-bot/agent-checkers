@@ -1349,6 +1349,107 @@ def _simulate_team_game(req: SimulateRequest):
     return resp
 
 
+# --- AI commentary (optional enhancement; gated on ANTHROPIC_API_KEY) -------
+import os as _os
+import urllib.request as _urlreq
+
+ANTHROPIC_API_KEY = _os.environ.get("ANTHROPIC_API_KEY", "")
+COMMENTARY_MODEL = "claude-sonnet-4-20250514"
+
+
+def build_commentary_summary(red_name, red_cfg, red_perk, black_name, black_cfg, black_perk, game):
+    """Compact match summary for the commentary prompt."""
+    moves = game.get("moves", []) or []
+    events = game.get("events", []) or []
+    wp = game.get("win_probability", []) or []
+    key = []
+    for i, mv in enumerate(moves, start=1):
+        caps = len((mv or {}).get("captures", []) or [])
+        if caps > 1:
+            key.append(f"move {i}: {caps}x capture")
+    for e in events:
+        if e.get("type") == "perk_activate":
+            key.append(f"move {e.get('move')}: {e.get('perk')} edge activated")
+
+    def _at(i):
+        return wp[i] if 0 <= i < len(wp) else None
+
+    def _agg(c):
+        return getattr(c, "aggression", None) if c is not None else None
+
+    def _risk(c):
+        return getattr(c, "risk_tolerance", None) if c is not None else None
+
+    return {
+        "red_name": red_name, "red_agg": _agg(red_cfg), "red_risk": _risk(red_cfg), "red_edge": red_perk or "none",
+        "black_name": black_name, "black_agg": _agg(black_cfg), "black_risk": _risk(black_cfg), "black_edge": black_perk or "none",
+        "total_moves": game.get("move_count"),
+        "winner": game.get("winner"),
+        "key_events": "; ".join(key[:10]) or "steady positional play, few captures",
+        "win_probs": [_at(10), _at(20), _at(30), _at(40), _at(50)],
+    }
+
+
+def _commentary_prompt(s):
+    return (
+        "You are a sportscaster for Agent Checkers where AI agents with configurable "
+        "personalities play checkers.\n\n"
+        "Match data:\n"
+        f"- Red agent: {s['red_name']}, aggression {s['red_agg']}, risk tolerance {s['red_risk']}, edge: {s['red_edge']}\n"
+        f"- Black agent: {s['black_name']}, aggression {s['black_agg']}, risk tolerance {s['black_risk']}, edge: {s['black_edge']}\n"
+        f"- Total moves: {s['total_moves']}\n"
+        f"- Winner: {s['winner']}\n"
+        f"- Key events: {s['key_events']}\n"
+        f"- Win probability at moves 10, 20, 30, 40, 50: {s['win_probs']}\n\n"
+        "Generate 6-8 commentary lines tied to specific move numbers. Rules:\n"
+        "- Tell the STORY not the moves\n"
+        "- Reference agents by name and personality\n"
+        "- Note edge activations and what they mean\n"
+        "- Call out momentum shifts and turning points\n"
+        "- Build tension toward the conclusion\n"
+        "- Each line is ONE sentence max 15 words\n"
+        "- Be conversational like a sports commentator\n\n"
+        "Respond in JSON only, no markdown:\n"
+        '[{"move": 5, "text": "..."}, ...]'
+    )
+
+
+def generate_commentary(summary):
+    """Call Claude for sportscaster commentary. Returns [] if no API key or on any error
+    (commentary is an enhancement, never a hard requirement)."""
+    if not ANTHROPIC_API_KEY:
+        return []
+    try:
+        body = {
+            "model": COMMENTARY_MODEL,
+            "max_tokens": 700,
+            "messages": [{"role": "user", "content": _commentary_prompt(summary)}],
+        }
+        req = _urlreq.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=json.dumps(body).encode(),
+            headers={"content-type": "application/json", "x-api-key": ANTHROPIC_API_KEY,
+                     "anthropic-version": "2023-06-01"},
+            method="POST",
+        )
+        with _urlreq.urlopen(req, timeout=12) as r:
+            data = json.load(r)
+        text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text[:4].lower() == "json":
+                text = text[4:]
+            text = text.strip()
+        lines = json.loads(text)
+        out = []
+        for ln in lines:
+            if isinstance(ln, dict) and "move" in ln and "text" in ln:
+                out.append({"move": int(ln["move"]), "text": str(ln["text"])[:120]})
+        return out[:8]
+    except Exception:
+        return []
+
+
 @app.post("/api/game/simulate")
 def simulate_game(req: SimulateRequest):
     # Real-money (USDC) betting is exclusive to multiplayer (human vs human, pot-split in
@@ -1509,6 +1610,11 @@ def simulate_game(req: SimulateRequest):
         resp["red_agent"] = {"id": red_agent["id"], "name": red_agent["name"], "perk": red_perk}
     if black_agent:
         resp["black_agent"] = {"id": black_agent["id"], "name": black_agent["name"], "perk": black_perk}
+    # optional AI commentary — no-op (returns []) unless ANTHROPIC_API_KEY is set
+    _opp_name = black_agent["name"] if black_agent else (bot_opponent.get("name") if bot_opponent else "Black")
+    resp["commentary"] = generate_commentary(build_commentary_summary(
+        red_agent["name"] if red_agent else "Red", red_cfg, red_perk,
+        _opp_name, black_cfg, black_perk, game))
     if level_ups:
         resp["level_ups"] = level_ups
     if evolution_result:

@@ -204,6 +204,238 @@ function TagBadge({ tag }) {
   );
 }
 
+// --- game-feel: moment amplification, commentary, countdown, match theater ---
+
+const tBtn = { fontSize: 10, padding: "3px 10px", borderRadius: 4, border: "1px solid #21262d", background: "transparent", color: "#8892a0", cursor: "pointer", fontFamily: "inherit" };
+
+let _gfStylesInjected = false;
+function ensureGameFeelStyles() {
+  if (_gfStylesInjected || typeof document === "undefined") return;
+  _gfStylesInjected = true;
+  const s = document.createElement("style");
+  s.textContent =
+    "@keyframes gfPop{0%{transform:scale(.4);opacity:0}55%{transform:scale(1.18)}100%{transform:scale(1);opacity:1}}" +
+    "@keyframes gfCount{0%{transform:scale(2.6);opacity:0}25%{transform:scale(1);opacity:1}80%{opacity:1}100%{transform:scale(.65);opacity:0}}" +
+    "@keyframes gfFight{0%{transform:scale(.6);opacity:0}30%{transform:scale(1.35);opacity:1;filter:brightness(1.6)}100%{transform:scale(1.12);opacity:1}}";
+  document.head.appendChild(s);
+}
+
+function countKings(board) {
+  if (!board) return 0;
+  let n = 0;
+  for (const row of board) for (const c of row) if (c === RED_KING || c === BLACK_KING) n++;
+  return n;
+}
+
+// Detect the "moment" introduced by the move that produced board[step]. Priority:
+// multi-capture > promotion > edge activation > big win-probability swing.
+function detectMoment(step, boards, moves, winProbs, events) {
+  if (!boards || step <= 0 || step >= boards.length) return null;
+  const mv = moves && moves[step - 1];
+  const caps = (mv && mv.captures && mv.captures.length) || 0;
+  if (caps >= 2) {
+    const label = caps >= 4 ? "MASSACRE!" : caps >= 3 ? "TRIPLE CAPTURE!" : "DOUBLE JUMP!";
+    const color = caps >= 4 ? "#e74c3c" : caps >= 3 ? "#e67e22" : "#ffd700";
+    return { kind: "multicapture", label, color, holdMs: caps >= 3 ? 2400 : 1500, sound: () => gameAudio.playMultiCapture(caps) };
+  }
+  if (countKings(boards[step]) > countKings(boards[step - 1]))
+    return { kind: "promotion", label: "CROWNED!", color: "#ffd700", holdMs: 1000, sound: () => gameAudio.playPromotion() };
+  const pe = events && events.find(e => e.type === "perk_activate" && e.move === step);
+  if (pe) {
+    const info = PERK_INFO[pe.perk] || { name: String(pe.perk || "EDGE").toUpperCase(), color: "#9b59b6" };
+    return { kind: "edge", side: pe.side, perk: pe.perk, label: `${info.name} ACTIVATED`, color: info.color, holdMs: 1000, sound: () => gameAudio.playEdge() };
+  }
+  if (winProbs && winProbs[step] != null && winProbs[step - 1] != null && Math.abs(winProbs[step] - winProbs[step - 1]) > 0.15)
+    return { kind: "shift", label: "MOMENTUM SHIFT", color: "#ecf0f1", holdMs: 1100, subtle: true, sound: () => gameAudio.playShift() };
+  return null;
+}
+
+function MomentBanner({ moment }) {
+  if (!moment) return null;
+  return (
+    <div style={{ position: "absolute", top: "36%", left: 0, right: 0, textAlign: "center", zIndex: 20, pointerEvents: "none" }}>
+      <span key={moment.label + (moment.step || "")} style={{
+        display: "inline-block", fontSize: moment.big ? 28 : moment.subtle ? 15 : 23, fontWeight: 800, letterSpacing: 3,
+        color: moment.subtle ? moment.color : "#0d1117", background: moment.subtle ? "rgba(13,17,23,0.85)" : moment.color + "f2",
+        padding: moment.subtle ? "5px 14px" : "8px 22px", borderRadius: 8, boxShadow: `0 0 34px ${moment.color}`,
+        textShadow: moment.subtle ? "none" : "0 1px 2px rgba(255,255,255,0.35)", border: `1px solid ${moment.color}`,
+        animation: "gfPop 0.35s ease",
+      }}>{moment.label}</span>
+    </div>
+  );
+}
+
+function CommentaryBar({ commentary, step }) {
+  if (!commentary || !commentary.length) return null;
+  const active = commentary.filter(c => c.move <= step).slice(-1)[0];
+  if (!active) return null;
+  return (
+    <div key={active.move} style={{ marginTop: 6, maxWidth: 380, marginLeft: "auto", marginRight: "auto", padding: "6px 12px",
+      background: "rgba(13,17,23,0.9)", border: "1px solid #1a1f2b", borderRadius: 6, fontSize: 11, fontStyle: "italic",
+      color: "#c8d0da", textAlign: "center", animation: "gfPop 0.4s ease" }}>
+      🎙️ {active.text}
+    </div>
+  );
+}
+
+// 3-2-1 countdown with opponent reveal (multiplayer only).
+function Countdown({ you, opponent, onDone }) {
+  const [phase, setPhase] = useState("reveal");
+  useEffect(() => {
+    ensureGameFeelStyles();
+    const t = [];
+    t.push(setTimeout(() => { setPhase("3"); gameAudio.playCountdown(3); }, 2000));
+    t.push(setTimeout(() => { setPhase("2"); gameAudio.playCountdown(2); }, 3000));
+    t.push(setTimeout(() => { setPhase("1"); gameAudio.playCountdown(1); }, 4000));
+    t.push(setTimeout(() => { setPhase("fight"); gameAudio.playFight(); }, 5000));
+    t.push(setTimeout(() => onDone && onDone(), 5600));
+    return () => t.forEach(clearTimeout);
+  }, []);
+  const fighter = (f, color, align, label) => (
+    <div style={{ flex: 1, textAlign: align }}>
+      <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 2 }}>{label}</div>
+      <div style={{ fontSize: 15, fontWeight: 800, color }}>{f?.name || "—"}</div>
+      <div style={{ fontSize: 9, color: "#8892a0" }}>{f?.elo != null ? `${Math.round(f.elo)} elo` : ""}</div>
+      {f?.edge && <div style={{ fontSize: 8, color }}>{(PERK_INFO[f.edge]?.icon || "") + " " + (PERK_INFO[f.edge]?.name || f.edge)}</div>}
+      {f?.level != null && <div style={{ fontSize: 8, color: "#4a5568" }}>Lv.{f.level}</div>}
+    </div>
+  );
+  return (
+    <div style={{ maxWidth: 460, margin: "30px auto", padding: "20px 16px", textAlign: "center" }}>
+      <div style={{ display: "flex", alignItems: "flex-start", gap: 10, marginBottom: 16 }}>
+        {fighter(you, "#e74c3c", "left", "YOUR AGENT")}
+        <div style={{ fontSize: 12, fontWeight: 800, color: "#4a5568", paddingTop: 18 }}>VS</div>
+        {fighter(opponent, "#ecf0f1", "right", "OPPONENT")}
+      </div>
+      <div style={{ height: 96, display: "flex", alignItems: "center", justifyContent: "center" }}>
+        {phase === "reveal"
+          ? <div style={{ fontSize: 11, color: "#9b59b6", letterSpacing: 3 }}>GET READY…</div>
+          : phase === "fight"
+            ? <div key="f" style={{ fontSize: 44, fontWeight: 800, letterSpacing: 4, color: "#2ecc71", animation: "gfFight 0.5s ease", textShadow: "0 0 30px #2ecc71" }}>FIGHT!</div>
+            : <div key={phase} style={{ fontSize: 80, fontWeight: 800, color: "#f39c12", animation: "gfCount 1s ease", textShadow: "0 0 40px #f39c12" }}>{phase}</div>}
+      </div>
+    </div>
+  );
+}
+
+// Reusable rich 1v1 playback: board + win-prob + material + transport + moment
+// amplification + commentary + sound. Used by multiplayer (and anywhere a 1v1 game
+// needs the full spectator treatment). Calls onFinish() after the final moment holds.
+function MatchTheater({ game, red, black, viewerSide, onFinish }) {
+  const [step, setStep] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [speed, setSpeed] = useState(380);
+  const [moment, setMoment] = useState(null);
+  const playRef = useRef(false), stepRef = useRef(0), maxRef = useRef(0), doneRef = useRef(false), speedRef = useRef(380);
+  useEffect(() => { speedRef.current = speed; }, [speed]);
+
+  const boards = game.boards || [];
+  const moves = game.moves || [];
+  const events = game.events || [];
+  const winProbs = game.win_probability || null;
+  const maxStep = boards.length - 1;
+  const winnerName = game.winner === "red" ? (red?.name || "RED") : game.winner === "black" ? (black?.name || "BLACK") : null;
+
+  const momentAt = (s, isLast) => {
+    if (isLast) return { kind: "end", big: true, color: "#ffd700", holdMs: 2000,
+      label: (game.winner === "draw" || !winnerName) ? "DRAW" : `${winnerName} WINS!`,
+      sound: () => (viewerSide && game.winner !== viewerSide && game.winner !== "draw") ? gameAudio.playLose() : gameAudio.playWin() };
+    return detectMoment(s, boards, moves, winProbs, events);
+  };
+  const routineSound = (s) => { const mv = moves[s - 1]; if (mv && mv.captures && mv.captures.length) gameAudio.playCapture(); else gameAudio.playMove(); };
+  const scaleHold = (ms) => Math.round(ms * Math.min(1.5, Math.max(0.25, speedRef.current / 380)));
+
+  const advance = () => {
+    if (!playRef.current || stepRef.current >= maxRef.current) return;
+    const next = stepRef.current + 1;
+    stepRef.current = next; setStep(next);
+    const isLast = next >= maxRef.current;
+    const m = momentAt(next, isLast);
+    setMoment(m ? { ...m, step: next } : null);
+    if (m && m.sound) m.sound(); else routineSound(next);
+    if (isLast) {
+      playRef.current = false; setPlaying(false);
+      if (!doneRef.current) { doneRef.current = true; setTimeout(() => onFinish && onFinish(), scaleHold(m ? m.holdMs : 800)); }
+      return;
+    }
+    setTimeout(advance, speedRef.current + (m ? scaleHold(m.holdMs) : 0));
+  };
+
+  useEffect(() => {
+    ensureGameFeelStyles();
+    doneRef.current = false; maxRef.current = maxStep; stepRef.current = 0; setStep(0); setMoment(null);
+    playRef.current = true; setPlaying(true);
+    const id = setTimeout(advance, 450);
+    return () => { playRef.current = false; clearTimeout(id); };
+  }, [game]);
+
+  const board = boards[step] || null;
+  const lastMove = step > 0 ? moves[step - 1] : null;
+  let cr = 0, cb = 0;
+  if (board) for (const row of board) for (const c of row) { if (c === RED || c === RED_KING) cr++; else if (c === BLACK || c === BLACK_KING) cb++; }
+  const wp = winProbs && winProbs[step] != null ? winProbs[step] : null;
+  const redPct = wp != null ? Math.round(wp * 100) : null;
+
+  const pause = () => { playRef.current = false; setPlaying(false); };
+  const play = () => { if (stepRef.current >= maxRef.current) return; playRef.current = true; setPlaying(true); advance(); };
+  const stepTo = (v) => { playRef.current = false; setPlaying(false); const nv = Math.max(0, Math.min(maxStep, v)); stepRef.current = nv; setStep(nv); setMoment(null); };
+
+  const edgeIcon = (side, agent) => {
+    if (!agent?.perk) return null;
+    const info = PERK_INFO[agent.perk]; if (!info) return null;
+    const firing = moment && moment.kind === "edge" && moment.side === side;
+    return <span style={{ fontSize: 10, marginLeft: 4, padding: "0 3px", borderRadius: 3, color: info.color,
+      background: firing ? info.color + "33" : "transparent", border: `1px solid ${firing ? info.color : "transparent"}`,
+      boxShadow: firing ? `0 0 10px ${info.color}` : "none", transition: "all 0.2s" }}>{info.icon}</span>;
+  };
+
+  return (
+    <div style={{ maxWidth: 460, margin: "0 auto" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4, fontSize: 11 }}>
+        <span style={{ fontWeight: 700, color: "#e74c3c" }}>{red?.name || "RED"}{edgeIcon("red", red)}{viewerSide === "red" ? " (you)" : ""}</span>
+        <span style={{ fontSize: 8, color: "#4a5568" }}>Move {step}/{maxStep}</span>
+        <span style={{ fontWeight: 700, color: "#ecf0f1" }}>{viewerSide === "black" ? "(you) " : ""}{black?.name || "BLACK"}{edgeIcon("black", black)}</span>
+      </div>
+      {redPct != null && (
+        <div style={{ marginBottom: 4 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 8 }}>
+            <span style={{ color: "#e74c3c", fontWeight: redPct >= 50 ? 800 : 400 }}>{redPct}%</span>
+            <span style={{ color: "#ecf0f1", fontWeight: redPct < 50 ? 800 : 400 }}>{100 - redPct}%</span>
+          </div>
+          <div style={{ display: "flex", height: 6, borderRadius: 3, overflow: "hidden", background: "#1a1f2b", transformOrigin: "center",
+            transform: moment && moment.kind === "shift" ? "scaleY(2)" : "scaleY(1)", transition: "transform 0.25s" }}>
+            <div style={{ width: `${redPct}%`, background: "#e74c3c" }} />
+            <div style={{ flex: 1, background: "#bdc3c7" }} />
+          </div>
+        </div>
+      )}
+      <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 4, fontSize: 8 }}>
+        <span style={{ color: "#e74c3c", width: 14, textAlign: "right" }}>{cr}</span>
+        <div style={{ flex: 1, height: 4, background: "#1a1f2b", borderRadius: 2, overflow: "hidden", display: "flex" }}>
+          <div style={{ width: `${(cr / Math.max(cr + cb, 1)) * 100}%`, background: "#e74c3c" }} />
+          <div style={{ flex: 1, background: "#bdc3c7" }} />
+        </div>
+        <span style={{ color: "#ecf0f1", width: 14 }}>{cb}</span>
+      </div>
+      <div style={{ position: "relative", borderRadius: 8, boxShadow: moment ? `0 0 36px ${moment.color}` : "none", transition: "box-shadow 0.3s" }}>
+        <BoardGrid board={board} lastMove={lastMove} redLevel={red?.level || 1} blackLevel={black?.level || 1} />
+        <MomentBanner moment={moment} />
+      </div>
+      <input type="range" min={0} max={maxStep} value={step} onChange={(e) => stepTo(parseInt(e.target.value))} style={{ width: "100%", accentColor: "#9b59b6", marginTop: 6 }} />
+      <div style={{ display: "flex", gap: 6, justifyContent: "center", alignItems: "center", marginTop: 4 }}>
+        <button onClick={() => stepTo(step - 1)} style={tBtn}>◀</button>
+        {playing ? <button onClick={pause} style={{ ...tBtn, borderColor: "#e67e22", color: "#e67e22" }}>❚❚</button>
+          : <button onClick={play} style={{ ...tBtn, borderColor: "#2ecc71", color: "#2ecc71" }}>▶</button>}
+        <button onClick={() => stepTo(step + 1)} style={tBtn}>▶|</button>
+        <button onClick={() => stepTo(maxStep)} style={tBtn}>▶▶</button>
+        <span style={{ fontSize: 7, color: "#4a5568", marginLeft: 4 }}>SPD</span>
+        <input type="range" min="50" max="800" value={850 - speed} onChange={(e) => setSpeed(850 - parseInt(e.target.value))} style={{ width: 50, accentColor: "#2ecc71" }} />
+      </div>
+      <CommentaryBar commentary={game.commentary} step={step} />
+    </div>
+  );
+}
+
 // --- tournament components ---
 
 function TournamentSetup({ roster, onStart, onBack, loading }) {
@@ -1122,6 +1354,8 @@ function MultiplayerLobby({ roster, onBack }) {
   const [queueStatus, setQueueStatus] = useState(null);
   const [matchResult, setMatchResult] = useState(null);
   const [matchFound, setMatchFound] = useState(null);
+  const [countdownDone, setCountdownDone] = useState(false);
+  const [playbackDone, setPlaybackDone] = useState(false);
   const [onlineCount, setOnlineCount] = useState(0);
   const [queuedCount, setQueuedCount] = useState(0);
   const [notice, setNotice] = useState(null);
@@ -1175,8 +1409,8 @@ function MultiplayerLobby({ roster, onBack }) {
       const msg = JSON.parse(e.data);
       if (msg.type === "connected") setWsStatus("connected");
       if (msg.type === "queue_status") setQueueStatus(msg);
-      if (msg.type === "match_found") { setMatchFound(msg); setNotice(null); }
-      if (msg.type === "match_result") { setMatchResult(msg); setMatchFound(null); setQueueStatus(null); if (msg.mode === "real") loadRealBalance(); }
+      if (msg.type === "match_found") { setMatchResult(null); setPlaybackDone(false); setCountdownDone(false); setMatchFound(msg); setNotice(null); setQueueStatus(null); }
+      if (msg.type === "match_result") { setMatchResult(msg); setQueueStatus(null); if (msg.mode === "real") loadRealBalance(); }
       if (msg.type === "queue_timeout") { setQueueStatus(null); setNotice(msg.message || "No opponents found. Try again later."); }
       if (msg.type === "error") { setQueueStatus(null); setNotice(msg.message || "Something went wrong."); }
       if (msg.type === "queue_cancelled") setQueueStatus(null);
@@ -1188,6 +1422,7 @@ function MultiplayerLobby({ roster, onBack }) {
   const joinQueue = () => {
     if (!selectedAgent || !wsRef.current) return;
     setNotice(null);
+    setMatchFound(null); setMatchResult(null); setCountdownDone(false); setPlaybackDone(false);
     const join = playMode === "real"
       ? { type: "queue_join", agent_id: selectedAgent.id, bet_amount: realBet, mode: "real" }
       : { type: "queue_join", agent_id: selectedAgent.id, bet_amount: betAmount, mode: "free" };
@@ -1231,8 +1466,8 @@ function MultiplayerLobby({ roster, onBack }) {
     );
   }
 
-  // match result screen
-  if (matchResult) {
+  // match result screen — only AFTER the playback has finished
+  if (matchResult && playbackDone) {
     const won = matchResult.winner === matchResult.your_side;
     const opp = matchResult.opponent_reveal;
     return (
@@ -1267,27 +1502,44 @@ function MultiplayerLobby({ roster, onBack }) {
           <BoardGrid board={matchResult.boards[matchResult.boards.length - 1]} lastMove={null} maxWidth={320} />
         </div>
         <div style={{ display: "flex", gap: 8, justifyContent: "center", marginTop: 12 }}>
-          <button onClick={() => { setMatchResult(null); setMatchFound(null); }} style={{ padding: "6px 16px", borderRadius: 4, border: "1px solid #9b59b6", background: "transparent", color: "#9b59b6", fontFamily: "inherit", fontSize: 9, letterSpacing: 1, cursor: "pointer" }}>PLAY AGAIN</button>
+          <button onClick={() => { setMatchResult(null); setMatchFound(null); setCountdownDone(false); setPlaybackDone(false); }} style={{ padding: "6px 16px", borderRadius: 4, border: "1px solid #9b59b6", background: "transparent", color: "#9b59b6", fontFamily: "inherit", fontSize: 9, letterSpacing: 1, cursor: "pointer" }}>PLAY AGAIN</button>
           <button onClick={onBack} style={{ padding: "6px 16px", borderRadius: 4, border: "1px solid #21262d", background: "transparent", color: "#4a5568", fontFamily: "inherit", fontSize: 9, letterSpacing: 1, cursor: "pointer" }}>BACK</button>
         </div>
       </div>
     );
   }
 
-  // match found countdown
+  // multiplayer match: opponent reveal + 3-2-1 countdown, then full move-by-move playback
   if (matchFound) {
-    return (
-      <div style={{ maxWidth: 500, margin: "40px auto", padding: "20px 16px", textAlign: "center" }}>
-        <h2 style={{ fontSize: 14, fontWeight: 800, letterSpacing: 4, color: "#9b59b6", textTransform: "uppercase", marginBottom: 12 }}>Match Found</h2>
-        <div style={{ display: "flex", justifyContent: "center", alignItems: "center", gap: 20, marginBottom: 16 }}>
-          <div><div style={{ fontSize: 12, fontWeight: 700, color: "#e74c3c" }}>{selectedAgent?.name}</div><div style={{ fontSize: 9, color: "#4a5568" }}>{selectedAgent?.elo} elo</div></div>
-          <span style={{ fontSize: 11, color: "#4a5568" }}>vs</span>
-          <div><div style={{ fontSize: 12, fontWeight: 700, color: "#ecf0f1" }}>{matchFound.opponent.agent_name}</div><div style={{ fontSize: 9, color: "#4a5568" }}>{matchFound.opponent.agent_elo} elo</div></div>
+    const oppName = matchFound.opponent?.agent_name;
+    const oppElo = matchFound.opponent?.agent_elo;
+    if (!countdownDone) {
+      return <Countdown
+        you={{ name: selectedAgent?.name, elo: selectedAgent?.elo, edge: selectedAgent?.perk, level: selectedAgent?.level }}
+        opponent={{ name: oppName, elo: oppElo }}
+        onDone={() => setCountdownDone(true)} />;
+    }
+    if (matchResult) {
+      const opp = matchResult.opponent_reveal || {};
+      const mine = { name: selectedAgent?.name, perk: selectedAgent?.perk, level: selectedAgent?.level };
+      const oppSide = { name: opp.agent_name || oppName, perk: opp.perk, level: opp.level };
+      const red = matchResult.your_side === "red" ? mine : oppSide;
+      const black = matchResult.your_side === "red" ? oppSide : mine;
+      return (
+        <div style={{ maxWidth: 520, margin: "16px auto", padding: "12px" }}>
+          <h2 style={{ fontSize: 13, fontWeight: 800, letterSpacing: 3, color: "#9b59b6", textTransform: "uppercase", textAlign: "center", marginBottom: 10 }}>Live Match</h2>
+          {matchFound.bet_amount > 0 && (playMode === "real"
+            ? <div style={{ fontSize: 9, color: "#2ecc71", textAlign: "center", marginBottom: 6 }}>💰 ${Number(matchFound.bet_amount).toFixed(2)} staked · winner takes 95% of pot</div>
+            : <div style={{ fontSize: 9, color: "#ffd700", textAlign: "center", marginBottom: 6 }}>Bet: {matchFound.bet_amount} coins at {matchFound.odds}x</div>)}
+          <MatchTheater game={matchResult} red={red} black={black} viewerSide={matchResult.your_side} onFinish={() => setPlaybackDone(true)} />
         </div>
-        {matchFound.bet_amount > 0 && (playMode === "real"
-          ? <div style={{ fontSize: 9, color: "#2ecc71" }}>💰 Staking ${Number(matchFound.bet_amount).toFixed(2)} · winner takes 95% of pot</div>
-          : <div style={{ fontSize: 9, color: "#ffd700" }}>Bet: {matchFound.bet_amount} coins at {matchFound.odds}x</div>)}
-        <div style={{ fontSize: 11, color: "#4a5568", marginTop: 8 }}>Simulating...</div>
+      );
+    }
+    // countdown done but match data hasn't arrived yet
+    return (
+      <div style={{ maxWidth: 460, margin: "60px auto", padding: "20px", textAlign: "center" }}>
+        <div style={{ fontSize: 16, fontWeight: 800, letterSpacing: 4, color: "#2ecc71" }}>FIGHT!</div>
+        <div style={{ fontSize: 10, color: "#4a5568", marginTop: 8 }}>Loading the match…</div>
       </div>
     );
   }
@@ -1524,7 +1776,10 @@ function MatchPlayback({ game, redTeam, blackTeam, autoPlay = true, onFinish, co
     if (!playRef.current) return;
     if (stepRef.current >= maxRef.current) { playRef.current = false; setPlaying(false); return; }
     stepRef.current += 1; setStep(stepRef.current);
-    setTimeout(playNext, compact ? 280 : 350);
+    const base = compact ? 280 : 350;
+    const m = detectMoment(stepRef.current, game.boards, game.moves, game.win_probability, game.events);
+    if (m && m.sound) m.sound();
+    setTimeout(playNext, base + (m ? Math.round(m.holdMs * 0.6) : 0));
   };
   useEffect(() => {
     doneRef.current = false;
@@ -1549,6 +1804,7 @@ function MatchPlayback({ game, redTeam, blackTeam, autoPlay = true, onFinish, co
   const board = game.boards[step];
   const moves = game.moves || [];
   const events = game.events || [];
+  const moment = detectMoment(step, game.boards, game.moves, game.win_probability, game.events);
   const influence = game.influence_per_move || [];
   const lastMove = step > 0 ? moves[step - 1] : null;
   const curInf = step > 0 ? influence[step - 1] : null;
@@ -1567,7 +1823,10 @@ function MatchPlayback({ game, redTeam, blackTeam, autoPlay = true, onFinish, co
       <div style={{ display: "grid", gridTemplateColumns: "1fr auto 1fr", gap: 12, alignItems: "start" }}>
         <TeamPanel side="red" color="#e74c3c" team={redTeam} dynamics={isFinished ? td.red : null} firedThisMove={fired.red} />
         <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
-          <BoardGrid board={board} lastMove={lastMove} maxWidth={compact ? 320 : 360} redLevel={redTeam?.agent_a?.level || 1} blackLevel={blackTeam?.agent_a?.level || 1} flashColor={flashColor} />
+          <div style={{ position: "relative", width: "100%", display: "flex", justifyContent: "center", borderRadius: 8, boxShadow: moment ? `0 0 30px ${moment.color}` : "none", transition: "box-shadow 0.3s" }}>
+            <BoardGrid board={board} lastMove={lastMove} maxWidth={compact ? 320 : 360} redLevel={redTeam?.agent_a?.level || 1} blackLevel={blackTeam?.agent_a?.level || 1} flashColor={flashColor} />
+            <MomentBanner moment={moment} />
+          </div>
           <div style={{ fontSize: 8, color: "#4a5568" }}>Move {step}/{maxStep}{isFinished && game.winner ? ` · ${game.winner.toUpperCase()} WINS` : ""}</div>
           <input type="range" min={0} max={maxStep} value={step} onChange={scrub} style={{ width: "100%", accentColor: "#1abc9c" }} />
           <div style={{ display: "flex", gap: 8 }}>
@@ -1958,6 +2217,7 @@ export default function App() {
   const speedRef = useRef(speed);
   const stepRef = useRef(0);
   const maxStepRef = useRef(0);
+  const momentsRef = useRef([]);  // precomputed per-step moments (for amplified pacing)
 
   useEffect(() => { speedRef.current = speed; }, [speed]);
 
@@ -1995,6 +2255,7 @@ export default function App() {
       if (!res.ok) throw new Error(`API error: ${res.status}`);
       const data = await res.json();
       setBoards(data.boards); setMoves(data.moves); setEvents(data.events || []); setResult(data);
+      momentsRef.current = (data.boards || []).map((_, i) => detectMoment(i, data.boards, data.moves, data.win_probability, data.events || []));
       maxStepRef.current = data.boards.length - 1; stepRef.current = 0; setCurrentStep(0);
       playingRef.current = true; setPlaying(true); playNext();
       loadRoster(); loadHistory(); loadLeaderboard(); loadWallet(); loadJackpot();
@@ -2005,7 +2266,10 @@ export default function App() {
     if (!playingRef.current) return;
     if (stepRef.current >= maxStepRef.current) { playingRef.current = false; setPlaying(false); return; }
     stepRef.current += 1; setCurrentStep(stepRef.current);
-    setTimeout(playNext, speedRef.current);
+    // amplify big moments: linger on them (scaled by current speed)
+    const m = momentsRef.current[stepRef.current];
+    const extra = m ? Math.round(m.holdMs * Math.min(1.5, Math.max(0.25, speedRef.current / 380))) : 0;
+    setTimeout(playNext, speedRef.current + extra);
   }, []);
 
   const pause = () => { playingRef.current = false; setPlaying(false); };
@@ -2037,11 +2301,22 @@ export default function App() {
       const curKings = boards[currentStep].flat().filter(c => c === RED_KING || c === BLACK_KING).length;
       if (curKings > prevKings) gameAudio.playKingPromotion();
     }
+    if (events.some(e => e.type === "perk_activate" && e.move === currentStep)) gameAudio.playEdge();
+    const _wp = result?.win_probability;
+    if (_wp && _wp[currentStep] != null && _wp[currentStep - 1] != null && Math.abs(_wp[currentStep] - _wp[currentStep - 1]) > 0.15) gameAudio.playShift();
+    if (boards.length > 1 && currentStep === boards.length - 1) gameAudio.playWin();
   }, [currentStep]);
   const activeShrinkEvent = events.find(e => e.type === "shrink" && e.move === currentStep);
   const activeFatigueEvent = events.find(e => e.type === "fatigue" && e.move === currentStep);
   const activeOverextEvent = events.find(e => e.type === "overextension" && e.move === currentStep && e.pieces_lost >= 2);
   const activePerkEvent = events.find(e => e.type === "perk_activate" && e.move === currentStep);
+  // amplified "moment" for this step (multi-capture / promotion / edge / shift / match-end)
+  const inlineMoment = boards ? momentsRef.current[currentStep] : null;
+  const inlineEndMoment = (boards && result && currentStep > 0 && currentStep >= boards.length - 1)
+    ? { kind: "end", big: true, color: "#ffd700",
+        label: result.winner === "draw" ? "DRAW" : `${result.winner === "red" ? (redAgent?.name || "RED") : (result.bot_opponent?.name || blackAgent?.name || "BLACK")} WINS!` }
+    : null;
+  const shownMoment = inlineEndMoment || inlineMoment || null;
   const activePerkStates = (() => {
     const states = {};
     for (const e of events) {
@@ -2193,7 +2468,7 @@ export default function App() {
             )}
 
             {/* board with overlaid event banners */}
-            <div style={{ position: "relative" }}>
+            <div style={{ position: "relative", borderRadius: 8, boxShadow: shownMoment ? `0 0 36px ${shownMoment.color}` : "none", transition: "box-shadow 0.3s" }}>
               {board ? (
                 <BoardGrid board={board} lastMove={lastMove} redLevel={redAgent?.level || 1} blackLevel={blackAgent?.level || 1} />
               ) : (
@@ -2214,7 +2489,9 @@ export default function App() {
                   {activePerkEvent.side}: {pi.name} ({activePerkEvent.duration} moves)
                 </div>
               ) : null; })()}
+              <MomentBanner moment={shownMoment} />
             </div>
+            <CommentaryBar commentary={result?.commentary} step={currentStep} />
           </div>
 
           {/* betting panel / bet indicator */}
@@ -2501,7 +2778,7 @@ export default function App() {
                   const body = { agent_id: redAgent.id, opponent_config: result.revenge_available.opponent_config, opponent_perk: result.revenge_available.opponent_perk };
                   try {
                     const res = await fetch(`${API}/game/revenge`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-                    if (res.ok) { const d = await res.json(); setBoards(d.boards); setMoves(d.moves); setEvents(d.events || []); setResult(d); maxStepRef.current = d.boards.length - 1; stepRef.current = 0; setCurrentStep(0); playingRef.current = true; setPlaying(true); playNext(); loadWallet(); loadJackpot(); }
+                    if (res.ok) { const d = await res.json(); setBoards(d.boards); setMoves(d.moves); setEvents(d.events || []); setResult(d); momentsRef.current = (d.boards || []).map((_, i) => detectMoment(i, d.boards, d.moves, d.win_probability, d.events || [])); maxStepRef.current = d.boards.length - 1; stepRef.current = 0; setCurrentStep(0); playingRef.current = true; setPlaying(true); playNext(); loadWallet(); loadJackpot(); }
                   } catch {}
                 }} style={{ padding: "4px 16px", borderRadius: 3, border: "none", background: "#e67e22", color: "#fff", fontWeight: 700, fontSize: 9, letterSpacing: 1, cursor: "pointer", fontFamily: "inherit" }}>ACCEPT RUNBACK</button>
               </div>

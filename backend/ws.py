@@ -302,6 +302,18 @@ async def _run_multiplayer_match_inner(red: QueueEntry, black: QueueEntry):
                     red_familiarity=red_fam, black_familiarity=black_fam)
     log.info("match: game done winner=%s moves=%s", game.get("winner"), game.get("move_count"))
 
+    # optional AI commentary (no-op without ANTHROPIC_API_KEY); run off the event loop so
+    # the blocking HTTP call never freezes other WS connections.
+    try:
+        from main import generate_commentary, build_commentary_summary
+        _summary = build_commentary_summary(
+            red_agent["name"], red_cfg, red_agent.get("perk"),
+            black_agent["name"], black_cfg, black_agent.get("perk"), game)
+        commentary = await asyncio.to_thread(generate_commentary, _summary)
+    except Exception:
+        log.exception("commentary generation failed")
+        commentary = []
+
     # elo update
     result_red = 1.0 if game["winner"] == "red" else (0.0 if game["winner"] == "black" else 0.5)
     red_elo_after, black_elo_after = update_elo(red.agent_elo, black.agent_elo, result_red)
@@ -384,6 +396,8 @@ async def _run_multiplayer_match_inner(red: QueueEntry, black: QueueEntry):
             "boards": game["boards"],
             "moves": game["moves"],
             "events": game["events"],
+            "win_probability": game.get("win_probability"),
+            "commentary": commentary,
             "move_count": game["move_count"],
             "final_red": game["final_red"],
             "final_black": game["final_black"],

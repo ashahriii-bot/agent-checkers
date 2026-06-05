@@ -68,6 +68,71 @@ class GameAudio {
     this._tone(200, 0.1, "sine", 0.25);
   }
 
+  // --- game-feel sounds (filtered white-noise helper for thuds/impacts) ---
+  _noise(duration = 0.15, vol = 0.3, cutoff = 1200) {
+    if (this.muted || !this.ctx) return;
+    const v = vol * this.volume;
+    const n = Math.max(1, Math.floor(this.ctx.sampleRate * duration));
+    const buffer = this.ctx.createBuffer(1, n, this.ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < n; i++) data[i] = Math.random() * 2 - 1;
+    const src = this.ctx.createBufferSource();
+    src.buffer = buffer;
+    const filter = this.ctx.createBiquadFilter();
+    filter.type = "lowpass"; filter.frequency.value = cutoff;
+    const gain = this.ctx.createGain();
+    gain.gain.setValueAtTime(v, this.ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, this.ctx.currentTime + duration);
+    src.connect(filter); filter.connect(gain); gain.connect(this.ctx.destination);
+    src.start(); src.stop(this.ctx.currentTime + duration);
+  }
+
+  // countdown beats: 3 = low, 2 = mid, 1 = high
+  playCountdown(num) {
+    const freq = num >= 3 ? 300 : num === 2 ? 420 : 560;
+    this._tone(freq, 0.18, "square", 0.3);
+  }
+
+  // FIGHT! — noise burst + low hit
+  playFight() {
+    this._noise(0.28, 0.4, 2200);
+    this._tone(110, 0.35, "sawtooth", 0.38);
+    setTimeout(() => this._tone(170, 0.18, "square", 0.25), 70);
+  }
+
+  // multi-capture chain: escalating pitch per jump
+  playMultiCapture(count) {
+    const n = Math.min(Math.max(count, 2), 5);
+    for (let i = 0; i < n; i++) {
+      setTimeout(() => { this._tone(360 + i * 130, 0.09, "triangle", 0.32); this._noise(0.05, 0.14, 1400); }, i * 150);
+    }
+  }
+
+  // king promotion: rising arpeggio
+  playPromotion() {
+    [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => this._tone(f, 0.13, "sine", 0.3), i * 95));
+  }
+
+  // edge activation: sharp attack, quick decay
+  playEdge() {
+    this._tone(720, 0.05, "square", 0.3);
+    setTimeout(() => this._tone(960, 0.1, "sawtooth", 0.22), 45);
+  }
+
+  // momentum shift: low detuned chord swell
+  playShift() {
+    this._tone(220, 0.5, "sine", 0.16);
+    this._tone(223.5, 0.5, "sine", 0.16);
+  }
+
+  // match end — win: ascending major triad; lose: descending minor
+  playWin() {
+    [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => this._tone(f, 0.2, "triangle", 0.32), i * 115));
+  }
+  playLose() {
+    [440, 370, 311, 233].forEach((f, i) => setTimeout(() => this._tone(f, 0.24, "sine", 0.26), i * 130));
+  }
+
   setMuted(m) { this.muted = m; }
   setVolume(v) { this.volume = v; }
 }
