@@ -14,6 +14,14 @@ PROP_TYPES = {
 }
 
 
+# 2v2-specific props (resolved in team.resolve_team_props against team dynamics)
+TEAM_PROP_TYPES = {
+    "alpha_dog": {"label": "ALPHA DOG", "icon": "🐺", "desc": "Which agent leads more moves on the winning team?"},
+    "team_clash": {"label": "TEAM CLASH", "icon": "⚔", "desc": "Will the winning team agree on over 50% of moves?"},
+    "double_edge": {"label": "DOUBLE EDGE", "icon": "⚡", "desc": "Will both of your agents' edges activate at least once?"},
+}
+
+
 def _odds(prob):
     return round((1 / max(prob, 0.01)) * (1 - HOUSE_EDGE), 2)
 
@@ -251,3 +259,47 @@ def resolve_props(boards: list, moves: list, events: list, prop_bets: list, winn
         results.append(res)
 
     return results
+
+
+def calculate_team_prop_odds(red_a: dict, red_b: dict, perk_a, perk_b,
+                             diversity_frac: float) -> list[dict]:
+    """Odds for the three 2v2-specific props, from the player's (red) team composition."""
+    props = []
+
+    # ALPHA DOG: the more decisive personality (aggression + risk) tends to dominate eval
+    proxy_a = red_a.get("aggression", 50) + red_a.get("risk_tolerance", 50) + 1
+    proxy_b = red_b.get("aggression", 50) + red_b.get("risk_tolerance", 50) + 1
+    p_a = proxy_a / (proxy_a + proxy_b)
+    props.append({
+        "type": "alpha_dog", **TEAM_PROP_TYPES["alpha_dog"],
+        "options": [
+            {"selection": "agent_a", "label": "Agent A", "odds": _odds(p_a)},
+            {"selection": "agent_b", "label": "Agent B", "odds": _odds(1 - p_a)},
+        ],
+    })
+
+    # TEAM CLASH: more diverse pairs disagree more, so "under 50% agreement" gets likelier
+    p_under = min(0.9, 0.45 + diversity_frac * 0.45)
+    props.append({
+        "type": "team_clash", **TEAM_PROP_TYPES["team_clash"],
+        "options": [
+            {"selection": "over", "label": "Over 50% (harmonious)", "odds": _odds(1 - p_under)},
+            {"selection": "under", "label": "Under 50% (one carried)", "odds": _odds(p_under)},
+        ],
+    })
+
+    # DOUBLE EDGE: needs both agents to own an edge; aggression drives activations
+    if perk_a and perk_b:
+        avg_aggro = (red_a.get("aggression", 50) + red_b.get("aggression", 50)) / 200
+        p_yes = min(0.9, 0.45 + avg_aggro * 0.4)
+    else:
+        p_yes = 0.04  # an agent with no edge can never activate one
+    props.append({
+        "type": "double_edge", **TEAM_PROP_TYPES["double_edge"],
+        "options": [
+            {"selection": "yes", "label": "Yes (both fire)", "odds": _odds(p_yes)},
+            {"selection": "no", "label": "No", "odds": _odds(1 - p_yes)},
+        ],
+    })
+
+    return props

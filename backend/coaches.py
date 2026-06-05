@@ -116,6 +116,90 @@ def generate_bot_agent(coach: Coach, target_elo: float, player_config: dict | No
     }
 
 
+_SLIDER_KEYS = ("aggression", "risk_tolerance", "king_priority", "edge_affinity", "trade_down")
+
+
+def _clamp(v, lo=5, hi=95):
+    return max(lo, min(hi, int(v)))
+
+
+def _name_for(config: dict, coach: Coach, used_names: set[str]) -> str:
+    dominant = max(_SLIDER_KEYS, key=lambda k: config[k])
+    adj = random.choice(ADJECTIVE_POOLS.get(dominant, ["Bold"]))
+    noun = random.choice(coach.name_pool)
+    name = f"{adj} {noun}"
+    suffix = 2
+    while name in used_names:
+        name = f"{adj} {noun} {suffix}"
+        suffix += 1
+    used_names.add(name)
+    return name
+
+
+def _team_member(coach: Coach, target_elo: float, config: dict, perk: str,
+                 used_names: set[str]) -> dict:
+    if coach.difficulty == "easy":
+        elo_offset = random.randint(-50, 50)
+    elif coach.difficulty == "medium":
+        elo_offset = random.randint(-20, 20)
+    else:
+        elo_offset = random.randint(0, 80)
+    return {
+        "id": None, "name": _name_for(config, coach, used_names), "is_bot": True, "is_random": True,
+        "coach_id": coach.id, "coach_name": coach.name,
+        **config, "elo": round(target_elo + elo_offset, 1), "level": 5, "perk": perk,
+        "wins": 0, "losses": 0, "draws": 0, "matches": 0, "xp": 50, "xp_next": None,
+    }
+
+
+# archetype templates for composition strategies (used by shark/professor so the pair
+# is genuinely spread out -- inverting a coach's center-clustered range yields no diversity)
+_ARCHETYPES = {
+    "aggressive": {"aggression": (80, 95), "risk_tolerance": (75, 95), "king_priority": (15, 35), "edge_affinity": (15, 35), "trade_down": (25, 50)},
+    "defensive":  {"aggression": (10, 30), "risk_tolerance": (5, 25), "king_priority": (65, 90), "edge_affinity": (70, 95), "trade_down": (50, 80)},
+    "trading":    {"aggression": (55, 75), "risk_tolerance": (30, 50), "king_priority": (40, 60), "edge_affinity": (25, 45), "trade_down": (82, 100)},
+}
+
+
+def _draw(ranges: dict) -> dict:
+    return {k: random.randint(*ranges[k]) for k in _SLIDER_KEYS}
+
+
+def generate_bot_team(coach: Coach, target_elo: float,
+                      used_names: set[str] | None = None) -> tuple[dict, dict]:
+    """Generate a 2-agent team reflecting the coach's composition strategy.
+
+    Blitz/Fortress -> two similar agents (low diversity, double-down archetype).
+    Shark -> aggressive + trading (moderate diversity, complementary).
+    Professor -> a deliberately high-diversity pair (opposite archetypes, two edges).
+    Wildcard -> two independent random agents (could be anything).
+    """
+    if used_names is None:
+        used_names = set()
+
+    perks = coach.preferred_perks
+    perk_a = random.choice(perks)
+
+    if coach.id == "professor":
+        # deliberately maximize diversity: pick two opposite archetypes
+        cfg_a = _draw(_ARCHETYPES["aggressive"])
+        cfg_b = _draw(_ARCHETYPES["defensive"])
+        perk_b = next((p for p in perks if p != perk_a), perk_a)
+    elif coach.id == "shark":
+        # complementary: one aggressive + one trading/grinder
+        cfg_a = _draw(_ARCHETYPES["aggressive"])
+        cfg_b = _draw(_ARCHETYPES["trading"])
+        perk_b = next((p for p in perks if p != perk_a), random.choice(perks))
+    else:
+        # blitz / fortress (double-down, low diversity) and wildcard (independent random)
+        cfg_a = _draw(coach.slider_ranges)
+        cfg_b = _draw(coach.slider_ranges)
+        perk_b = random.choice(perks)
+
+    return (_team_member(coach, target_elo, cfg_a, perk_a, used_names),
+            _team_member(coach, target_elo, cfg_b, perk_b, used_names))
+
+
 def get_coach_list() -> list[dict]:
     return [{
         "id": c.id, "name": c.name, "title": c.title,

@@ -327,6 +327,24 @@ def init_db():
             detail TEXT
         )
     """)
+    # 2v2 tag-team match metadata (links to the base matches row)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS team_matches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            match_id INTEGER NOT NULL,
+            mode TEXT NOT NULL DEFAULT '2v2',
+            red_agent_a_id INTEGER, red_agent_b_id INTEGER,
+            black_agent_a_id INTEGER, black_agent_b_id INTEGER,
+            red_diversity_bonus REAL, black_diversity_bonus REAL,
+            red_agreement_rate REAL, black_agreement_rate REAL,
+            red_a_lead_pct REAL, red_b_lead_pct REAL,
+            black_a_lead_pct REAL, black_b_lead_pct REAL
+        )
+    """)
+    # 2v2 tournaments: mode column on the existing tournaments table
+    tour_cols = {r[1] for r in conn.execute("PRAGMA table_info(tournaments)").fetchall()}
+    if "mode" not in tour_cols:
+        conn.execute("ALTER TABLE tournaments ADD COLUMN mode TEXT NOT NULL DEFAULT '1v1'")
     # recompute stored levels against the (possibly extended) XP curve, so existing
     # veterans are not stuck at the old L5 cap until their next match. Idempotent.
     for row in conn.execute("SELECT id, xp, level FROM agents").fetchall():
@@ -771,6 +789,32 @@ def save_match(
     match_id = cursor.lastrowid
     conn.close()
     return match_id
+
+
+def save_team_match(match_id: int, red_ids: tuple, black_ids: tuple,
+                    red_diversity: float, black_diversity: float,
+                    red_dyn: dict, black_dyn: dict) -> int:
+    """Persist 2v2 team metadata linked to a base matches row. ids = (agent_a_id, agent_b_id)."""
+    conn = get_db()
+    cursor = conn.execute(
+        """
+        INSERT INTO team_matches (match_id, mode,
+            red_agent_a_id, red_agent_b_id, black_agent_a_id, black_agent_b_id,
+            red_diversity_bonus, black_diversity_bonus,
+            red_agreement_rate, black_agreement_rate,
+            red_a_lead_pct, red_b_lead_pct, black_a_lead_pct, black_b_lead_pct)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (match_id, "2v2", red_ids[0], red_ids[1], black_ids[0], black_ids[1],
+         red_diversity, black_diversity,
+         (red_dyn.get("agreement_pct", 0) or 0) / 100.0, (black_dyn.get("agreement_pct", 0) or 0) / 100.0,
+         red_dyn.get("agent_a_lead_pct", 0), red_dyn.get("agent_b_lead_pct", 0),
+         black_dyn.get("agent_a_lead_pct", 0), black_dyn.get("agent_b_lead_pct", 0)),
+    )
+    conn.commit()
+    tmid = cursor.lastrowid
+    conn.close()
+    return tmid
 
 
 def get_matches(limit: int = 50) -> list[dict]:

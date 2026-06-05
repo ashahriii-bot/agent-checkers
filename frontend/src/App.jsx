@@ -108,7 +108,7 @@ function MiniBars({ config, width = "100%" }) {
   );
 }
 
-function Piece({ type, highlight, level = 1 }) {
+function Piece({ type, highlight, level = 1, flashColor = null }) {
   if (type <= 0) return null;
   const red = isRed(type);
   const king = isKing(type);
@@ -118,7 +118,7 @@ function Piece({ type, highlight, level = 1 }) {
   const tier = level >= 25 ? 5 : level >= 20 ? 4 : level >= 15 ? 3 : level >= 10 ? 2 : level >= 5 ? 1 : 0;
   const glowRGB = red ? "231,76,60" : "210,220,235";
   const baseShadow = highlight
-    ? `0 0 16px 4px ${red ? "rgba(231,76,60,0.6)" : "rgba(200,210,220,0.5)"}`
+    ? `0 0 16px 4px ${flashColor || (red ? "rgba(231,76,60,0.6)" : "rgba(200,210,220,0.5)")}`
     : (tier >= 5 ? "0 4px 9px rgba(0,0,0,0.5), inset 0 1px 2px rgba(255,255,255,0.2)"
        : tier >= 2 ? "0 3px 7px rgba(0,0,0,0.5), inset 0 1px 2px rgba(255,255,255,0.2)"
        : "0 3px 6px rgba(0,0,0,0.4), inset 0 1px 2px rgba(255,255,255,0.2)");
@@ -142,7 +142,7 @@ function Piece({ type, highlight, level = 1 }) {
   );
 }
 
-function BoardGrid({ board, lastMove, maxWidth = 380, redLevel = 1, blackLevel = 1 }) {
+function BoardGrid({ board, lastMove, maxWidth = 380, redLevel = 1, blackLevel = 1, flashColor = null }) {
   return (
     <div style={{
       display: "grid", gridTemplateColumns: `repeat(${SIZE}, 1fr)`,
@@ -162,7 +162,7 @@ function BoardGrid({ board, lastMove, maxWidth = 380, redLevel = 1, blackLevel =
               transition: "background 0.4s", position: "relative",
             }}>
               {isDead && <div style={{ position: "absolute", inset: 0, background: "repeating-linear-gradient(45deg, transparent, transparent 3px, rgba(231,76,60,0.08) 3px, rgba(231,76,60,0.08) 6px)" }} />}
-              {cell > 0 && <Piece type={cell} highlight={isLastTo} level={isRed(cell) ? redLevel : blackLevel} />}
+              {cell > 0 && <Piece type={cell} highlight={isLastTo} level={isRed(cell) ? redLevel : blackLevel} flashColor={isLastTo ? flashColor : null} />}
             </div>
           );
         })
@@ -1379,6 +1379,383 @@ function MultiplayerLobby({ roster, onBack }) {
 
 // --- main app ---
 
+// --- 2v2 Tag Team ---
+const AGENT_A_COLOR = "#f1c40f";   // amber
+const AGENT_B_COLOR = "#3498db";   // cyan
+const EDGE_SHORT = { rope_a_dope: "Counter", press: "Surge", momentum: "Frenzy", anchor: "Anchor", phantom: "Phantom", siege: "Siege", flux: "Flux" };
+
+function clientDiversity(a, b) {
+  if (!a || !b) return { frac: 0, bonus: 1.0 };
+  const keys = ["aggression", "risk_tolerance", "king_priority", "edge_affinity", "trade_down"];
+  const total = keys.reduce((s, k) => s + Math.abs((a[k] ?? 50) - (b[k] ?? 50)), 0);
+  const frac = total / 500;
+  let bonus = 1.0 + frac * 0.05;
+  if (a.perk && b.perk && a.perk !== b.perk) bonus += 0.005;
+  return { frac, bonus: Math.round(bonus * 1000) / 1000 };
+}
+
+function edgeComboDesc(pa, pb) {
+  if (!pa && !pb) return "No edges equipped";
+  if (!pa || !pb) return `${EDGE_SHORT[pa || pb] || "Edge"} on one agent`;
+  const a = EDGE_SHORT[pa], b = EDGE_SHORT[pb];
+  const tag = { rope_a_dope: "defend", press: "force action", momentum: "attack", anchor: "fortress", phantom: "counter", siege: "siege", flux: "chaos" };
+  return `${a} + ${b} (${tag[pa] || "?"} + ${tag[pb] || "?"})`;
+}
+
+function TeamDynamicsBar({ dyn }) {
+  if (!dyn) return null;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 8, color: "#8892a0" }}>
+      <span style={{ color: AGENT_A_COLOR }}>A {dyn.agent_a_lead_pct}%</span>
+      <div style={{ flex: 1, height: 5, borderRadius: 3, overflow: "hidden", display: "flex", background: "#1a1f2b" }}>
+        <div style={{ width: `${dyn.agent_a_lead_pct}%`, background: AGENT_A_COLOR }} />
+        <div style={{ width: `${dyn.agreement_pct}%`, background: "#4a5568" }} />
+        <div style={{ width: `${dyn.agent_b_lead_pct}%`, background: AGENT_B_COLOR }} />
+      </div>
+      <span style={{ color: AGENT_B_COLOR }}>B {dyn.agent_b_lead_pct}%</span>
+      <span style={{ color: "#4a5568" }}>agree {dyn.agreement_pct}%</span>
+    </div>
+  );
+}
+
+function InfluenceIndicator({ inf, nameA, nameB }) {
+  if (!inf) return <div style={{ fontSize: 8, color: "#3a4450", textAlign: "center", padding: 4 }}>— first move —</div>;
+  const a = inf.score_a, b = inf.score_b;
+  const mag = Math.max(Math.abs(a), Math.abs(b), 0.01);
+  const barA = Math.max(0, Math.min(100, (a / mag) * 100));
+  const barB = Math.max(0, Math.min(100, (b / mag) * 100));
+  const agreePct = Math.round(inf.agreement * 100);
+  const dom = inf.dominant;
+  const note = dom === "equal" ? "Both agents agreed" : `Agent ${dom.toUpperCase()} ${agreePct < 50 ? "overruled" : "edged out"} ${dom === "a" ? nameB : nameA}`;
+  const bar = (label, val, color, score, isDom) => (
+    <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 8 }}>
+      <span style={{ color, width: 52, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{label}</span>
+      <span style={{ width: 26, textAlign: "right", color: "#c8d0da" }}>{score.toFixed(1)}</span>
+      <div style={{ flex: 1, height: 6, background: "#1a1f2b", borderRadius: 3, overflow: "hidden" }}>
+        <div style={{ width: `${val}%`, height: "100%", background: color, opacity: isDom ? 1 : 0.5 }} />
+      </div>
+      {isDom && <span style={{ fontSize: 6, color, fontWeight: 800 }}>DOM</span>}
+    </div>
+  );
+  return (
+    <div style={{ width: "100%", padding: "5px 8px", background: "#0a0c10", border: "1px solid #1a1f2b", borderRadius: 4 }}>
+      {bar(nameA, barA, AGENT_A_COLOR, a, dom === "a")}
+      {bar(nameB, barB, AGENT_B_COLOR, b, dom === "b")}
+      <div style={{ fontSize: 7, color: "#6b7280", marginTop: 2, textAlign: "center" }}>Agreement {agreePct}% — {note}</div>
+    </div>
+  );
+}
+
+function TeamPanel({ side, color, team, dynamics, firedThisMove }) {
+  if (!team) return null;
+  const ag = (key, name, perk, lead) => {
+    const fired = firedThisMove && firedThisMove[key];
+    return (
+      <div style={{ marginBottom: 4 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 9 }}>
+          <span style={{ width: 12, height: 12, borderRadius: 2, background: key === "a" ? AGENT_A_COLOR : AGENT_B_COLOR, color: "#0d1117", fontSize: 7, fontWeight: 800, display: "flex", alignItems: "center", justifyContent: "center" }}>{key.toUpperCase()}</span>
+          <span style={{ color: "#c8d0da", fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{name}</span>
+        </div>
+        <div style={{ fontSize: 7, color: "#6b7280", marginLeft: 16 }}>
+          {perk ? <span style={{ color: fired ? "#2ecc71" : "#8892a0" }}>{EDGE_SHORT[perk] || perk}{fired ? " ⚡ FIRED" : ""}</span> : "no edge"}
+          {dynamics ? <span style={{ color: "#4a5568" }}>  ·  led {lead}%</span> : null}
+        </div>
+      </div>
+    );
+  };
+  return (
+    <div style={{ padding: 8, background: "#0d1117", border: `1px solid ${color}44`, borderRadius: 6 }}>
+      <div style={{ fontSize: 8, color, letterSpacing: 1, textTransform: "uppercase", marginBottom: 4 }}>{side} team</div>
+      {ag("a", team.agent_a.name, team.agent_a.perk, dynamics?.agent_a_lead_pct)}
+      {ag("b", team.agent_b.name, team.agent_b.perk, dynamics?.agent_b_lead_pct)}
+      <div style={{ fontSize: 7, color: "#4a5568", marginTop: 2 }}>diversity {team.diversity_pct}% · {team.diversity_bonus}x</div>
+    </div>
+  );
+}
+
+function TeamDynamicsBreakdown({ result }) {
+  const td = result.team_dynamics;
+  if (!td) return null;
+  const rt = result.red_team, bt = result.black_team;
+  const section = (label, team, dyn, color) => (
+    <div style={{ marginBottom: 8 }}>
+      <div style={{ fontSize: 9, fontWeight: 800, color, marginBottom: 3 }}>{label}: {team.agent_a.name} + {team.agent_b.name}</div>
+      <div style={{ fontSize: 8, color: "#8892a0" }}>
+        <div><span style={{ color: AGENT_A_COLOR }}>{team.agent_a.name} (A)</span> led {dyn.agent_a_lead_pct}% of decisions{dyn.agent_a_edge_count ? `, ${EDGE_SHORT[team.agent_a.perk] || "edge"} fired ${dyn.agent_a_edge_count}x` : ""}</div>
+        <div><span style={{ color: AGENT_B_COLOR }}>{team.agent_b.name} (B)</span> led {dyn.agent_b_lead_pct}% of decisions{dyn.agent_b_edge_count ? `, ${EDGE_SHORT[team.agent_b.perk] || "edge"} fired ${dyn.agent_b_edge_count}x` : ""}</div>
+        <div style={{ color: "#6b7280" }}>Agreement rate: {dyn.agreement_pct}% · diversity {team.diversity_pct}% ({team.diversity_bonus}x)</div>
+      </div>
+    </div>
+  );
+  return (
+    <div style={{ width: "100%", padding: "8px 12px", background: "rgba(52,152,219,0.08)", border: "1px solid rgba(52,152,219,0.3)", borderRadius: 6, marginTop: 6 }}>
+      <div style={{ fontSize: 8, color: "#3498db", letterSpacing: 2, textTransform: "uppercase", marginBottom: 6 }}>Team Dynamics</div>
+      {section("Your team", rt, td.red, "#e74c3c")}
+      {section("Opponent", bt, td.black, "#ecf0f1")}
+      <div style={{ fontSize: 7, color: "#6b7280", fontStyle: "italic", marginTop: 2 }}>
+        {td.red.agreement_pct < 30 ? "These agents rarely agree — their push-pull disagreement drives the team." : td.red.agreement_pct > 70 ? "These agents almost always agree — a unified, predictable team." : "A balanced mix of agreement and creative tension."}
+      </div>
+    </div>
+  );
+}
+
+function TagTeam({ roster, onBack, loadRoster, loadWallet }) {
+  const [subMode, setSubMode] = useState("match");
+  const [agentA, setAgentA] = useState(null);
+  const [agentB, setAgentB] = useState(null);
+  const [oppMode, setOppMode] = useState("vsbot");
+  const [coach, setCoach] = useState("professor");
+  const [oppA, setOppA] = useState(null);
+  const [oppB, setOppB] = useState(null);
+  const [betSide, setBetSide] = useState(null);
+  const [betAmt, setBetAmt] = useState(50);
+  const [props, setProps] = useState({});  // {alpha_dog:"agent_a", ...}
+  // playback
+  const [boards, setBoards] = useState(null);
+  const [moves, setMoves] = useState(null);
+  const [events, setEvents] = useState([]);
+  const [influence, setInfluence] = useState([]);
+  const [result, setResult] = useState(null);
+  const [step, setStep] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+  const [tourney, setTourney] = useState(null);
+  const playRef = useRef(false), stepRef = useRef(0), maxRef = useRef(0);
+
+  const div = clientDiversity(agentA, agentB);
+  const combinedElo = agentA && agentB ? Math.round(((agentA.elo + agentB.elo) / 2) * div.bonus) : 0;
+  const ready = agentA && agentB && agentA.id !== agentB.id && (oppMode === "vsbot" || (oppA && oppB && oppA.id !== oppB.id));
+
+  const playNext = () => {
+    if (!playRef.current) return;
+    if (stepRef.current >= maxRef.current) { playRef.current = false; setPlaying(false); return; }
+    stepRef.current += 1; setStep(stepRef.current);
+    setTimeout(playNext, 350);
+  };
+  const pause = () => { playRef.current = false; setPlaying(false); };
+  const resume = () => { if (stepRef.current >= maxRef.current) return; playRef.current = true; setPlaying(true); playNext(); };
+  const jumpEnd = () => { playRef.current = false; setPlaying(false); stepRef.current = maxRef.current; setStep(maxRef.current); };
+  const scrub = (e) => { const v = parseInt(e.target.value); playRef.current = false; setPlaying(false); stepRef.current = v; setStep(v); };
+
+  const reset = () => { setBoards(null); setMoves(null); setEvents([]); setInfluence([]); setResult(null); setStep(0); playRef.current = false; setPlaying(false); };
+
+  const start = async () => {
+    setErr(null); setLoading(true);
+    const body = { mode: "2v2", red_team: { agent_a_id: agentA.id, agent_b_id: agentB.id } };
+    if (oppMode === "vsbot") body.vs_bot = { coach_id: coach };
+    else body.black_team = { agent_a_id: oppA.id, agent_b_id: oppB.id };
+    if (betSide) body.bet = { side: betSide, amount: betAmt };
+    const pb = Object.entries(props).filter(([, v]) => v).map(([type, selection]) => ({ type, selection, amount: 30 }));
+    if (pb.length) body.prop_bets = pb;
+    try {
+      const res = await fetch(`${API}/game/simulate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      if (!res.ok) { const e = await res.json(); setErr(e.detail || "error"); setLoading(false); return; }
+      const d = await res.json();
+      setBoards(d.boards); setMoves(d.moves); setEvents(d.events || []); setInfluence(d.influence_per_move || []); setResult(d);
+      maxRef.current = d.boards.length - 1; stepRef.current = 0; setStep(0); playRef.current = true; setPlaying(true);
+      setLoading(false); playNext(); loadWallet && loadWallet();
+    } catch (e) { setErr(String(e)); setLoading(false); }
+  };
+
+  const runTourney = async () => {
+    setErr(null); setLoading(true); setTourney(null);
+    try {
+      const res = await fetch(`${API}/tournaments/team`, { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ team: { agent_a_id: agentA.id, agent_b_id: agentB.id }, vs_bot: { coach_id: coach }, seeding: "elo" }) });
+      if (!res.ok) { const e = await res.json(); setErr(e.detail || "error"); setLoading(false); return; }
+      setTourney(await res.json()); setLoading(false); loadWallet && loadWallet();
+    } catch (e) { setErr(String(e)); setLoading(false); }
+  };
+
+  const isFinished = result && step >= maxRef.current;
+  const board = boards ? boards[step] : null;
+  const lastMove = boards && step > 0 ? moves[step - 1] : null;
+  const curInf = boards && step > 0 ? influence[step - 1] : null;
+  // dominant-agent flash (1.3x decisive rule, per spec)
+  let flashColor = null;
+  if (curInf) {
+    if (curInf.score_a > curInf.score_b * 1.3) flashColor = AGENT_A_COLOR;
+    else if (curInf.score_b > curInf.score_a * 1.3) flashColor = AGENT_B_COLOR;
+  }
+  // which agent's edge fired on the current move
+  const firedThisMove = { red: {}, black: {} };
+  if (lastMove) {
+    for (const e of events) {
+      if (e.type === "perk_activate" && e.move === step && e.agent) firedThisMove[e.side][e.agent] = true;
+    }
+  }
+
+  const pickRow = (label, val, setVal, color, exclude) => (
+    <div style={{ flex: 1 }}>
+      <div style={{ fontSize: 8, color, letterSpacing: 1, marginBottom: 2 }}>{label}</div>
+      <select value={val?.id || ""} onChange={(e) => setVal(roster.find((a) => a.id === parseInt(e.target.value)) || null)}
+        style={{ width: "100%", padding: "5px", fontSize: 9, background: "#0d1117", color: "#c8d0da", border: "1px solid #21262d", borderRadius: 4, fontFamily: "inherit" }}>
+        <option value="">— select —</option>
+        {roster.filter((a) => !exclude || a.id !== exclude.id).map((a) => (
+          <option key={a.id} value={a.id}>{a.name} (Lv.{a.level || 1}{a.perk ? " " + (EDGE_SHORT[a.perk] || a.perk) : ""})</option>
+        ))}
+      </select>
+    </div>
+  );
+
+  return (
+    <div style={{ maxWidth: 1000, margin: "0 auto", padding: "0 12px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", margin: "8px 0" }}>
+        <button onClick={onBack} style={{ fontSize: 9, background: "none", border: "1px solid #21262d", color: "#8892a0", borderRadius: 3, padding: "3px 10px", cursor: "pointer", fontFamily: "inherit" }}>← BACK</button>
+        <div style={{ display: "flex", gap: 6 }}>
+          <button onClick={() => { setSubMode("match"); setTourney(null); }} style={{ fontSize: 9, fontWeight: 700, letterSpacing: 1, padding: "3px 12px", borderRadius: 3, cursor: "pointer", fontFamily: "inherit", background: subMode === "match" ? "#161b22" : "#0d1117", border: `1px solid ${subMode === "match" ? "#1abc9c" : "#21262d"}`, color: subMode === "match" ? "#1abc9c" : "#4a5568" }}>SINGLE MATCH</button>
+          <button onClick={() => { setSubMode("tournament"); reset(); }} style={{ fontSize: 9, fontWeight: 700, letterSpacing: 1, padding: "3px 12px", borderRadius: 3, cursor: "pointer", fontFamily: "inherit", background: subMode === "tournament" ? "#161b22" : "#0d1117", border: `1px solid ${subMode === "tournament" ? "#f39c12" : "#21262d"}`, color: subMode === "tournament" ? "#f39c12" : "#4a5568" }}>TOURNAMENT</button>
+        </div>
+      </div>
+      <h2 style={{ textAlign: "center", fontSize: 16, letterSpacing: 4, color: "#1abc9c", margin: "4px 0 12px" }}>TAG TEAM 2v2</h2>
+      {err && <div style={{ color: "#e74c3c", fontSize: 9, textAlign: "center", marginBottom: 6 }}>{err}</div>}
+
+      {/* TEAM SELECTION (shown when no active match/tourney) */}
+      {!boards && !tourney && (
+        <div style={{ background: "#0d1117", border: "1px solid #21262d", borderRadius: 8, padding: 14, maxWidth: 560, margin: "0 auto" }}>
+          <div style={{ fontSize: 9, color: "#8892a0", letterSpacing: 2, marginBottom: 8 }}>SELECT YOUR TEAM</div>
+          <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
+            {pickRow("AGENT A", agentA, setAgentA, AGENT_A_COLOR, agentB)}
+            {pickRow("AGENT B", agentB, setAgentB, AGENT_B_COLOR, agentA)}
+          </div>
+          {agentA && agentB && (
+            <div style={{ background: "#0a0c10", border: "1px solid #1a1f2b", borderRadius: 6, padding: 10, marginBottom: 10 }}>
+              <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 1, marginBottom: 4 }}>TEAM STATS</div>
+              <div style={{ fontSize: 11, color: "#1abc9c", fontWeight: 800 }}>Diversity: {Math.round(div.frac * 100)}% → {div.bonus}x bonus</div>
+              <div style={{ fontSize: 9, color: "#8892a0", marginTop: 2 }}>Combined Elo: {combinedElo}</div>
+              <div style={{ fontSize: 9, color: "#8892a0" }}>Edge combo: {edgeComboDesc(agentA.perk, agentB.perk)}</div>
+              {div.frac < 0.05 && <div style={{ fontSize: 8, color: "#e67e22", marginTop: 2 }}>⚠ near-clone pair — no diversity bonus</div>}
+            </div>
+          )}
+          {subMode === "match" && (
+            <>
+              <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                <button onClick={() => setOppMode("vsbot")} style={{ flex: 1, fontSize: 9, padding: "4px", borderRadius: 4, cursor: "pointer", fontFamily: "inherit", background: oppMode === "vsbot" ? "#161b22" : "#0d1117", border: `1px solid ${oppMode === "vsbot" ? "#1abc9c" : "#21262d"}`, color: oppMode === "vsbot" ? "#1abc9c" : "#4a5568" }}>VS BOT</button>
+                <button onClick={() => setOppMode("sandbox")} style={{ flex: 1, fontSize: 9, padding: "4px", borderRadius: 4, cursor: "pointer", fontFamily: "inherit", background: oppMode === "sandbox" ? "#161b22" : "#0d1117", border: `1px solid ${oppMode === "sandbox" ? "#1abc9c" : "#21262d"}`, color: oppMode === "sandbox" ? "#1abc9c" : "#4a5568" }}>SANDBOX</button>
+              </div>
+              {oppMode === "vsbot" ? (
+                <select value={coach} onChange={(e) => setCoach(e.target.value)} style={{ width: "100%", padding: "5px", fontSize: 9, background: "#0d1117", color: "#c8d0da", border: "1px solid #21262d", borderRadius: 4, fontFamily: "inherit", marginBottom: 8 }}>
+                  <option value="blitz">Coach Blitz (two aggressors)</option>
+                  <option value="fortress">The Fortress (two walls)</option>
+                  <option value="shark">The Shark (aggressive + trader)</option>
+                  <option value="professor">The Professor (high-diversity pair)</option>
+                  <option value="wildcard">Wildcard (random pair)</option>
+                  <option value="mirror">The Mirror (counters your pair)</option>
+                </select>
+              ) : (
+                <div style={{ display: "flex", gap: 10, marginBottom: 8 }}>
+                  {pickRow("OPP A", oppA, setOppA, "#ecf0f1", oppB)}
+                  {pickRow("OPP B", oppB, setOppB, "#ecf0f1", oppA)}
+                </div>
+              )}
+              <button disabled={!ready || loading} onClick={start} style={{ width: "100%", padding: "9px", borderRadius: 6, border: "none", background: ready ? "linear-gradient(135deg,#1abc9c,#16a085)" : "#1a1f2b", color: ready ? "#fff" : "#4a5568", fontWeight: 800, fontSize: 12, letterSpacing: 3, cursor: ready ? "pointer" : "default", fontFamily: "inherit" }}>{loading ? "..." : "TAG TEAM FIGHT"}</button>
+            </>
+          )}
+          {subMode === "tournament" && (
+            <>
+              <select value={coach} onChange={(e) => setCoach(e.target.value)} style={{ width: "100%", padding: "5px", fontSize: 9, background: "#0d1117", color: "#c8d0da", border: "1px solid #21262d", borderRadius: 4, fontFamily: "inherit", marginBottom: 8 }}>
+                <option value="mixed">Mixed coaches (3 different bot teams)</option>
+                <option value="blitz">All Coach Blitz teams</option>
+                <option value="professor">All Professor teams</option>
+                <option value="shark">All Shark teams</option>
+              </select>
+              <button disabled={!agentA || !agentB || agentA.id === agentB.id || loading} onClick={runTourney} style={{ width: "100%", padding: "9px", borderRadius: 6, border: "none", background: (agentA && agentB && agentA.id !== agentB.id) ? "linear-gradient(135deg,#f39c12,#e67e22)" : "#1a1f2b", color: (agentA && agentB && agentA.id !== agentB.id) ? "#fff" : "#4a5568", fontWeight: 800, fontSize: 12, letterSpacing: 3, cursor: "pointer", fontFamily: "inherit" }}>{loading ? "..." : "RUN 4-TEAM BRACKET"}</button>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* MATCH PLAYBACK */}
+      {boards && (
+        <div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr auto 1fr", gap: 12, alignItems: "start" }}>
+            <TeamPanel side="red" color="#e74c3c" team={result.red_team} dynamics={isFinished ? result.team_dynamics?.red : null} firedThisMove={firedThisMove.red} />
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
+              <BoardGrid board={board} lastMove={lastMove} maxWidth={360} redLevel={result.red_team?.agent_a?.level || 1} blackLevel={result.black_team?.agent_a?.level || 1} flashColor={flashColor} />
+              <div style={{ fontSize: 8, color: "#4a5568" }}>Move {step}/{maxRef.current} {result.winner && step >= maxRef.current ? `· ${result.winner.toUpperCase()} WINS` : ""}</div>
+              <input type="range" min={0} max={maxRef.current} value={step} onChange={scrub} style={{ width: "100%", accentColor: "#1abc9c" }} />
+              <div style={{ display: "flex", gap: 8 }}>
+                {playing ? <button onClick={pause} style={{ fontSize: 10, padding: "4px 14px", borderRadius: 4, border: "1px solid #e67e22", background: "transparent", color: "#e67e22", cursor: "pointer", fontFamily: "inherit" }}>❚❚ PAUSE</button>
+                  : <button onClick={resume} style={{ fontSize: 10, padding: "4px 14px", borderRadius: 4, border: "1px solid #2ecc71", background: "transparent", color: "#2ecc71", cursor: "pointer", fontFamily: "inherit" }}>▶ PLAY</button>}
+                <button onClick={jumpEnd} style={{ fontSize: 10, padding: "4px 14px", borderRadius: 4, border: "1px solid #21262d", background: "transparent", color: "#8892a0", cursor: "pointer", fontFamily: "inherit" }}>▶▶ END</button>
+                <button onClick={reset} style={{ fontSize: 10, padding: "4px 14px", borderRadius: 4, border: "1px solid #21262d", background: "transparent", color: "#8892a0", cursor: "pointer", fontFamily: "inherit" }}>NEW</button>
+              </div>
+            </div>
+            <TeamPanel side="black" color="#ecf0f1" team={result.black_team} dynamics={isFinished ? result.team_dynamics?.black : null} firedThisMove={firedThisMove.black} />
+          </div>
+          {/* influence indicator + dynamics bar for the team that just moved */}
+          <div style={{ maxWidth: 360, margin: "8px auto 0" }}>
+            <div style={{ fontSize: 7, color: "#4a5568", letterSpacing: 1, marginBottom: 2 }}>
+              {lastMove ? `MOVE ${step} INFLUENCE · ${lastMove.side.toUpperCase()} TEAM` : "INFLUENCE"}
+            </div>
+            <InfluenceIndicator inf={curInf}
+              nameA={(lastMove?.side === "black" ? result.black_team : result.red_team)?.agent_a?.name || "A"}
+              nameB={(lastMove?.side === "black" ? result.black_team : result.red_team)?.agent_b?.name || "B"} />
+            <div style={{ marginTop: 6 }}>
+              <div style={{ fontSize: 7, color: "#4a5568", marginBottom: 1 }}>TEAM DYNAMICS (your team, full match)</div>
+              <TeamDynamicsBar dyn={result.team_dynamics?.red} />
+            </div>
+          </div>
+          {/* post-match */}
+          {isFinished && (
+            <div style={{ maxWidth: 560, margin: "0 auto" }}>
+              {result.bet && <div style={{ textAlign: "center", fontSize: 11, fontWeight: 800, color: result.bet.result === "win" ? "#2ecc71" : "#e74c3c", marginTop: 6 }}>{result.bet.result === "win" ? `+${result.bet.payout}` : result.bet.net} coins</div>}
+              {result.prop_results && result.prop_results.length > 0 && (
+                <div style={{ width: "100%", padding: "4px 8px", background: "#0a0c10", border: "1px solid #1a1f2b", borderRadius: 4, fontSize: 8, marginTop: 4 }}>
+                  <div style={{ fontSize: 7, color: "#4a5568", letterSpacing: 1, marginBottom: 2 }}>SIDE ACTION</div>
+                  {result.prop_results.map((pr, i) => (
+                    <div key={i} style={{ display: "flex", justifyContent: "space-between", color: pr.result === "win" ? "#2ecc71" : "#e74c3c" }}>
+                      <span>{pr.result === "win" ? "✅" : "❌"} {pr.label}: {pr.selection}</span>
+                      <span style={{ color: "#6b7280" }}>{pr.detail}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {result.mirror_data && <div style={{ fontSize: 8, color: "#9b59b6", textAlign: "center", marginTop: 4 }}>🪞 {result.mirror_data.mirror_strategy} (read: {result.mirror_data.pair_read})</div>}
+              <TeamDynamicsBreakdown result={result} />
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* TOURNAMENT BRACKET */}
+      {tourney && (
+        <div style={{ maxWidth: 700, margin: "0 auto" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+            <div style={{ fontSize: 10, color: "#f39c12", letterSpacing: 2 }}>2v2 BRACKET</div>
+            <button onClick={() => setTourney(null)} style={{ fontSize: 8, background: "none", border: "1px solid #21262d", color: "#8892a0", borderRadius: 3, padding: "2px 8px", cursor: "pointer", fontFamily: "inherit" }}>NEW</button>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10 }}>
+            {tourney.bracket.map((t) => (
+              <div key={t.slot} style={{ padding: 8, borderRadius: 6, background: t.is_player ? "rgba(26,188,156,0.1)" : "#0d1117", border: `1px solid ${t.is_player ? "#1abc9c" : "#21262d"}` }}>
+                <div style={{ fontSize: 9, fontWeight: 700, color: t.is_player ? "#1abc9c" : "#c8d0da" }}>#{t.seed} {t.agent_a} + {t.agent_b}{t.is_player ? " (YOU)" : ""}</div>
+                <div style={{ fontSize: 7, color: "#6b7280" }}>{t.coach_name || "your team"} · diversity {t.diversity_pct}% ({t.diversity_bonus}x) · elo {t.team_elo}</div>
+              </div>
+            ))}
+          </div>
+          {tourney.rounds.map((rd) => (
+            <div key={rd.round} style={{ marginBottom: 8 }}>
+              <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 1, marginBottom: 3 }}>{rd.name}</div>
+              {rd.matches.map((m, i) => (
+                <div key={i} style={{ fontSize: 9, color: "#8892a0", padding: "3px 8px", background: "#0a0c10", borderRadius: 4, marginBottom: 3 }}>
+                  <span style={{ color: m.winner_name === m.red_name ? "#2ecc71" : "#8892a0" }}>{m.red_name}</span>
+                  <span style={{ color: "#4a5568" }}> vs </span>
+                  <span style={{ color: m.winner_name === m.black_name ? "#2ecc71" : "#8892a0" }}>{m.black_name}</span>
+                  <span style={{ color: "#6b7280", fontSize: 7 }}> · {m.game.winner} won in {m.game.move_count}</span>
+                </div>
+              ))}
+            </div>
+          ))}
+          <div style={{ textAlign: "center", fontSize: 12, fontWeight: 800, color: tourney.champion.is_player ? "#2ecc71" : "#f39c12", marginTop: 6 }}>
+            🏆 {tourney.champion.name}{tourney.champion.is_player ? " — YOU WIN!" : ""}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const [appMode, setAppMode] = useState("match");
   const [matchMode, setMatchMode] = useState("vsbot");
@@ -1524,6 +1901,9 @@ export default function App() {
   if (appMode === "multiplayer") {
     return <MultiplayerLobby roster={roster} onBack={() => { setAppMode("match"); loadRoster(); }} />;
   }
+  if (appMode === "tagteam") {
+    return <TagTeam roster={roster} onBack={() => { setAppMode("match"); loadRoster(); }} loadRoster={loadRoster} loadWallet={loadWallet} />;
+  }
 
   return (
     <div style={{ minHeight: "100vh", padding: "16px 12px" }}>
@@ -1553,6 +1933,7 @@ export default function App() {
           <button onClick={() => setAppMode("match")} style={{ padding: "4px 16px", fontSize: 9, fontWeight: 700, letterSpacing: 2, fontFamily: "inherit", cursor: "pointer", background: "#161b22", border: "1px solid #2ecc71", color: "#2ecc71", borderRadius: 3, textTransform: "uppercase" }}>MATCH</button>
           <button onClick={() => setAppMode("tournament")} style={{ padding: "4px 16px", fontSize: 9, fontWeight: 700, letterSpacing: 2, fontFamily: "inherit", cursor: "pointer", background: "#0d1117", border: "1px solid #f39c1266", color: "#f39c12", borderRadius: 3, textTransform: "uppercase" }}>TOURNAMENT</button>
           <button onClick={() => setAppMode("multiplayer")} style={{ padding: "4px 16px", fontSize: 9, fontWeight: 700, letterSpacing: 2, fontFamily: "inherit", cursor: "pointer", background: "#0d1117", border: "1px solid #9b59b666", color: "#9b59b6", borderRadius: 3, textTransform: "uppercase" }}>MULTIPLAYER</button>
+          <button onClick={() => setAppMode("tagteam")} style={{ padding: "4px 16px", fontSize: 9, fontWeight: 700, letterSpacing: 2, fontFamily: "inherit", cursor: "pointer", background: "#0d1117", border: "1px solid #1abc9c66", color: "#1abc9c", borderRadius: 3, textTransform: "uppercase" }}>TAG TEAM</button>
         </div>
       </div>
 

@@ -18,15 +18,19 @@ from engine import (
 )
 from ai import AgentConfig, pick_move, detect_phase, calc_overextension_factor, suggest_names, apply_perk_overrides, apply_progression_edges, EDGE_DEFINITIONS
 from auth import hash_password, verify_password, create_token, get_current_player_id, get_optional_player_id
-from coaches import COACHES, generate_bot_agent, get_coach_list
-from mirror import get_mirror_profile, get_mirror_history, generate_mirror_agent, record_mirror_bout
-from props import calculate_prop_odds, resolve_props
+from coaches import COACHES, generate_bot_agent, get_coach_list, generate_bot_team
+from mirror import get_mirror_profile, get_mirror_history, generate_mirror_agent, record_mirror_bout, generate_mirror_team
+from props import calculate_prop_odds, resolve_props, calculate_team_prop_odds
+from team import (
+    consensus_move, calculate_diversity_bonus, slider_diversity, team_elo,
+    aggregate_team_dynamics, resolve_team_props,
+)
 from ws import router as ws_router
 from matchmaking import online
 from crypto import crypto_service, micros_to_usdc, usdc_to_micros
 from privy_auth import privy_service
 from database import (
-    save_match, get_matches, get_match, get_leaderboard, get_agent_leaderboard,
+    save_match, save_team_match, get_matches, get_match, get_leaderboard, get_agent_leaderboard,
     get_elo, update_elo, update_elo_record,
     create_agent, get_agents, get_agent, update_agent, delete_agent, update_agent_after_match,
     save_tournament, get_tournaments, get_tournament,
@@ -127,6 +131,11 @@ class PropBetInput(BaseModel):
     amount: int = Field(ge=10)
 
 
+class TeamSpec(BaseModel):
+    agent_a_id: int
+    agent_b_id: int
+
+
 class SimulateRequest(BaseModel):
     red: Optional[AgentConfigSchema] = None
     black: Optional[AgentConfigSchema] = None
@@ -135,6 +144,10 @@ class SimulateRequest(BaseModel):
     bet: Optional[BetSchema] = None
     vs_bot: Optional[VsBotSchema] = None
     prop_bets: Optional[list[PropBetInput]] = None
+    # 2v2 tag team
+    mode: str = "1v1"
+    red_team: Optional[TeamSpec] = None
+    black_team: Optional[TeamSpec] = None
 
 
 class ParlayPrediction(BaseModel):
@@ -153,6 +166,14 @@ class TournamentRequest(BaseModel):
     bracket_size: int = Field(default=8, ge=4, le=8)
     seeding: str = "elo"
     champion_bet: Optional[ChampionBetSchema] = None
+    vs_bot: Optional[VsBotSchema] = None
+    parlay: Optional[ParlaySchema] = None
+
+
+class TeamTournamentRequest(BaseModel):
+    team: TeamSpec
+    bracket_size: int = Field(default=4, ge=4, le=4)  # 4 teams
+    seeding: str = "elo"
     vs_bot: Optional[VsBotSchema] = None
     parlay: Optional[ParlaySchema] = None
 
@@ -336,6 +357,183 @@ def _run_game(red_cfg: AgentConfig, black_cfg: AgentConfig,
         "moves": moves, "boards": boards, "events": events,
         "final_red": counts["red"], "final_black": counts["black"],
         "win_probability": win_prob,
+    }
+
+
+# --- 2v2 tag-team consensus game ---
+
+def _run_team_game(red_cfgs, black_cfgs, red_perks=(None, None), black_perks=(None, None),
+                   red_fam=(0.0, 0.0), black_fam=(0.0, 0.0),
+                   red_diversity_bonus=1.0, black_diversity_bonus=1.0,
+                   red_diversity_frac=0.0, black_diversity_frac=0.0) -> dict:
+    """Run a 2v2 match. Each side is two agents sharing one set of pieces; every move is
+    chosen by consensus (averaged eval). Both agents' perk state machines run independently
+    and are reported as separate events tagged with agent 'a'/'b'. Returns the standard game
+    dict plus influence_per_move and per-side team_dynamics."""
+    board = init_board()
+    turn = "black"
+    moves, boards, events, influence = [], [board_to_list(board)], [], []
+    move_count = 0
+    winner = None
+    king_idle = {}
+    current_phase = "opening"
+    events.append({"type": "phase_change", "move": 0, "phase": "opening"})
+
+    AG = ("a", "b")
+    cfgs = {"red": red_cfgs, "black": black_cfgs}
+    perks = {"red": red_perks, "black": black_perks}
+    fam = {"red": red_fam, "black": black_fam}
+    div_bonus = {"red": red_diversity_bonus, "black": black_diversity_bonus}
+    div_frac = {"red": red_diversity_frac, "black": black_diversity_frac}
+    perk_state = {s: {"a": _init_perk_state(perks[s][0]), "b": _init_perk_state(perks[s][1])} for s in ("red", "black")}
+    edge_of = {s: {"a": perks[s][0], "b": perks[s][1]} for s in ("red", "black")}
+    flux_state = {s: {"a": {}, "b": {}} for s in ("red", "black")}
+    prog_active = {s: {"a": False, "b": False} for s in ("red", "black")}
+    moves_since_capture = 0
+
+    while move_count < MAX_MOVES:
+        if move_count >= SHRINK_START and (move_count - SHRINK_START) % SHRINK_INTERVAL == 0:
+            board, killed = shrink_board(board, SHRINK_COUNT)
+            if killed:
+                events.append({"type": "shrink", "move": move_count, "killed": killed})
+                boards[-1] = board_to_list(board)
+                counts = count_pieces(board)
+                if counts["red"] == 0:
+                    winner = "black"; break
+                if counts["black"] == 0:
+                    winner = "red"; break
+
+        board, demoted = apply_king_fatigue(board, king_idle, KING_FATIGUE_LIMIT)
+        if demoted:
+            events.append({"type": "fatigue", "move": move_count, "demoted": demoted})
+            boards[-1] = board_to_list(board)
+            for key in demoted:
+                king_idle.pop(key, None)
+
+        counts = count_pieces(board)
+        new_phase = detect_phase(move_count, counts["red"], counts["black"])
+        if new_phase != current_phase:
+            current_phase = new_phase
+            events.append({"type": "phase_change", "move": move_count, "phase": new_phase})
+
+        # effective config per agent on the moving side (perk overrides + progression edges)
+        eff = {}
+        for ag, base in zip(AG, cfgs[turn]):
+            e = apply_perk_overrides(base, perk_state[turn][ag])
+            e, prog_on, prog_detail = apply_progression_edges(e, edge_of[turn][ag], board, turn, move_count, flux_state[turn][ag])
+            if prog_on and not prog_active[turn][ag]:
+                events.append({"type": "perk_activate", "move": move_count, "side": turn, "agent": ag,
+                               "perk": edge_of[turn][ag], "duration": 0, "detail": prog_detail})
+            elif not prog_on and prog_active[turn][ag]:
+                events.append({"type": "perk_deactivate", "move": move_count, "side": turn, "agent": ag, "perk": edge_of[turn][ag]})
+            prog_active[turn][ag] = prog_on
+            eff[ag] = e
+
+        chosen = consensus_move(board, turn, eff["a"], eff["b"], fam[turn][0], fam[turn][1],
+                                div_bonus[turn], div_frac[turn], phase=current_phase)
+        if chosen is None:
+            winner = "red" if turn == "black" else "black"; break
+        move = chosen["move"]
+        influence.append({"move": move_count, "side": turn, "score_a": chosen["score_a"],
+                          "score_b": chosen["score_b"], "dominant": chosen["dominant"], "agreement": chosen["agreement"]})
+
+        had_capture = len(move.captures) > 0
+        board = apply_move(board, move)
+        moves.append({"side": turn, **move.to_dict()})
+        boards.append(board_to_list(board))
+        move_count += 1
+        opp = "black" if turn == "red" else "red"
+
+        # decrement active perks for both moving-side agents
+        for ag in AG:
+            ps = perk_state[turn][ag]
+            if ps and ps["active_moves"] > 0:
+                ps["active_moves"] -= 1
+                if ps["active_moves"] == 0:
+                    events.append({"type": "perk_deactivate", "move": move_count, "side": turn, "agent": ag, "perk": ps["perk"]})
+        if had_capture:
+            # rope-a-dope: each defending-side agent with it activates independently
+            for ag in AG:
+                ps = perk_state[opp][ag]
+                if ps and ps["perk"] == "rope_a_dope":
+                    ps["active_moves"] = 3
+                    events.append({"type": "perk_activate", "move": move_count, "side": opp, "agent": ag, "perk": "rope_a_dope", "duration": 3})
+            # momentum: each attacking-side agent with it activates independently
+            for ag in AG:
+                ps = perk_state[turn][ag]
+                if ps and ps["perk"] == "momentum":
+                    ps["active_moves"] = 2
+                    events.append({"type": "perk_activate", "move": move_count, "side": turn, "agent": ag, "perk": "momentum", "duration": 2})
+            moves_since_capture = 0
+            for sk in ("red", "black"):
+                for ag in AG:
+                    sps = perk_state[sk][ag]
+                    if sps and sps["perk"] == "press" and sps["active_moves"] > 0:
+                        sps["active_moves"] = 0
+                        events.append({"type": "perk_deactivate", "move": move_count, "side": sk, "agent": ag, "perk": "press"})
+        else:
+            moves_since_capture += 1
+            if moves_since_capture >= 5:
+                for sk in ("red", "black"):
+                    for ag in AG:
+                        sps = perk_state[sk][ag]
+                        if sps and sps["perk"] == "press" and sps["active_moves"] == 0:
+                            sps["active_moves"] = 4
+                            events.append({"type": "perk_activate", "move": move_count, "side": sk, "agent": ag, "perk": "press", "duration": 4})
+
+        new_idle = {}
+        for r in range(8):
+            for c in range(8):
+                if is_king(board[r][c]):
+                    key = f"{r},{c}"
+                    if had_capture:
+                        dest = move.path[-1]
+                        new_idle[key] = 0 if (r == dest.row and c == dest.col) else king_idle.get(key, 0) + 1
+                    else:
+                        new_idle[key] = king_idle.get(key, 0) + 1
+        king_idle = new_idle
+
+        counts = count_pieces(board)
+        if counts["red"] == 0:
+            winner = "black"; break
+        if counts["black"] == 0:
+            winner = "red"; break
+        turn = "black" if turn == "red" else "red"
+
+    if winner is None:
+        winner = "draw"
+    counts = count_pieces(board)
+
+    win_prob = []
+    for b in boards:
+        c = count_pieces(board_to_list(b) if not isinstance(b[0], list) else b)
+        rm = (c["red"] - c["red_kings"]) + c["red_kings"] * 1.7
+        bm = (c["black"] - c["black_kings"]) + c["black_kings"] * 1.7
+        total_m = rm + bm
+        if total_m == 0:
+            win_prob.append(0.5)
+        else:
+            raw = rm / total_m
+            adj = 1 / (1 + ((1 - raw) / max(raw, 0.01)) ** 1.8)
+            win_prob.append(round(max(0.05, min(0.95, adj)), 3))
+    if winner == "red":
+        win_prob[-1] = 1.0
+    elif winner == "black":
+        win_prob[-1] = 0.0
+
+    def _edge_counts(side):
+        return {ag: sum(1 for e in events if e.get("type") == "perk_activate"
+                        and e.get("side") == side and e.get("agent") == ag) for ag in AG}
+    red_dyn = aggregate_team_dynamics([x for x in influence if x["side"] == "red"], _edge_counts("red"))
+    black_dyn = aggregate_team_dynamics([x for x in influence if x["side"] == "black"], _edge_counts("black"))
+
+    return {
+        "winner": winner, "move_count": move_count,
+        "moves": moves, "boards": boards, "events": events,
+        "final_red": counts["red"], "final_black": counts["black"],
+        "win_probability": win_prob,
+        "influence_per_move": influence,
+        "team_dynamics": {"red": red_dyn, "black": black_dyn},
     }
 
 
@@ -941,8 +1139,222 @@ def api_set_perk(agent_id: int, body: dict):
     return result
 
 
+_TEAM_SLIDERS = ("aggression", "risk_tolerance", "king_priority", "edge_affinity", "trade_down")
+
+
+def _resolve_team(team_spec: "TeamSpec", label: str):
+    a = get_agent(team_spec.agent_a_id)
+    b = get_agent(team_spec.agent_b_id)
+    if not a:
+        raise HTTPException(400, f"{label} agent A not found")
+    if not b:
+        raise HTTPException(400, f"{label} agent B not found")
+    return a, b
+
+
+def _agent_cfg(agent: dict) -> AgentConfig:
+    return AgentConfig(**{k: agent[k] for k in _TEAM_SLIDERS})
+
+
+def _team_summary(agent_a, agent_b, div_bonus, div_frac, elo_after=None):
+    """Build a team payload for the response. elo_after = (a_after, b_after) or None."""
+    def one(agent, after):
+        d = {k: agent[k] for k in _TEAM_SLIDERS}
+        d.update({"id": agent.get("id"), "name": agent["name"], "perk": agent.get("perk"),
+                  "level": agent.get("level", 1), "elo": round(agent["elo"], 1)})
+        if after is not None:
+            d["elo_after"] = round(after, 1)
+        return d
+    return {
+        "agent_a": one(agent_a, elo_after[0] if elo_after else None),
+        "agent_b": one(agent_b, elo_after[1] if elo_after else None),
+        "diversity_bonus": div_bonus,
+        "diversity_pct": round(div_frac * 100),
+    }
+
+
+def _simulate_team_game(req: SimulateRequest):
+    if not req.red_team:
+        raise HTTPException(400, "2v2 requires red_team {agent_a_id, agent_b_id}")
+    red_a, red_b = _resolve_team(req.red_team, "red")
+    red_a_cfg, red_b_cfg = _agent_cfg(red_a), _agent_cfg(red_b)
+    red_div = calculate_diversity_bonus(red_a_cfg, red_b_cfg, red_a.get("perk"), red_b.get("perk"))
+    red_frac = slider_diversity(red_a_cfg, red_b_cfg)
+
+    competitive = False
+    is_mirror = False
+    mirror_meta = None
+    bot_coach_id = None
+
+    # resolve the opponent team: VS BOT (coach generates a pair) or sandbox (explicit ids)
+    if req.vs_bot:
+        coach_id = req.vs_bot.coach_id
+        if coach_id == "random":
+            coach_id = random.choice(list(COACHES.keys()))
+        bot_coach_id = coach_id
+        red_team_elo = team_elo(red_a["elo"], red_b["elo"], red_div)
+        if coach_id == "mirror":
+            is_mirror = True
+            mt = generate_mirror_team(red_a_cfg.to_dict(), red_b_cfg.to_dict(),
+                                      red_a.get("perk"), red_b.get("perk"))
+            black_a = {**mt["agent_a"]["config"], "id": None, "name": mt["agent_a"]["name"],
+                       "perk": mt["agent_a"]["edge"], "level": 5, "elo": red_team_elo + random.randint(-30, 30),
+                       "coach_id": "mirror", "coach_name": "The Mirror"}
+            black_b = {**mt["agent_b"]["config"], "id": None, "name": mt["agent_b"]["name"],
+                       "perk": mt["agent_b"]["edge"], "level": 5, "elo": red_team_elo + random.randint(-30, 30),
+                       "coach_id": "mirror", "coach_name": "The Mirror"}
+            mirror_meta = {"adaptation_level": mt["adaptation_level"], "pair_read": mt["pair_read"],
+                           "mirror_strategy": mt["strategy_description"], "bout_number": mt["bout_number"]}
+        else:
+            coach = COACHES.get(coach_id)
+            if not coach:
+                raise HTTPException(400, f"unknown coach: {coach_id}")
+            black_a, black_b = generate_bot_team(coach, red_team_elo, used_names={red_a["name"], red_b["name"]})
+        competitive = (coach_id == "mirror") or (COACHES.get(coach_id) is not None and COACHES[coach_id].difficulty in ("medium", "hard"))
+    elif req.black_team:
+        black_a, black_b = _resolve_team(req.black_team, "black")
+    else:
+        raise HTTPException(400, "2v2 requires vs_bot or black_team")
+
+    black_a_cfg, black_b_cfg = _agent_cfg(black_a), _agent_cfg(black_b)
+    black_div = calculate_diversity_bonus(black_a_cfg, black_b_cfg, black_a.get("perk"), black_b.get("perk"))
+    black_frac = slider_diversity(black_a_cfg, black_b_cfg)
+
+    # matchup familiarity (competitive VS BOT only): each red agent vs the opponent team's type
+    red_fam = (0.0, 0.0)
+    opp_type = None
+    if competitive:
+        avg_black = {k: (black_a_cfg.to_dict()[k] + black_b_cfg.to_dict()[k]) // 2 for k in _TEAM_SLIDERS}
+        opp_type = categorize_opponent(avg_black)
+        red_fam = (get_familiarity_score(red_a["id"], opp_type), get_familiarity_score(red_b["id"], opp_type))
+
+    red_te_before = team_elo(red_a["elo"], red_b["elo"], red_div)
+    black_te_before = team_elo(black_a["elo"], black_b["elo"], black_div)
+
+    game = _run_team_game(
+        (red_a_cfg, red_b_cfg), (black_a_cfg, black_b_cfg),
+        red_perks=(red_a.get("perk"), red_b.get("perk")), black_perks=(black_a.get("perk"), black_b.get("perk")),
+        red_fam=red_fam, black_fam=(0.0, 0.0),
+        red_diversity_bonus=red_div, black_diversity_bonus=black_div,
+        red_diversity_frac=red_frac, black_diversity_frac=black_frac,
+    )
+    winner = game["winner"]
+    result_red = 1.0 if winner == "red" else (0.0 if winner == "black" else 0.5)
+    red_result = "win" if winner == "red" else ("loss" if winner == "black" else "draw")
+    black_result = "win" if winner == "black" else ("loss" if winner == "red" else "draw")
+
+    # team elo update: apply the team-vs-team delta to BOTH agents on each side
+    new_red_te, new_black_te = update_elo(red_te_before, black_te_before, result_red)
+    red_delta = new_red_te - red_te_before
+    black_delta = new_black_te - black_te_before
+
+    level_ups = []
+    red_after = (red_a["elo"] + red_delta, red_b["elo"] + red_delta)
+    black_after = (black_a["elo"] + black_delta, black_b["elo"] + black_delta)
+    for agent, new_elo in ((red_a, red_after[0]), (red_b, red_after[1])):
+        lu = update_agent_after_match(agent["id"], new_elo, red_result)
+        if lu:
+            level_ups.append(lu)
+    for agent, new_elo in ((black_a, black_after[0]), (black_b, black_after[1])):
+        if agent.get("id"):  # sandbox opponent agents are real; bot agents are not
+            lu = update_agent_after_match(agent["id"], new_elo, black_result)
+            if lu:
+                level_ups.append(lu)
+
+    match_id = save_match(
+        red_config=red_a_cfg.to_dict(), black_config=black_a_cfg.to_dict(),
+        winner=winner, move_count=game["move_count"], final_red=game["final_red"], final_black=game["final_black"],
+        moves=game["moves"], shrink_events=game["events"],
+        red_elo_before=red_te_before, red_elo_after=new_red_te,
+        black_elo_before=black_te_before, black_elo_after=new_black_te,
+        red_agent_id=red_a.get("id"), black_agent_id=black_a.get("id"),
+    )
+    save_team_match(match_id, (red_a.get("id"), red_b.get("id")), (black_a.get("id"), black_b.get("id")),
+                    red_div, black_div, game["team_dynamics"]["red"], game["team_dynamics"]["black"])
+
+    # progression: evolution + familiarity for red agents (competitive only)
+    if competitive:
+        for agent in (red_a, red_b):
+            process_agent_evolution(agent["id"], red_result)
+            if opp_type:
+                update_familiarity(agent["id"], opp_type, won=(red_result == "win"))
+            fresh = get_agent(agent["id"])
+            if fresh and fresh["matches"] > 0 and fresh["matches"] % 50 == 0:
+                decay_familiarity(agent["id"])
+
+    resp = {
+        "mode": "2v2", "match_id": match_id, **game,
+        "red_team": _team_summary(red_a, red_b, red_div, red_frac, red_after),
+        "black_team": _team_summary(black_a, black_b, black_div, black_frac, black_after),
+        "elo": {"red_before": red_te_before, "red_after": new_red_te,
+                "black_before": black_te_before, "black_after": new_black_te},
+    }
+    if level_ups:
+        resp["level_ups"] = level_ups
+    if is_mirror:
+        resp["mirror_data"] = mirror_meta
+    if bot_coach_id:
+        resp["bot_coach_id"] = bot_coach_id
+
+    # main bet (team odds + streak), same flow as 1v1
+    bet_result = None
+    if req.bet:
+        if req.bet.side not in ("red", "black", "draw"):
+            raise HTTPException(400, "bet side must be red, black, or draw")
+        odds = calculate_match_odds(red_te_before, black_te_before)
+        side_odds = odds[req.bet.side]
+        try:
+            bet_info = place_bet("match", req.bet.side, req.bet.amount, side_odds, match_id=match_id)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        won = winner == req.bet.side
+        w = get_wallet()
+        streak_mult = get_streak_multiplier(w["win_streak"])
+        effective_odds = round(side_odds * streak_mult, 2)
+        payout = int(req.bet.amount * effective_odds) if won else 0
+        settle_result = settle_bet(bet_info["bet_id"], "win" if won else "loss", payout)
+        add_to_jackpot(req.bet.amount)
+        streak_info = increment_streak() if won else reset_streak()
+        bet_result = {"side": req.bet.side, "amount": req.bet.amount, "odds": side_odds,
+                      "streak_mult": streak_mult, "effective_odds": effective_odds,
+                      "result": "win" if won else "loss", "payout": payout,
+                      "net": payout - req.bet.amount if won else -req.bet.amount,
+                      "balance_after": settle_result["balance"], "streak": streak_info}
+    resp["bet"] = bet_result
+
+    # 2v2-specific props (alpha dog / team clash / double edge)
+    if req.prop_bets:
+        if len(req.prop_bets) > 4:
+            raise HTTPException(400, "maximum 4 prop bets per match")
+        all_props = calculate_team_prop_odds(red_a_cfg.to_dict(), red_b_cfg.to_dict(),
+                                              red_a.get("perk"), red_b.get("perk"), red_frac)
+        prop_inputs = []
+        for pb in req.prop_bets:
+            prop_def = next((p for p in all_props if p["type"] == pb.type), None)
+            if not prop_def:
+                continue
+            opt = next((o for o in prop_def.get("options", []) if o["selection"] == pb.selection), None)
+            if not opt:
+                continue
+            try:
+                place_bet("prop", f"{pb.type}:{pb.selection}", pb.amount, opt["odds"], match_id=match_id)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            add_to_jackpot(pb.amount)
+            prop_inputs.append({"type": pb.type, "selection": pb.selection, "amount": pb.amount, "odds": opt["odds"]})
+        prop_results = resolve_team_props(prop_inputs, winner, game["team_dynamics"])
+        for pr in prop_results:
+            if pr["result"] == "win":
+                settle_bet(0, "win", pr["payout"])
+        resp["prop_results"] = prop_results
+
+    return resp
+
+
 @app.post("/api/game/simulate")
 def simulate_game(req: SimulateRequest):
+    if req.mode == "2v2":
+        return _simulate_team_game(req)
     bot_opponent = None
 
     is_mirror = False
@@ -1505,6 +1917,106 @@ def api_create_tournament(req: TournamentRequest):
         }
 
     return resp
+
+
+@app.post("/api/tournaments/team")
+def api_create_team_tournament(req: TeamTournamentRequest):
+    """2v2 single-elimination bracket: the player's team + 3 bot teams (4 total)."""
+    pa = get_agent(req.team.agent_a_id)
+    pb = get_agent(req.team.agent_b_id)
+    if not pa or not pb:
+        raise HTTPException(400, "team agents not found")
+
+    def make_team(a, b, is_player, coach_name=None):
+        ca, cb = _agent_cfg(a), _agent_cfg(b)
+        frac = slider_diversity(ca, cb)
+        bonus = calculate_diversity_bonus(ca, cb, a.get("perk"), b.get("perk"))
+        return {
+            "name": f"{a['name']} + {b['name']}", "agent_a": a, "agent_b": b,
+            "cfg_a": ca, "cfg_b": cb, "perk_a": a.get("perk"), "perk_b": b.get("perk"),
+            "diversity_bonus": bonus, "diversity_pct": round(frac * 100), "diversity_frac": frac,
+            "team_elo": team_elo(a["elo"], b["elo"], bonus),
+            "is_player": is_player, "coach_name": coach_name,
+        }
+
+    teams = [make_team(pa, pb, True)]
+    used_names = {pa["name"], pb["name"]}
+    player_team_elo = teams[0]["team_elo"]
+
+    coach_id = req.vs_bot.coach_id if req.vs_bot else "mixed"
+    coach_ids = list(COACHES.keys())
+    for i in range(3):
+        cid = random.choice(coach_ids) if coach_id in ("mixed", "random") else coach_id
+        coach = COACHES.get(cid) or COACHES["wildcard"]
+        ba, bb = generate_bot_team(coach, player_team_elo, used_names=used_names)
+        teams.append(make_team(ba, bb, False, coach.name))
+
+    # seed by team elo
+    if req.seeding == "elo":
+        teams.sort(key=lambda t: t["team_elo"], reverse=True)
+    else:
+        random.shuffle(teams)
+    for i, t in enumerate(teams):
+        t["seed"] = i + 1
+
+    slot_order = [0, 3, 1, 2]
+    round_names = ["Semifinals", "Final"]
+    bracket = [None] * 4
+    for slot, seed_idx in enumerate(slot_order):
+        bracket[slot] = teams[seed_idx]
+    elo_snapshot = {t["name"]: t["team_elo"] for t in bracket}
+
+    rounds_output = []
+    current = list(range(4))
+    for round_idx, rname in enumerate(round_names):
+        num_matches = (4 // 2) // (2 ** round_idx)
+        round_matches = []
+        next_winners = []
+        for mi in range(num_matches):
+            r_slot, b_slot = current[mi * 2], current[mi * 2 + 1]
+            red_t, black_t = bracket[r_slot], bracket[b_slot]
+            game = _run_team_game(
+                (red_t["cfg_a"], red_t["cfg_b"]), (black_t["cfg_a"], black_t["cfg_b"]),
+                red_perks=(red_t["perk_a"], red_t["perk_b"]), black_perks=(black_t["perk_a"], black_t["perk_b"]),
+                red_diversity_bonus=red_t["diversity_bonus"], black_diversity_bonus=black_t["diversity_bonus"],
+                red_diversity_frac=red_t["diversity_frac"], black_diversity_frac=black_t["diversity_frac"],
+            )
+            re_before, be_before = elo_snapshot[red_t["name"]], elo_snapshot[black_t["name"]]
+            result_red = 1.0 if game["winner"] == "red" else (0.0 if game["winner"] == "black" else 0.5)
+            new_re, new_be = update_elo(re_before, be_before, result_red)
+            elo_snapshot[red_t["name"]], elo_snapshot[black_t["name"]] = new_re, new_be
+            red_word = "win" if game["winner"] == "red" else ("loss" if game["winner"] == "black" else "draw")
+            black_word = "win" if game["winner"] == "black" else ("loss" if game["winner"] == "red" else "draw")
+            for t, delta, res_word in ((red_t, new_re - re_before, red_word), (black_t, new_be - be_before, black_word)):
+                if t["is_player"]:
+                    for ag in (t["agent_a"], t["agent_b"]):
+                        update_agent_after_match(ag["id"], ag["elo"] + delta, res_word)
+            winner_slot = r_slot if game["winner"] == "red" else b_slot
+            next_winners.append(winner_slot)
+            round_matches.append({
+                "match_index": mi, "red_slot": r_slot, "black_slot": b_slot, "winner_slot": winner_slot,
+                "red_name": red_t["name"], "black_name": black_t["name"],
+                "winner_name": bracket[winner_slot]["name"], "round_name": rname,
+                "red_diversity": red_t["diversity_bonus"], "black_diversity": black_t["diversity_bonus"],
+                "game": game, "team_dynamics": game["team_dynamics"],
+            })
+        rounds_output.append({"round": round_idx + 1, "name": rname, "matches": round_matches})
+        current = next_winners
+
+    champion = bracket[current[0]]
+    bracket_display = [{
+        "slot": i, "seed": t["seed"], "name": t["name"],
+        "agent_a": t["agent_a"]["name"], "agent_b": t["agent_b"]["name"],
+        "diversity_pct": t["diversity_pct"], "diversity_bonus": t["diversity_bonus"],
+        "team_elo": round(t["team_elo"], 1), "is_player": t["is_player"], "coach_name": t["coach_name"],
+    } for i, t in enumerate(bracket)]
+
+    return {
+        "mode": "2v2", "bracket_size": 4, "rounds": rounds_output,
+        "bracket": bracket_display, "champion_slot": current[0],
+        "champion": {"name": champion["name"], "is_player": champion["is_player"],
+                     "diversity_bonus": champion["diversity_bonus"]},
+    }
 
 
 @app.post("/api/bets/tournament-settle")

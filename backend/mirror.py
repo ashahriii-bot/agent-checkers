@@ -229,6 +229,66 @@ def generate_mirror_agent(player_config: dict, player_edge: str | None = None) -
     }
 
 
+_MIRROR_SLIDERS = ["aggression", "risk_tolerance", "king_priority", "edge_affinity", "trade_down"]
+
+
+def _counter_edge(edge: str | None) -> str:
+    return {"rope_a_dope": "press", "press": "momentum", "momentum": "rope_a_dope"}.get(
+        edge) or random.choice(["rope_a_dope", "press", "momentum"])
+
+
+def _agent_label(cfg: dict) -> str:
+    agg = cfg.get("aggression", 50)
+    if agg > 65:
+        return "aggressive"
+    if agg < 35:
+        return "defensive"
+    if cfg.get("trade_down", 50) > 65:
+        return "trading"
+    return "balanced"
+
+
+def _pair_archetype(a: dict, b: dict) -> str:
+    return f"{_agent_label(a)} + {_agent_label(b)}"
+
+
+def generate_mirror_team(team_a: dict, team_b: dict,
+                         edge_a: str | None = None, edge_b: str | None = None) -> dict:
+    """Generate a counter-PAIR tailored to the player's specific 2v2 team composition.
+
+    The Mirror reads the presented pairing (its archetype + each agent's config) and
+    builds two agents that each counter one of the player's agents, calibrated to the
+    same target win rate as the 1v1 Mirror. This is deeper adaptation: it exploits the
+    team dynamic, not just an individual agent.
+    """
+    profile = _compute_player_profile()
+    total = profile["total_bouts"]
+    win_rate = profile["mirror_win_rate"]
+    if total < 5:
+        noise = 25
+    elif win_rate > TARGET_WIN_RATE + TOLERANCE:
+        noise = 20
+    elif win_rate < TARGET_WIN_RATE - TOLERANCE:
+        noise = 5
+    else:
+        noise = 12
+
+    def counter(target: dict) -> dict:
+        return {s: _clamp(100 - target.get(s, 50) + random.randint(-noise, noise)) for s in _MIRROR_SLIDERS}
+
+    names = random.sample(MIRROR_NAMES, 2)
+    pair_arch = _pair_archetype(team_a, team_b)
+    adaptation = min(100, (total or 0) * 2)
+    return {
+        "agent_a": {"name": f"Mirror's {names[0]}", "config": counter(team_a), "edge": _counter_edge(edge_a)},
+        "agent_b": {"name": f"Mirror's {names[1]}", "config": counter(team_b), "edge": _counter_edge(edge_b)},
+        "adaptation_level": adaptation,
+        "pair_read": pair_arch,
+        "strategy_description": f"Built a counter-pair to exploit your {pair_arch} duo",
+        "bout_number": (total or 0) + 1,
+    }
+
+
 def _describe_tendencies(profile: dict) -> str:
     parts = []
     avg = profile["avg_config"]
