@@ -380,18 +380,30 @@ async def _run_multiplayer_match_inner(red: QueueEntry, black: QueueEntry):
         (black, "black", black_agent, red_agent, black.agent_elo, black_elo_after),
     ]:
         won = game["winner"] == side
+        is_blocked_draw = game.get("draw_reason") == "blocked"
         bet_result = None
         if entry.mode == "free" and entry.bet_amount > 0:
             side_odds = odds[side]
-            payout = int(entry.bet_amount * side_odds) if won else 0
-            net = payout - entry.bet_amount if won else -entry.bet_amount
+            if is_blocked_draw:
+                payout = entry.bet_amount  # refund
+                net = 0
+                bet_outcome = "push"
+            elif won:
+                payout = int(entry.bet_amount * side_odds)
+                net = payout - entry.bet_amount
+                bet_outcome = "win"
+            else:
+                payout = 0
+                net = -entry.bet_amount
+                bet_outcome = "loss"
             update_player_coins(entry.player_id, net)
-            bet_result = {"result": "win" if won else "loss", "amount": entry.bet_amount,
+            bet_result = {"result": bet_outcome, "amount": entry.bet_amount,
                           "odds": side_odds, "payout": payout, "net": net}
 
         result_msg = {
             "type": "match_result",
             "winner": game["winner"],
+            "draw_reason": game.get("draw_reason"),
             "your_side": side,
             "boards": game["boards"],
             "moves": game["moves"],

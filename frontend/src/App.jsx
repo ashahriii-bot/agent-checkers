@@ -337,8 +337,10 @@ function MatchTheater({ game, red, black, viewerSide, onFinish }) {
   const winnerName = game.winner === "red" ? (red?.name || "RED") : game.winner === "black" ? (black?.name || "BLACK") : null;
 
   const momentAt = (s, isLast) => {
-    if (isLast) return { kind: "end", big: true, color: "#ffd700", holdMs: 2000,
-      label: (game.winner === "draw" || !winnerName) ? "DRAW" : `${winnerName} WINS!`,
+    if (isLast) return { kind: "end", big: true, color: game.winner === "draw" ? "#f39c12" : "#ffd700", holdMs: 2000,
+      label: (game.winner === "draw" || !winnerName)
+        ? (game.draw_reason === "blocked" ? "BLOCKED — DRAW" : "DRAW")
+        : `${winnerName} WINS!`,
       sound: () => (viewerSide && game.winner !== viewerSide && game.winner !== "draw") ? gameAudio.playLose() : gameAudio.playWin() };
     return detectMoment(s, boards, moves, winProbs, events);
   };
@@ -1469,15 +1471,19 @@ function MultiplayerLobby({ roster, onBack }) {
   // match result screen — only AFTER the playback has finished
   if (matchResult && playbackDone) {
     const won = matchResult.winner === matchResult.your_side;
+    const isDraw = matchResult.winner === "draw";
     const opp = matchResult.opponent_reveal;
     return (
       <div style={{ maxWidth: 500, margin: "20px auto", padding: "16px" }}>
-        <h2 style={{ fontSize: 16, fontWeight: 800, letterSpacing: 4, color: won ? "#2ecc71" : "#e74c3c", textTransform: "uppercase", textAlign: "center", marginBottom: 8 }}>
-          {won ? "YOU WIN" : "YOU LOSE"}
+        <h2 style={{ fontSize: 16, fontWeight: 800, letterSpacing: 4, color: isDraw ? "#f39c12" : won ? "#2ecc71" : "#e74c3c", textTransform: "uppercase", textAlign: "center", marginBottom: 8 }}>
+          {isDraw ? (matchResult.draw_reason === "blocked" ? "BLOCKED — DRAW" : "DRAW") : won ? "YOU WIN" : "YOU LOSE"}
         </h2>
+        {isDraw && matchResult.draw_reason === "blocked" && (
+          <div style={{ textAlign: "center", fontSize: 9, color: "#f39c12", marginBottom: 6 }}>Board shrink trapped the leading side — no legal moves</div>
+        )}
         {matchResult.bet_result && (
-          <div style={{ textAlign: "center", fontSize: 16, fontWeight: 800, color: matchResult.bet_result.result === "win" ? "#2ecc71" : "#e74c3c", marginBottom: 8 }}>
-            {matchResult.bet_result.result === "win" ? `+${matchResult.bet_result.payout}` : `${matchResult.bet_result.net}`} coins
+          <div style={{ textAlign: "center", fontSize: 16, fontWeight: 800, color: matchResult.bet_result.result === "win" ? "#2ecc71" : matchResult.bet_result.result === "push" ? "#f39c12" : "#e74c3c", marginBottom: 8 }}>
+            {matchResult.bet_result.result === "push" ? "REFUNDED" : matchResult.bet_result.result === "win" ? `+${matchResult.bet_result.payout}` : `${matchResult.bet_result.net}`} coins
           </div>
         )}
         {matchResult.real_result && (
@@ -1827,7 +1833,7 @@ function MatchPlayback({ game, redTeam, blackTeam, autoPlay = true, onFinish, co
             <BoardGrid board={board} lastMove={lastMove} maxWidth={compact ? 320 : 360} redLevel={redTeam?.agent_a?.level || 1} blackLevel={blackTeam?.agent_a?.level || 1} flashColor={flashColor} />
             <MomentBanner moment={moment} />
           </div>
-          <div style={{ fontSize: 8, color: "#4a5568" }}>Move {step}/{maxStep}{isFinished && game.winner ? ` · ${game.winner.toUpperCase()} WINS` : ""}</div>
+          <div style={{ fontSize: 8, color: "#4a5568" }}>Move {step}/{maxStep}{isFinished && game.winner ? ` · ${game.winner === "draw" ? (game.draw_reason === "blocked" ? "BLOCKED — DRAW" : "DRAW") : `${game.winner.toUpperCase()} WINS`}` : ""}</div>
           <input type="range" min={0} max={maxStep} value={step} onChange={scrub} style={{ width: "100%", accentColor: "#1abc9c" }} />
           <div style={{ display: "flex", gap: 8 }}>
             {playing ? <button onClick={pause} style={{ fontSize: 10, padding: "4px 14px", borderRadius: 4, border: "1px solid #e67e22", background: "transparent", color: "#e67e22", cursor: "pointer", fontFamily: "inherit" }}>❚❚ PAUSE</button>
@@ -2313,8 +2319,10 @@ export default function App() {
   // amplified "moment" for this step (multi-capture / promotion / edge / shift / match-end)
   const inlineMoment = boards ? momentsRef.current[currentStep] : null;
   const inlineEndMoment = (boards && result && currentStep > 0 && currentStep >= boards.length - 1)
-    ? { kind: "end", big: true, color: "#ffd700",
-        label: result.winner === "draw" ? "DRAW" : `${result.winner === "red" ? (redAgent?.name || "RED") : (result.bot_opponent?.name || blackAgent?.name || "BLACK")} WINS!` }
+    ? { kind: "end", big: true, color: result.winner === "draw" ? "#f39c12" : "#ffd700",
+        label: result.winner === "draw"
+          ? (result.draw_reason === "blocked" ? "BLOCKED — DRAW" : "DRAW")
+          : `${result.winner === "red" ? (redAgent?.name || "RED") : (result.bot_opponent?.name || blackAgent?.name || "BLACK")} WINS!` }
     : null;
   const shownMoment = inlineEndMoment || inlineMoment || null;
   const activePerkStates = (() => {
@@ -2439,7 +2447,7 @@ export default function App() {
           <div style={{ position: "relative", width: "100%", maxWidth: 380 }}>
             {/* win probability meter - inside stable container */}
             {boards && result?.win_probability && (() => {
-              const wp = result.win_probability[currentStep] || 0.5;
+              const wp = result.win_probability[currentStep] ?? 0.5;
               const redPct = Math.round(wp * 100);
               const blackPct = 100 - redPct;
               return (
@@ -2591,13 +2599,18 @@ export default function App() {
             {boards && playing && <button onClick={pause} style={{ padding: "7px 18px", borderRadius: 6, border: "1px solid #e67e22", background: "transparent", color: "#e67e22", fontWeight: 700, fontSize: 10, letterSpacing: 2, textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit" }}>PAUSE</button>}
             {boards && !playing && !isFinished && <button onClick={resume} style={{ padding: "7px 18px", borderRadius: 6, border: "1px solid #2ecc71", background: "transparent", color: "#2ecc71", fontWeight: 700, fontSize: 10, letterSpacing: 2, textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit" }}>RESUME</button>}
             {isFinished && result?.bet && (
-              <div style={{ padding: "6px 16px", borderRadius: 6, textAlign: "center", background: result.bet.result === "win" ? "rgba(46,204,113,0.1)" : "rgba(231,76,60,0.1)", border: `1px solid ${result.bet.result === "win" ? "rgba(46,204,113,0.3)" : "rgba(231,76,60,0.3)"}` }}>
-                <div style={{ fontSize: 18, fontWeight: 800, color: result.bet.result === "win" ? "#2ecc71" : "#e74c3c" }}>
-                  {result.bet.result === "win" ? `+${result.bet.payout}` : `${result.bet.net}`}
+              <div style={{ padding: "6px 16px", borderRadius: 6, textAlign: "center",
+                background: result.bet.result === "win" ? "rgba(46,204,113,0.1)" : result.bet.result === "push" ? "rgba(243,156,18,0.1)" : "rgba(231,76,60,0.1)",
+                border: `1px solid ${result.bet.result === "win" ? "rgba(46,204,113,0.3)" : result.bet.result === "push" ? "rgba(243,156,18,0.3)" : "rgba(231,76,60,0.3)"}` }}>
+                <div style={{ fontSize: 18, fontWeight: 800, color: result.bet.result === "win" ? "#2ecc71" : result.bet.result === "push" ? "#f39c12" : "#e74c3c" }}>
+                  {result.bet.result === "win" ? `+${result.bet.payout}` : result.bet.result === "push" ? "REFUNDED" : `${result.bet.net}`}
                 </div>
-                <div style={{ fontSize: 9, color: "#8892a0" }}>{result.bet.amount} bet on {result.bet.side.toUpperCase()} at {result.bet.odds}x</div>
+                <div style={{ fontSize: 9, color: "#8892a0" }}>
+                  {result.bet.amount} bet on {result.bet.side.toUpperCase()} at {result.bet.odds}x
+                  {result.bet.result === "push" && " — board shrink forced a draw"}
+                </div>
                 {result.bet.bankrupt && <div style={{ fontSize: 9, color: "#ffd700", marginTop: 2 }}>Bankrupt! Here's 500 coins to get back in the game.</div>}
-                {result.bet.streak && <div style={{ fontSize: 8, color: "#e67e22", marginTop: 2 }}>{result.bet.result === "win" ? `🔥 HOT STREAK: ${result.bet.streak.streak}` : "HOT STREAK broken"}</div>}
+                {result.bet.streak && result.bet.result !== "push" && <div style={{ fontSize: 8, color: "#e67e22", marginTop: 2 }}>{result.bet.result === "win" ? `🔥 HOT STREAK: ${result.bet.streak.streak}` : "HOT STREAK broken"}</div>}
               </div>
             )}
             {/* near-miss for lost bets */}
@@ -2624,7 +2637,16 @@ export default function App() {
             })()}
             {isFinished && (
               <>
-                <span style={{ fontSize: 14, fontWeight: 800, letterSpacing: 2, textTransform: "uppercase", color: result.winner === "red" ? "#e74c3c" : result.winner === "black" ? "#ecf0f1" : "#f39c12" }}>{result.winner === "draw" ? "DRAW" : `${result.winner === "red" ? (result.red_agent?.name || "RED") : (result.black_agent?.name || result.bot_opponent?.name || "BLACK")} wins`}</span>
+                <span style={{ fontSize: 14, fontWeight: 800, letterSpacing: 2, textTransform: "uppercase", color: result.winner === "red" ? "#e74c3c" : result.winner === "black" ? "#ecf0f1" : "#f39c12" }}>
+                  {result.winner === "draw"
+                    ? (result.draw_reason === "blocked" ? "BLOCKED — DRAW" : "DRAW")
+                    : `${result.winner === "red" ? (result.red_agent?.name || "RED") : (result.black_agent?.name || result.bot_opponent?.name || "BLACK")} wins`}
+                </span>
+                {result.draw_reason === "blocked" && (
+                  <span style={{ fontSize: 8, color: "#f39c12", display: "block", marginBottom: 4 }}>
+                    Board shrink trapped the leading side — no legal moves
+                  </span>
+                )}
                 <button onClick={resetGame} style={{ padding: "7px 18px", borderRadius: 6, border: "1px solid #2ecc71", background: "transparent", color: "#2ecc71", fontWeight: 700, fontSize: 10, letterSpacing: 2, textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit" }}>REMATCH</button>
               </>
             )}

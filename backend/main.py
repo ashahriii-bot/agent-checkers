@@ -197,6 +197,7 @@ def _run_game(red_cfg: AgentConfig, black_cfg: AgentConfig,
     events = []
     move_count = 0
     winner = None
+    draw_reason = None   # "blocked" when stalemate with material advantage → draw
     king_idle = {}
     current_phase = "opening"
     events.append({"type": "phase_change", "move": 0, "phase": "opening"})
@@ -253,7 +254,18 @@ def _run_game(red_cfg: AgentConfig, black_cfg: AgentConfig,
         prog_active[turn] = prog_on
         move = pick_move(board, turn, effective_cfg, phase=current_phase, familiarity=familiarity_by_side[turn])
         if move is None:
-            winner = "red" if turn == "black" else "black"; break
+            # stalemate: blocked side has no legal moves
+            other = "red" if turn == "black" else "black"
+            counts_at_block = count_pieces(board)
+            blocked_pieces = counts_at_block[turn]
+            other_pieces = counts_at_block[other]
+            if blocked_pieces > other_pieces:
+                # blocked side has MORE pieces — shrink-induced paradox → draw
+                winner = "draw"
+                draw_reason = "blocked"
+            else:
+                winner = other
+            break
 
         had_capture = len(move.captures) > 0
         board = apply_move(board, move)
@@ -353,12 +365,15 @@ def _run_game(red_cfg: AgentConfig, black_cfg: AgentConfig,
     elif winner == "black":
         win_prob[-1] = 0.0
 
-    return {
+    resp = {
         "winner": winner, "move_count": move_count,
         "moves": moves, "boards": boards, "events": events,
         "final_red": counts["red"], "final_black": counts["black"],
         "win_probability": win_prob,
     }
+    if draw_reason:
+        resp["draw_reason"] = draw_reason
+    return resp
 
 
 # --- 2v2 tag-team consensus game ---
@@ -376,6 +391,7 @@ def _run_team_game(red_cfgs, black_cfgs, red_perks=(None, None), black_perks=(No
     moves, boards, events, influence = [], [board_to_list(board)], [], []
     move_count = 0
     winner = None
+    draw_reason = None
     king_idle = {}
     current_phase = "opening"
     events.append({"type": "phase_change", "move": 0, "phase": "opening"})
@@ -433,7 +449,14 @@ def _run_team_game(red_cfgs, black_cfgs, red_perks=(None, None), black_perks=(No
         chosen = consensus_move(board, turn, eff["a"], eff["b"], fam[turn][0], fam[turn][1],
                                 div_bonus[turn], div_frac[turn], phase=current_phase)
         if chosen is None:
-            winner = "red" if turn == "black" else "black"; break
+            other = "red" if turn == "black" else "black"
+            counts_at_block = count_pieces(board)
+            if counts_at_block[turn] > counts_at_block[other]:
+                winner = "draw"
+                draw_reason = "blocked"
+            else:
+                winner = other
+            break
         move = chosen["move"]
         influence.append({"move": move_count, "side": turn, "score_a": chosen["score_a"],
                           "score_b": chosen["score_b"], "dominant": chosen["dominant"], "agreement": chosen["agreement"]})
@@ -528,7 +551,7 @@ def _run_team_game(red_cfgs, black_cfgs, red_perks=(None, None), black_perks=(No
     red_dyn = aggregate_team_dynamics([x for x in influence if x["side"] == "red"], _edge_counts("red"))
     black_dyn = aggregate_team_dynamics([x for x in influence if x["side"] == "black"], _edge_counts("black"))
 
-    return {
+    resp = {
         "winner": winner, "move_count": move_count,
         "moves": moves, "boards": boards, "events": events,
         "final_red": counts["red"], "final_black": counts["black"],
@@ -536,6 +559,9 @@ def _run_team_game(red_cfgs, black_cfgs, red_perks=(None, None), black_perks=(No
         "influence_per_move": influence,
         "team_dynamics": {"red": red_dyn, "black": black_dyn},
     }
+    if draw_reason:
+        resp["draw_reason"] = draw_reason
+    return resp
 
 
 # --- match tags ---
@@ -1582,21 +1608,32 @@ def simulate_game(req: SimulateRequest):
         except ValueError as e:
             raise HTTPException(400, str(e))
         won = game["winner"] == req.bet.side
-        # base odds only -- streak heat bonus removed (no payout multiplier)
-        payout = int(req.bet.amount * side_odds) if won else 0
-        settle_result = settle_bet(bet_info["bet_id"], "win" if won else "loss", payout)
+        is_blocked_draw = game.get("draw_reason") == "blocked"
+        # blocked draws → push (refund): board-shrink forced the draw, nobody won
+        if is_blocked_draw:
+            payout = req.bet.amount  # full refund
+            bet_outcome = "push"
+        elif won:
+            payout = int(req.bet.amount * side_odds)
+            bet_outcome = "win"
+        else:
+            payout = 0
+            bet_outcome = "loss"
+        settle_result = settle_bet(bet_info["bet_id"], "win" if payout > 0 else "loss", payout)
         # jackpot contribution
         jp_add = add_to_jackpot(req.bet.amount)
         # streak counter still tracked for engagement; no payout effect
-        if won:
+        if bet_outcome == "win":
             streak_info = increment_streak()
+        elif bet_outcome == "push":
+            streak_info = {"current": 0}  # push doesn't affect streak
         else:
             streak_info = reset_streak()
         bet_result = {
             "bet_id": bet_info["bet_id"], "side": req.bet.side,
             "amount": req.bet.amount, "odds": side_odds,
-            "result": "win" if won else "loss",
-            "payout": payout, "net": payout - req.bet.amount if won else -req.bet.amount,
+            "result": bet_outcome,
+            "payout": payout, "net": 0 if is_blocked_draw else (payout - req.bet.amount if won else -req.bet.amount),
             "balance_after": settle_result["balance"], "bankrupt": settle_result["bankrupt"],
             "streak": streak_info, "jackpot_contribution": jp_add,
         }
@@ -1815,6 +1852,10 @@ def api_create_tournament(req: TournamentRequest):
 
             game = _run_game(red_cfg, black_cfg,
                              red_perk=red_p.get("perk"), black_perk=black_p.get("perk"))
+            # tournament bracket needs a winner — if blocked draw, side with more material advances
+            if game["winner"] == "draw" and game.get("draw_reason") == "blocked":
+                game["winner"] = "red" if game["final_red"] > game["final_black"] else "black"
+                game["bracket_tiebreak"] = True
             tag = _detect_tag(game, red_elo, black_elo)
             if tag == "UPSET":
                 total_upsets += 1
@@ -2083,6 +2124,10 @@ def api_create_team_tournament(req: TeamTournamentRequest):
                 red_diversity_bonus=red_t["diversity_bonus"], black_diversity_bonus=black_t["diversity_bonus"],
                 red_diversity_frac=red_t["diversity_frac"], black_diversity_frac=black_t["diversity_frac"],
             )
+            # tournament bracket tiebreak for blocked draws
+            if game["winner"] == "draw" and game.get("draw_reason") == "blocked":
+                game["winner"] = "red" if game["final_red"] > game["final_black"] else "black"
+                game["bracket_tiebreak"] = True
             re_before, be_before = elo_snapshot[red_t["name"]], elo_snapshot[black_t["name"]]
             result_red = 1.0 if game["winner"] == "red" else (0.0 if game["winner"] == "black" else 0.5)
             new_re, new_be = update_elo(re_before, be_before, result_red)
