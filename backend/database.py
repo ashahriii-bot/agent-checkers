@@ -9,6 +9,8 @@ from pathlib import Path
 
 import os
 
+from arena_budget import normalize_list, validate_list
+
 DB_PATH = Path(os.environ.get("DB_PATH", str(Path(__file__).parent / "matches.db")))
 
 K_FACTOR = 32
@@ -285,6 +287,12 @@ def init_db():
         conn.execute("ALTER TABLE agents ADD COLUMN perk TEXT DEFAULT NULL")
     if "player_id" not in agent_cols:
         conn.execute("ALTER TABLE agents ADD COLUMN player_id INTEGER")
+    # Persistent Arena (Pilot) record — separate from the checkers ELO/W-L (P5/§8).
+    for _ac in ("arena_wins", "arena_losses", "arena_kills", "arena_deaths"):
+        if _ac not in agent_cols:
+            conn.execute(f"ALTER TABLE agents ADD COLUMN {_ac} INTEGER NOT NULL DEFAULT 0")
+    # Ownership backfill: pre-ownership agents belong to the single local user (1).
+    conn.execute("UPDATE agents SET player_id = 1 WHERE player_id IS NULL")
     if "recent_results" not in agent_cols:
         conn.execute("ALTER TABLE agents ADD COLUMN recent_results TEXT DEFAULT '[]'")
     # progression: adaptive sliders. original_* is the +/-10 drift reference.
@@ -345,12 +353,97 @@ def init_db():
     tour_cols = {r[1] for r in conn.execute("PRAGMA table_info(tournaments)").fetchall()}
     if "mode" not in tour_cols:
         conn.execute("ALTER TABLE tournaments ADD COLUMN mode TEXT NOT NULL DEFAULT '1v1'")
+    # --- Arena tables ---
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS arena_matches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            red_team TEXT NOT NULL,
+            blue_team TEXT NOT NULL,
+            winner TEXT NOT NULL,
+            win_method TEXT NOT NULL,
+            total_rounds INTEGER NOT NULL,
+            events TEXT NOT NULL,
+            drama_beats TEXT DEFAULT '[]',
+            red_agent_ids TEXT,
+            blue_agent_ids TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS arena_bets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            prop_type TEXT NOT NULL,
+            selection TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            odds REAL NOT NULL,
+            resolved INTEGER DEFAULT 0,
+            won INTEGER DEFAULT 0,
+            payout INTEGER DEFAULT 0,
+            arena_match_id INTEGER,
+            species TEXT,
+            line INTEGER
+        )
+    """)
+    # arena_bets gained match-linkage + server-derived resolution fields when the
+    # bet path was hardened (server recompute odds; settle from a sealed sim).
+    arena_bet_cols = {r[1] for r in conn.execute("PRAGMA table_info(arena_bets)").fetchall()}
+    for col, ddl in (("arena_match_id", "INTEGER"), ("species", "TEXT"), ("line", "INTEGER")):
+        if col not in arena_bet_cols:
+            conn.execute(f"ALTER TABLE arena_bets ADD COLUMN {col} {ddl}")
+    # Series (P3, §5.2) — the greenfield best-of data model. A series locks each
+    # team's Guardian *species* multiset for its whole length (Pilots/upgrades may
+    # still swap between games, §5.3); per_game_results stores the sealed
+    # arena_matches id of every game so series bets settle from a server-trusted
+    # record keyed by series_id (§7.1), never a client claim.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS arena_series (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            format TEXT NOT NULL,
+            games_needed INTEGER NOT NULL,
+            max_games INTEGER NOT NULL,
+            red_owner INTEGER,
+            blue_owner INTEGER,
+            red_species TEXT NOT NULL,
+            blue_species TEXT NOT NULL,
+            red_score INTEGER NOT NULL DEFAULT 0,
+            blue_score INTEGER NOT NULL DEFAULT 0,
+            per_game_results TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'active',
+            winner TEXT,
+            survival INTEGER NOT NULL DEFAULT 0,
+            benched TEXT NOT NULL DEFAULT '[]'
+        )
+    """)
+    # `benched` (P5/§5.4 Survival): JSON list of red agent_ids grounded for the rest
+    # of the series (lost a game while their Guardian died). Added lazily for DBs
+    # created before Survival shipped.
+    _series_cols = {r[1] for r in conn.execute("PRAGMA table_info(arena_series)").fetchall()}
+    if "benched" not in _series_cols:
+        conn.execute("ALTER TABLE arena_series ADD COLUMN benched TEXT NOT NULL DEFAULT '[]'")
     # recompute stored levels against the (possibly extended) XP curve, so existing
     # veterans are not stuck at the old L5 cap until their next match. Idempotent.
     for row in conn.execute("SELECT id, xp, level FROM agents").fetchall():
         correct = xp_to_level(row["xp"] or 0)
         if correct != (row["level"] or 1):
             conn.execute("UPDATE agents SET level=? WHERE id=?", (correct, row["id"]))
+    conn.commit()
+    # one-time "Re-attunement": coerce any pre-budget agent (sliders 0-100,
+    # unconstrained) to the 250-point budget, re-baselining the drift reference
+    # to the re-attuned build. Idempotent — already-legal agents are untouched.
+    _cols = ("aggression", "risk_tolerance", "king_priority", "edge_affinity", "trade_down")
+    for row in conn.execute(f"SELECT id, {', '.join(_cols)} FROM agents").fetchall():
+        vals = [row[c] for c in _cols]
+        if validate_list(vals, tol=0):
+            continue
+        a, r, k, e, t = normalize_list(vals)
+        conn.execute(
+            """UPDATE agents SET aggression=?, risk_tolerance=?, king_priority=?, edge_affinity=?, trade_down=?,
+               original_aggression=?, original_risk_tolerance=?, original_king_priority=?, original_edge_affinity=?, original_trade_down=?
+               WHERE id=?""",
+            (a, r, k, e, t, a, r, k, e, t, row["id"]),
+        )
     conn.commit()
     _seed_starter_agents(conn)
     conn.close()
@@ -362,6 +455,7 @@ def _seed_starter_agents(conn):
         return
     now = datetime.now(timezone.utc).isoformat()
     for name, a, r, k, e, t in STARTER_AGENTS:
+        a, r, k, e, t = normalize_list([a, r, k, e, t])   # coerce to the 250 budget
         conn.execute(
             "INSERT INTO agents (name, aggression, risk_tolerance, king_priority, edge_affinity, trade_down, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
             (name, a, r, k, e, t, now, now),
@@ -420,19 +514,24 @@ def _agent_row_to_dict(r) -> dict:
         "form": _calc_form(recent),
         "original": original,
         "evolution_matches": r["evolution_matches"] if "evolution_matches" in keys else 0,
+        "player_id": (r["player_id"] if "player_id" in keys and r["player_id"] is not None else 1),
+        "arena_wins": r["arena_wins"] if "arena_wins" in keys else 0,
+        "arena_losses": r["arena_losses"] if "arena_losses" in keys else 0,
+        "arena_kills": r["arena_kills"] if "arena_kills" in keys else 0,
+        "arena_deaths": r["arena_deaths"] if "arena_deaths" in keys else 0,
     }
 
 
 def create_agent(name: str, aggression: int, risk_tolerance: int, king_priority: int,
-                 edge_affinity: int, trade_down: int) -> dict:
+                 edge_affinity: int, trade_down: int, player_id: int = 1) -> dict:
     conn = get_db()
     now = datetime.now(timezone.utc).isoformat()
     try:
         cursor = conn.execute(
-            """INSERT INTO agents (name, aggression, risk_tolerance, king_priority, edge_affinity, trade_down,
+            """INSERT INTO agents (name, aggression, risk_tolerance, king_priority, edge_affinity, trade_down, player_id,
                 original_aggression, original_risk_tolerance, original_king_priority, original_edge_affinity, original_trade_down,
-                created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (name, aggression, risk_tolerance, king_priority, edge_affinity, trade_down,
+                created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (name, aggression, risk_tolerance, king_priority, edge_affinity, trade_down, player_id,
              aggression, risk_tolerance, king_priority, edge_affinity, trade_down, now, now),
         )
         conn.commit()
@@ -445,11 +544,33 @@ def create_agent(name: str, aggression: int, risk_tolerance: int, king_priority:
     return _agent_row_to_dict(row)
 
 
-def get_agents() -> list[dict]:
+def get_agents(player_id: int | None = 1) -> list[dict]:
+    """Owned-by-player roster (P5/F1). player_id=None returns all (admin/debug)."""
     conn = get_db()
-    rows = conn.execute("SELECT * FROM agents ORDER BY elo DESC").fetchall()
+    if player_id is None:
+        rows = conn.execute("SELECT * FROM agents ORDER BY elo DESC").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM agents WHERE COALESCE(player_id, 1) = ? ORDER BY elo DESC",
+            (player_id,),
+        ).fetchall()
     conn.close()
     return [_agent_row_to_dict(r) for r in rows]
+
+
+def update_arena_record(agent_id: int, outcome: str, kills: int = 0, deaths: int = 0) -> None:
+    """Accrue one Arena match into a Pilot's persistent record (P5/§8).
+    outcome in {'win','loss','draw'}; draws touch neither W nor L."""
+    conn = get_db()
+    win = 1 if outcome == "win" else 0
+    loss = 1 if outcome == "loss" else 0
+    conn.execute(
+        """UPDATE agents SET arena_wins = arena_wins + ?, arena_losses = arena_losses + ?,
+           arena_kills = arena_kills + ?, arena_deaths = arena_deaths + ? WHERE id = ?""",
+        (win, loss, max(0, kills), max(0, deaths), agent_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 def get_agent(agent_id: int) -> dict | None:
@@ -540,20 +661,27 @@ def process_agent_evolution(agent_id: int, result: str) -> dict | None:
     agent = _agent_row_to_dict(row)
     adjustments = evolve_sliders(agent, wins, losses)
 
+    # Apply drift, then re-normalize to the 250 budget so evolution is a
+    # REALLOCATION (one slider up => another down), never a net increase.
+    originals = {}
+    drifted = []
+    for slider in SLIDERS:
+        current = row[slider]
+        original = row[f"original_{slider}"] if row[f"original_{slider}"] is not None else current
+        originals[slider] = original
+        drifted.append(clamp_to_cap(current, adjustments.get(slider, 0), original))
+    new_vals = normalize_list(drifted)
+
     changes = {}
     sets = []
     params = []
-    for slider in SLIDERS:
-        adj = adjustments.get(slider, 0)
-        if adj == 0:
-            continue
+    for i, slider in enumerate(SLIDERS):
+        new_val = new_vals[i]
         current = row[slider]
-        original = row[f"original_{slider}"] if row[f"original_{slider}"] is not None else current
-        new_val = clamp_to_cap(current, adj, original)
         if new_val != current:
             sets.append(f"{slider}=?")
             params.append(new_val)
-            changes[slider] = {"from": current, "to": new_val, "original": original, "drift": new_val - original}
+            changes[slider] = {"from": current, "to": new_val, "original": originals[slider], "drift": new_val - originals[slider]}
 
     sets.append("evolution_matches=0")
     sets.append("evolution_log='[]'")
@@ -1094,19 +1222,39 @@ def place_bet(bet_type: str, bet_on: str, amount: int, odds: float,
     return {"bet_id": bet_id, "balance": new_bal}
 
 
-def settle_bet(bet_id: int, result: str, payout: int) -> dict:
+def settle_bet(bet_id: int, result: str, payout: int, affect_streak: bool = True) -> dict:
+    """Settle a row in `bets` and apply the wallet delta.
+
+    `result` is "win", "loss", or "push". A push refunds the stake and is neither
+    a win nor a loss, so it never touches total_won/total_lost/total_bets or the
+    streak (this is what fixes prop pushes being miscounted as wins).
+
+    `affect_streak` gates the cosmetic win-streak counter. Main moneyline /
+    tournament / parlay bets pass True (default, unchanged behaviour); prop and
+    arena settlements pass False — the win-streak is a visual-only counter and
+    must not be driven by prop/arena results (docs/ECONOMY_AUDIT.md;
+    docs/GUARDIANS-AND-ENGINES-SPEC.md §7.1 F2).
+    """
     conn = get_db()
     conn.execute("UPDATE bets SET result = ?, payout = ? WHERE id = ?", (result, payout, bet_id))
     if result == "win" and payout > 0:
-        conn.execute("UPDATE wallet SET balance = balance + ?, total_won = total_won + ?, total_bets = total_bets + 1, win_streak = win_streak + 1 WHERE id = 1", (payout, payout))
+        conn.execute("UPDATE wallet SET balance = balance + ?, total_won = total_won + ?, total_bets = total_bets + 1 WHERE id = 1", (payout, payout))
+        if affect_streak:
+            conn.execute("UPDATE wallet SET win_streak = win_streak + 1 WHERE id = 1")
         w = conn.execute("SELECT * FROM wallet WHERE id = 1").fetchone()
         best = max(w["best_streak"], w["win_streak"])
         biggest = max(w["biggest_win"], payout)
         conn.execute("UPDATE wallet SET best_streak = ?, biggest_win = ? WHERE id = 1", (best, biggest))
+    elif result == "push":
+        # stake refunded; neither win nor loss. No win/loss totals, no streak.
+        if payout > 0:
+            conn.execute("UPDATE wallet SET balance = balance + ? WHERE id = 1", (payout,))
     else:
         bet_row = conn.execute("SELECT amount FROM bets WHERE id = ?", (bet_id,)).fetchone()
         lost_amount = bet_row["amount"] if bet_row else 0
-        conn.execute("UPDATE wallet SET total_lost = total_lost + ?, total_bets = total_bets + 1, win_streak = 0 WHERE id = 1", (lost_amount,))
+        conn.execute("UPDATE wallet SET total_lost = total_lost + ?, total_bets = total_bets + 1 WHERE id = 1", (lost_amount,))
+        if affect_streak:
+            conn.execute("UPDATE wallet SET win_streak = 0 WHERE id = 1")
     conn.commit()
     w = conn.execute("SELECT * FROM wallet WHERE id = 1").fetchone()
     bankrupt = False
@@ -1205,6 +1353,138 @@ def reset_streak() -> dict:
     conn.commit()
     conn.close()
     return {"old_streak": old_streak, "streak": 0, "multiplier": 1.0}
+
+
+# --- arena ---
+#
+# An arena bet must settle against a server-trusted match, never a client-supplied
+# result. save_arena_match seals a completed simulation; get_arena_match reads it
+# back in the exact shape arena_props.resolve_arena_props expects.
+
+def save_arena_match(result: dict, red_agent_ids=None, blue_agent_ids=None) -> int:
+    """Persist a completed arena simulation (ArenaMatchResult.to_dict()) as the
+    authoritative record an arena bet is later resolved against. Returns the new
+    arena_matches id."""
+    conn = get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        """INSERT INTO arena_matches
+           (created_at, red_team, blue_team, winner, win_method, total_rounds,
+            events, drama_beats, red_agent_ids, blue_agent_ids)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (now,
+         json.dumps(result.get("red_team", [])),
+         json.dumps(result.get("blue_team", [])),
+         result.get("winner", "draw"),
+         result.get("win_method", ""),
+         int(result.get("total_rounds", 0)),
+         json.dumps(result.get("events", [])),
+         json.dumps(result.get("drama_beats", [])),
+         json.dumps(red_agent_ids) if red_agent_ids is not None else None,
+         json.dumps(blue_agent_ids) if blue_agent_ids is not None else None),
+    )
+    conn.commit()
+    match_id = cursor.lastrowid
+    conn.close()
+    return match_id
+
+
+def get_arena_match(match_id: int) -> dict | None:
+    """Reconstruct the match_result dict resolve_arena_props expects from a stored
+    arena_matches row. Returns None if the row is missing."""
+    conn = get_db()
+    r = conn.execute("SELECT * FROM arena_matches WHERE id = ?", (match_id,)).fetchone()
+    conn.close()
+    if not r:
+        return None
+    return {
+        "winner": r["winner"],
+        "win_method": r["win_method"],
+        "total_rounds": r["total_rounds"],
+        "events": json.loads(r["events"] or "[]"),
+        "red_team": json.loads(r["red_team"] or "[]"),
+        "blue_team": json.loads(r["blue_team"] or "[]"),
+        "drama_beats": json.loads(r["drama_beats"] or "[]"),
+    }
+
+
+# --- arena series (P3, §5.2) ---
+# Greenfield best-of orchestration storage. The series row is the authoritative
+# server record: it owns the locked species, the running score, and the sealed
+# per-game arena_matches ids. Orchestration (sim, win check) lives in main.py;
+# this layer is storage-only.
+
+def _series_row_to_dict(r) -> dict:
+    return {
+        "series_id": r["id"],
+        "created_at": r["created_at"],
+        "format": r["format"],
+        "games_needed": r["games_needed"],
+        "max_games": r["max_games"],
+        "red_owner": r["red_owner"],
+        "blue_owner": r["blue_owner"],
+        "red_species": json.loads(r["red_species"] or "[]"),
+        "blue_species": json.loads(r["blue_species"] or "[]"),
+        "red_score": r["red_score"],
+        "blue_score": r["blue_score"],
+        "per_game_results": json.loads(r["per_game_results"] or "[]"),
+        "status": r["status"],
+        "winner": r["winner"],
+        "survival": bool(r["survival"]),
+        "benched": json.loads(r["benched"] or "[]") if "benched" in r.keys() else [],
+    }
+
+
+def create_series(format: str, games_needed: int, max_games: int,
+                  red_species: list, blue_species: list,
+                  red_owner: int | None = 1, blue_owner: int | None = None,
+                  survival: bool = False) -> dict:
+    conn = get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        """INSERT INTO arena_series
+           (created_at, format, games_needed, max_games, red_owner, blue_owner,
+            red_species, blue_species, survival)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (now, format, games_needed, max_games, red_owner, blue_owner,
+         json.dumps(red_species), json.dumps(blue_species), 1 if survival else 0),
+    )
+    conn.commit()
+    sid = cursor.lastrowid
+    row = conn.execute("SELECT * FROM arena_series WHERE id = ?", (sid,)).fetchone()
+    conn.close()
+    return _series_row_to_dict(row)
+
+
+def get_series(series_id: int) -> dict | None:
+    conn = get_db()
+    r = conn.execute("SELECT * FROM arena_series WHERE id = ?", (series_id,)).fetchone()
+    conn.close()
+    return _series_row_to_dict(r) if r else None
+
+
+def update_series(series_id: int, red_score: int, blue_score: int,
+                  per_game_results: list, status: str, winner: str | None,
+                  benched: list | None = None) -> None:
+    """Persist the running state after a game resolves (score, sealed-game log,
+    completion + winner, and — in Survival — the grounded Pilots). Settlement of
+    series-level markets happens in main.py."""
+    conn = get_db()
+    if benched is None:
+        conn.execute(
+            """UPDATE arena_series SET red_score=?, blue_score=?, per_game_results=?,
+               status=?, winner=? WHERE id=?""",
+            (red_score, blue_score, json.dumps(per_game_results), status, winner, series_id),
+        )
+    else:
+        conn.execute(
+            """UPDATE arena_series SET red_score=?, blue_score=?, per_game_results=?,
+               status=?, winner=?, benched=? WHERE id=?""",
+            (red_score, blue_score, json.dumps(per_game_results), status, winner,
+             json.dumps(benched), series_id),
+        )
+    conn.commit()
+    conn.close()
 
 
 # --- parlays ---

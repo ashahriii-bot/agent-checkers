@@ -52,6 +52,13 @@ The win-streak ("HOT STREAK") is **visual only** — it must never multiply payo
 because it reversed the house edge (+5% → −3%); see `docs/ECONOMY_AUDIT.md`. Re-run `python scripts/economy_audit.py`
 after any betting-math change — the `heat` hold row is the standing acceptance test (must stay ≈ +5%).
 
+The **arena** has its own prop book (`backend/arena_props.py`: breach, first blood, the distance, last stand,
+survivor), priced from probability *models* of combat events — so an arena balance change can silently de-calibrate
+the odds. Re-run `python scripts/arena_props_audit.py` after any change to the arena engine, species stats, AI weights,
+or `arena_props.py`: it simulates matches via `backend/arena_balance_sim.py`, settles every prop, and asserts each
+type holds ≈ +5% (exits non-zero on failure). Those per-type hold rows are the arena book's standing acceptance test,
+exactly as `heat` is for the main book. See `docs/ARENA_PROPS_AUDIT.md` and `docs/ARENA-BALANCE-REPORT.md` §7.
+
 ## Progression
 
 1 XP / competitive match, level cap 25. `LEVEL_THRESHOLDS = 5*N*(N-1)//2`. Edges unlock by level: L5 basic perks

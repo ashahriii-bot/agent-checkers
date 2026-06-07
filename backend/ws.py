@@ -15,7 +15,7 @@ from database import (
     process_agent_evolution, update_familiarity, get_familiarity_score, decay_familiarity,
 )
 from familiarity import categorize_opponent
-from matchmaking import queue, online, QueueEntry
+from matchmaking import queue, online, QueueEntry, arena_queue, ArenaQueueEntry
 from crypto import crypto_service, micros_to_usdc
 
 import logging
@@ -66,11 +66,11 @@ def _ensure_matchmaker():
 
 
 async def _matchmaker_loop():
-    log.info("matchmaker loop started")
+    log.info("matchmaker loop started (checkers + arena)")
     while True:
         await asyncio.sleep(3)
         try:
-            # 1) pair everyone currently within band (bands widen over time)
+            # --- Checkers queue ---
             while True:
                 pair = await queue.pop_ready_match()
                 if not pair:
@@ -81,7 +81,6 @@ async def _matchmaker_loop():
                 online.set_status(red_entry.player_id, "in_match")
                 online.set_status(black_entry.player_id, "in_match")
                 asyncio.create_task(_run_multiplayer_match(red_entry, black_entry))
-            # 2) time out anyone who has waited too long with no opponent
             for e in await queue.pop_timed_out():
                 online.set_status(e.player_id, "idle")
                 log.info("matcher: timing out player %s (no opponent)", e.player_id)
@@ -92,8 +91,30 @@ async def _matchmaker_loop():
                     })
                 except Exception:
                     log.exception("matcher: failed to send queue_timeout to %s", e.player_id)
+
+            # --- Arena queue ---
+            while True:
+                pair = await arena_queue.pop_ready_match()
+                if not pair:
+                    break
+                red_entry, blue_entry = pair
+                log.info("arena matcher: pairing player %s vs player %s",
+                         red_entry.player_id, blue_entry.player_id)
+                online.set_status(red_entry.player_id, "in_match")
+                online.set_status(blue_entry.player_id, "in_match")
+                asyncio.create_task(_run_arena_match(red_entry, blue_entry))
+            for e in await arena_queue.pop_timed_out():
+                online.set_status(e.player_id, "idle")
+                log.info("arena matcher: timing out player %s", e.player_id)
+                try:
+                    await e.websocket.send_json({
+                        "type": "arena_queue_timeout",
+                        "message": "No arena opponents found. Try again later.",
+                    })
+                except Exception:
+                    log.exception("arena matcher: failed to send timeout to %s", e.player_id)
+
         except Exception:
-            # never let the matchmaker die on a transient error — but DO log it
             log.exception("matchmaker loop iteration failed")
 
 
@@ -138,6 +159,14 @@ async def ws_play(ws: WebSocket):
                     online.set_status(player_id, "idle")
                     await ws.send_json({"type": "queue_cancelled"})
 
+                elif msg_type == "arena_queue_join":
+                    await _handle_arena_queue_join(ws, player_id, display_name, msg)
+
+                elif msg_type == "arena_queue_cancel":
+                    await arena_queue.remove(player_id)
+                    online.set_status(player_id, "idle")
+                    await ws.send_json({"type": "arena_queue_cancelled"})
+
                 elif msg_type == "ping":
                     await ws.send_json({"type": "pong"})
 
@@ -158,6 +187,7 @@ async def ws_play(ws: WebSocket):
         log.exception("connection loop crashed: player %s", player_id)
     finally:
         await queue.remove_by_ws(ws)
+        await arena_queue.remove_by_ws(ws)
         online.disconnect(player_id)
         log.info("cleanup: player %s; online=%d", player_id, online.count)
 
@@ -432,4 +462,202 @@ async def _run_multiplayer_match_inner(red: QueueEntry, black: QueueEntry):
         except Exception:
             log.exception("match: failed sending result to player %s", entry.player_id)
 
+        online.set_status(entry.player_id, "idle")
+
+
+# =============================================================================
+# Arena multiplayer
+# =============================================================================
+
+async def _handle_arena_queue_join(ws: WebSocket, player_id: int, display_name: str, msg: dict):
+    """Handle arena_queue_join: validate team, compute team elo, enqueue."""
+    team = msg.get("team", [])
+    if not team or len(team) < 1 or len(team) > 3:
+        await ws.send_json({"type": "error", "message": "arena team must have 1-3 creatures"})
+        return
+
+    from arena_species import Species as ArenaSpecies
+    valid_species = {s.value for s in ArenaSpecies}
+    for c in team:
+        if c.get("species") not in valid_species:
+            await ws.send_json({"type": "error", "message": f"invalid species: {c.get('species')}"})
+            return
+
+    # Compute team elo: average of agents' elo if agents assigned, else 1200
+    elos = []
+    for c in team:
+        if c.get("agent_id"):
+            agent = get_agent(c["agent_id"])
+            if agent:
+                elos.append(agent.get("elo", 1200))
+            else:
+                elos.append(1200)
+        else:
+            elos.append(1200)
+    team_elo = sum(elos) / len(elos)
+
+    entry = ArenaQueueEntry(
+        player_id=player_id,
+        display_name=display_name,
+        websocket=ws,
+        team=team,
+        team_elo=team_elo,
+        joined_at=time.time(),
+    )
+
+    online.set_status(player_id, "in_queue")
+    await ws.send_json({"type": "arena_queue_joined", "team_elo": round(team_elo)})
+
+    match_pair = await arena_queue.add(entry)
+
+    if match_pair:
+        red_entry, blue_entry = match_pair
+        log.info("arena_queue_join: INSTANT match player %s vs player %s", red_entry.player_id, blue_entry.player_id)
+        online.set_status(red_entry.player_id, "in_match")
+        online.set_status(blue_entry.player_id, "in_match")
+        asyncio.create_task(_run_arena_match(red_entry, blue_entry))
+    else:
+        log.info("arena_queue_join: player %s queued; arena queue size=%d", player_id, arena_queue.size)
+        try:
+            await ws.send_json({"type": "arena_queue_status", **(await arena_queue.get_status(player_id))})
+        except Exception:
+            log.exception("arena_queue_join: failed sending status to %s", player_id)
+        asyncio.create_task(_arena_queue_wait_loop(ws, player_id))
+
+
+async def _arena_queue_wait_loop(ws: WebSocket, player_id: int):
+    """Stream arena queue status updates to a waiting player."""
+    while True:
+        await asyncio.sleep(2)
+        status = await arena_queue.get_status(player_id)
+        if status["position"] == 0:
+            return
+        try:
+            await ws.send_json({"type": "arena_queue_status", **status})
+        except Exception:
+            return
+
+
+async def _run_arena_match(red: ArenaQueueEntry, blue: ArenaQueueEntry):
+    """Resilient wrapper for arena multiplayer matches."""
+    try:
+        await _run_arena_match_inner(red, blue)
+    except Exception:
+        log.exception("ARENA MATCH FAILED: red_player=%s blue_player=%s", red.player_id, blue.player_id)
+        for e in (red, blue):
+            online.set_status(e.player_id, "idle")
+            try:
+                await e.websocket.send_json({"type": "error", "message": "arena match failed — please queue again"})
+            except Exception:
+                pass
+
+
+async def _run_arena_match_inner(red: ArenaQueueEntry, blue: ArenaQueueEntry):
+    """Simulate arena match, send results to both players."""
+    log.info("arena match: start red_player=%s blue_player=%s", red.player_id, blue.player_id)
+
+    from arena_engine import CreatureConfig, simulate_match as arena_simulate
+    from arena_species import Species as ArenaSpecies, derive_temperament
+
+    def _build_configs(team_data: list[dict]) -> list[CreatureConfig]:
+        configs = []
+        for c in team_data:
+            agent_name = ""
+            agg = c.get("aggression", 50)
+            risk = c.get("risk_tolerance", 50)
+            tgt = c.get("target_focus", 50)
+            pos = c.get("positioning", 50)
+            sac = c.get("sacrifice", 50)
+            if c.get("agent_id"):
+                agent = get_agent(c["agent_id"])
+                if agent:
+                    agent_name = agent["name"]
+                    agg = agent["aggression"]
+                    risk = agent["risk_tolerance"]
+                    tgt = agent.get("king_priority", 50)
+                    pos = agent.get("edge_affinity", 50)
+                    sac = agent.get("trade_down", 50)
+            configs.append(CreatureConfig(
+                species=ArenaSpecies(c["species"]),
+                agent_name=agent_name,
+                aggression=agg, risk_tolerance=risk,
+                target_focus=tgt, positioning=pos, sacrifice=sac,
+                upgrade=c.get("upgrade"),
+            ))
+        return configs
+
+    red_configs = _build_configs(red.team)
+    blue_configs = _build_configs(blue.team)
+
+    # --- Opponent reveal ---
+    red_team_reveal = []
+    for c, cfg in zip(red.team, red_configs):
+        temp = derive_temperament(cfg.aggression, cfg.risk_tolerance, cfg.target_focus, cfg.positioning, cfg.sacrifice)
+        red_team_reveal.append({
+            "species": c["species"], "temperament": temp.value,
+            "agent_name": cfg.agent_name,
+        })
+
+    blue_team_reveal = []
+    for c, cfg in zip(blue.team, blue_configs):
+        temp = derive_temperament(cfg.aggression, cfg.risk_tolerance, cfg.target_focus, cfg.positioning, cfg.sacrifice)
+        blue_team_reveal.append({
+            "species": c["species"], "temperament": temp.value,
+            "agent_name": cfg.agent_name,
+        })
+
+    for entry, side, opp_entry, opp_reveal in [
+        (red, "red", blue, blue_team_reveal),
+        (blue, "blue", red, red_team_reveal),
+    ]:
+        try:
+            await entry.websocket.send_json({
+                "type": "arena_match_found",
+                "your_side": side,
+                "opponent": {
+                    "display_name": opp_entry.display_name,
+                    "team": opp_reveal,
+                    "team_elo": round(opp_entry.team_elo),
+                },
+            })
+        except Exception:
+            pass
+
+    # Reveal pause + countdown
+    await asyncio.sleep(2)  # opponent reveal
+    for i in (3, 2, 1):
+        for entry in (red, blue):
+            try:
+                await entry.websocket.send_json({"type": "arena_countdown", "count": i})
+            except Exception:
+                pass
+        await asyncio.sleep(1)
+
+    # Simulate
+    log.info("arena match: running simulation")
+    result = await asyncio.to_thread(arena_simulate, red_configs, blue_configs)
+    result_dict = result.to_dict()
+    log.info("arena match: done winner=%s rounds=%s", result_dict["winner"], result_dict["total_rounds"])
+
+    # Optional AI commentary
+    try:
+        from main import generate_arena_commentary
+        commentary = await asyncio.to_thread(generate_arena_commentary, result_dict)
+    except Exception:
+        log.exception("arena commentary generation failed")
+        commentary = []
+
+    # Send results to both players
+    for entry, side in [(red, "red"), (blue, "blue")]:
+        result_msg = {
+            "type": "arena_match_result",
+            "your_side": side,
+            **result_dict,
+            "commentary": commentary,
+        }
+        try:
+            await entry.websocket.send_json(result_msg)
+            log.info("arena match: result sent to player %s (side=%s)", entry.player_id, side)
+        except Exception:
+            log.exception("arena match: failed sending result to player %s", entry.player_id)
         online.set_status(entry.player_id, "idle")

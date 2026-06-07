@@ -10,3 +10,5 @@ backend/static/
 frontend/dist/
 .env
 .DS_Store
+# Raw uncompressed 3D model sources — kept out of public/ so they don't ship in the build
+_raw_models/

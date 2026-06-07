@@ -1,12 +1,68 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { gameAudio } from "./audio.js";
+import Arena from "./Arena.jsx";
 
 const SIZE = 8;
 const EMPTY = 0, RED = 1, BLACK = 2, RED_KING = 3, BLACK_KING = 4, DEAD = -1;
 const isRed = (p) => p === RED || p === RED_KING;
 const isKing = (p) => p === RED_KING || p === BLACK_KING;
 const API = "/api";
-const defaultConfig = { aggression: 50, risk_tolerance: 50, king_priority: 50, edge_affinity: 50, trade_down: 50 };
+const defaultConfig = { aggression: 40, risk_tolerance: 40, king_priority: 40, edge_affinity: 40, trade_down: 40 };
+
+// ---- Point budget (mirrors backend/arena_budget.py + Arena.jsx): an agent
+// spends exactly AGENT_BUDGET across the 5 sliders, each in [SL_MIN, SL_MAX]. ----
+const AGENT_BUDGET = 200;
+const SL_MIN = 5;
+const SL_MAX = 80;
+const CK_SLIDERS = ["aggression", "risk_tolerance", "king_priority", "edge_affinity", "trade_down"];
+const ckClampInt = (v, lo, hi) => Math.max(lo, Math.min(hi, Math.round(v)));
+
+// Raise/lower `key` toward `requested`, conserving the 250 total by draining the
+// other sliders proportionally to their headroom. Returns the new config.
+function ckRedistribute(cfg, key, requested) {
+  const cur = {}; CK_SLIDERS.forEach(k => { cur[k] = cfg[k] ?? 50; });
+  requested = ckClampInt(requested, SL_MIN, SL_MAX);
+  const delta = requested - cur[key];
+  if (!delta) return cur;
+  const others = CK_SLIDERS.filter(k => k !== key);
+  const headroom = (k) => delta > 0 ? (cur[k] - SL_MIN) : (SL_MAX - cur[k]);
+  const pool = others.reduce((s, k) => s + headroom(k), 0);
+  const movable = Math.min(Math.abs(delta), pool);
+  if (movable <= 0) return cur;
+  const dir = delta > 0 ? 1 : -1, odir = -dir;
+  cur[key] += dir * movable;
+  const shares = others.map(k => { const raw = movable * headroom(k) / pool; return { k, raw, base: Math.floor(raw) }; });
+  const dr = {}; let rem = movable;
+  shares.forEach(s => { dr[s.k] = odir * s.base; rem -= s.base; });
+  shares.sort((a, b) => (b.raw - b.base) - (a.raw - a.base));
+  let i = 0;
+  while (rem > 0 && i < shares.length * 5) { const s = shares[i % shares.length]; if (Math.abs(dr[s.k]) < headroom(s.k)) { dr[s.k] += odir; rem -= 1; } i++; }
+  others.forEach(k => { cur[k] += dr[k] || 0; });
+  CK_SLIDERS.forEach(k => { cur[k] = ckClampInt(cur[k], SL_MIN, SL_MAX); });
+  return cur;
+}
+
+// Shape-preserving coercion of any config to the 250 budget (re-attunement).
+function ckNormalize(cfg) {
+  const cur = {}; CK_SLIDERS.forEach(k => { cur[k] = ckClampInt(cfg[k] ?? 50, SL_MIN, SL_MAX); });
+  for (let iter = 0; iter < 60; iter++) {
+    const diff = AGENT_BUDGET - CK_SLIDERS.reduce((s, k) => s + cur[k], 0);
+    if (diff === 0) break;
+    const dir = diff > 0 ? 1 : -1;
+    const headroom = (k) => dir > 0 ? (SL_MAX - cur[k]) : (cur[k] - SL_MIN);
+    const pool = CK_SLIDERS.reduce((s, k) => s + headroom(k), 0);
+    if (pool <= 0) break;
+    const move = Math.min(Math.abs(diff), pool);
+    const shares = CK_SLIDERS.map(k => { const raw = move * headroom(k) / pool; return { k, raw, base: Math.floor(raw) }; });
+    let rem = move;
+    shares.forEach(s => { cur[s.k] += dir * s.base; rem -= s.base; });
+    shares.sort((a, b) => (b.raw - b.base) - (a.raw - a.base));
+    let j = 0;
+    while (rem > 0 && j < shares.length * 5) { const s = shares[j % shares.length]; if (dir > 0 ? cur[s.k] < SL_MAX : cur[s.k] > SL_MIN) { cur[s.k] += dir; rem -= 1; } j++; }
+    CK_SLIDERS.forEach(k => { cur[k] = ckClampInt(cur[k], SL_MIN, SL_MAX); });
+  }
+  return cur;
+}
 
 const SLIDER_KEYS = [
   { key: "aggression", short: "A", color: "#e74c3c" },
@@ -181,15 +237,16 @@ function OverextWarning({ config }) {
   );
 }
 
-function Slider({ label, sliderKey, value, onChange, color, disabled, showDesc }) {
+function Slider({ label, sliderKey, value, onChange, color, disabled, showDesc, min = 0, max = 100 }) {
+  const pct = ((value - min) / (max - min)) * 100;
   return (
     <div style={{ marginBottom: 8 }}>
       <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
         <span style={{ fontSize: 8, letterSpacing: 2, textTransform: "uppercase", color: "#8892a0" }}>{label}</span>
         <span style={{ fontSize: 8, fontWeight: 700, color }}>{value}</span>
       </div>
-      <input type="range" min="0" max="100" value={value} disabled={disabled} onChange={(e) => onChange(parseInt(e.target.value))}
-        style={{ width: "100%", background: `linear-gradient(to right, ${color} ${value}%, #1e2530 ${value}%)`, accentColor: color, opacity: disabled ? 0.5 : 1 }} />
+      <input type="range" min={min} max={max} value={value} disabled={disabled} onChange={(e) => onChange(parseInt(e.target.value))}
+        style={{ width: "100%", background: `linear-gradient(to right, ${color} ${pct}%, #1e2530 ${pct}%)`, accentColor: color, opacity: disabled ? 0.5 : 1 }} />
       {showDesc && sliderKey && <div style={{ fontSize: 7, color: "#4a5568", marginTop: 1, fontStyle: "italic" }}>{getSliderDesc(sliderKey, value)}</div>}
     </div>
   );
@@ -528,7 +585,7 @@ function TournamentSetup({ roster, onStart, onBack, loading }) {
       </div>
 
       {randomFill > 0 && selected.size >= 2 && opponent === "open" && (
-        <div style={{ fontSize: 9, color: "#4a5568", marginBottom: 12 }}>{randomFill} random agent{randomFill > 1 ? "s" : ""} will fill remaining slots</div>
+        <div style={{ fontSize: 9, color: "#4a5568", marginBottom: 12 }}>{randomFill} random Pilot{randomFill > 1 ? "s" : ""} will fill remaining slots</div>
       )}
 
       <button onClick={() => onStart([...selected], bracketSize, seeding, opponent === "mirror" ? "mirror" : null, tournMode)} disabled={selected.size < 2 || loading}
@@ -1151,10 +1208,11 @@ function RosterPanel({ side, color, selectedAgent, onSelect, roster, disabled, m
 
   const openCreate = () => { setEditConfig({ ...defaultConfig }); setEditName(""); setSuggestions(localSuggestNames(defaultConfig)); setEditingAgent(null); setMode("editor"); };
   const openEdit = (agent) => {
-    const cfg = { aggression: agent.aggression, risk_tolerance: agent.risk_tolerance, king_priority: agent.king_priority, edge_affinity: agent.edge_affinity, trade_down: agent.trade_down };
+    const cfg = ckNormalize({ aggression: agent.aggression, risk_tolerance: agent.risk_tolerance, king_priority: agent.king_priority, edge_affinity: agent.edge_affinity, trade_down: agent.trade_down });
     setEditConfig(cfg); setEditName(agent.name); setSuggestions([]); setEditingAgent(agent); setMode("editor");
   };
-  const handleSliderChange = (key, val) => { const next = { ...editConfig, [key]: val }; setEditConfig(next); if (!editingAgent) refreshSuggestions(next); };
+  // Budget-bound: raising one slider drains the others, total stays 250.
+  const handleSliderChange = (key, val) => { const next = ckRedistribute(editConfig, key, val); setEditConfig(next); if (!editingAgent) refreshSuggestions(next); };
   const handleSave = async () => {
     if (!editName.trim()) return;
     setSaving(true);
@@ -1213,11 +1271,11 @@ function RosterPanel({ side, color, selectedAgent, onSelect, roster, disabled, m
     return (
       <div style={{ background: "#0d1117", border: "1px solid #1a1f2b", borderRadius: 8, padding: 10, width: "100%" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-          <span style={{ fontSize: 9, letterSpacing: 2, textTransform: "uppercase", fontWeight: 700, color: "#8892a0" }}>{editingAgent ? "EDIT AGENT" : "NEW AGENT"}</span>
+          <span style={{ fontSize: 9, letterSpacing: 2, textTransform: "uppercase", fontWeight: 700, color: "#8892a0" }}>{editingAgent ? "EDIT PILOT" : "NEW PILOT"}</span>
           <button onClick={() => setMode("roster")} style={{ fontSize: 8, background: "none", border: "1px solid #21262d", color: "#4a5568", borderRadius: 3, padding: "1px 6px", cursor: "pointer", fontFamily: "inherit" }}>CANCEL</button>
         </div>
         {editingAgent && <div style={{ fontSize: 7, color: "#e67e22", background: "rgba(230,126,34,0.1)", border: "1px solid rgba(230,126,34,0.2)", borderRadius: 3, padding: "2px 6px", marginBottom: 6 }}>changing config resets elo and record to 0</div>}
-        <input value={editName} onChange={(e) => setEditName(e.target.value)} placeholder="Agent name..."
+        <input value={editName} onChange={(e) => setEditName(e.target.value)} placeholder="Pilot name..."
           style={{ width: "100%", padding: "5px 8px", fontSize: 11, fontWeight: 700, background: "#161b22", border: "1px solid #21262d", borderRadius: 4, color: "#c8d0da", fontFamily: "inherit", marginBottom: 6, boxSizing: "border-box" }} />
         {!editingAgent && suggestions.length > 0 && (
           <div style={{ display: "flex", flexWrap: "wrap", gap: 3, marginBottom: 8 }}>
@@ -1226,7 +1284,22 @@ function RosterPanel({ side, color, selectedAgent, onSelect, roster, disabled, m
             ))}
           </div>
         )}
-        {SLIDER_KEYS.map(s => <Slider key={s.key} sliderKey={s.key} label={s.key.replace("_", " ")} value={editConfig[s.key]} color={color} onChange={(v) => handleSliderChange(s.key, v)} disabled={false} showDesc={true} />)}
+        {(() => {
+          const total = CK_SLIDERS.reduce((s, k) => s + (editConfig[k] ?? 0), 0);
+          return (
+            <div style={{ marginBottom: 6 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 2 }}>
+                <span style={{ fontSize: 7, letterSpacing: 1, fontWeight: 700, color: "#8892a0" }}>ALLOCATED</span>
+                <span style={{ fontSize: 8, fontWeight: 700, color: total === AGENT_BUDGET ? "#2ecc71" : "#f39c12" }}>{total} / {AGENT_BUDGET}</span>
+              </div>
+              <div style={{ height: 3, background: "#161b22", borderRadius: 2, overflow: "hidden" }}>
+                <div style={{ width: `${Math.min(100, total / AGENT_BUDGET * 100)}%`, height: "100%", background: color, transition: "width 0.18s ease-out" }} />
+              </div>
+              <div style={{ fontSize: 6, color: "#4a5568", marginTop: 2, fontStyle: "italic" }}>Spend 200 points. Raising one trait drains the others — trade-offs make the Pilot.</div>
+            </div>
+          );
+        })()}
+        {SLIDER_KEYS.map(s => <Slider key={s.key} sliderKey={s.key} label={s.key.replace("_", " ")} value={editConfig[s.key]} color={color} onChange={(v) => handleSliderChange(s.key, v)} disabled={false} showDesc={true} min={SL_MIN} max={SL_MAX} />)}
         <div style={{ fontSize: 8, color: "#8892a0", marginTop: 2, padding: "2px 0" }}>ARCHETYPE: <span style={{ fontWeight: 700 }}>{detectArchetype(editConfig)}</span></div>
         <OverextWarning config={editConfig} />
         <button onClick={handleSave} disabled={saving || !editName.trim()} style={{
@@ -1234,7 +1307,7 @@ function RosterPanel({ side, color, selectedAgent, onSelect, roster, disabled, m
           background: editName.trim() ? "linear-gradient(135deg, #2ecc71, #27ae60)" : "#21262d",
           color: editName.trim() ? "#fff" : "#4a5568", fontWeight: 700, fontSize: 10, letterSpacing: 2, textTransform: "uppercase",
           cursor: editName.trim() ? "pointer" : "not-allowed", fontFamily: "inherit",
-        }}>{saving ? "SAVING..." : editingAgent ? "SAVE CHANGES" : "SAVE AGENT"}</button>
+        }}>{saving ? "SAVING..." : editingAgent ? "SAVE CHANGES" : "SAVE PILOT"}</button>
       </div>
     );
   }
@@ -1590,7 +1663,7 @@ function MultiplayerLobby({ roster, onBack }) {
 
       {modal && <CryptoModal kind={modal} balance={realBal} onClose={() => { setModal(null); loadRealBalance(); }} doDeposit={doDeposit} doWithdraw={doWithdraw} />}
 
-      <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 1, marginBottom: 4, marginTop: 12, textTransform: "uppercase" }}>Your agent {isReal && <span style={{ color: "#2ecc71" }}>(level 3+, 10+ matches)</span>}</div>
+      <div style={{ fontSize: 8, color: "#4a5568", letterSpacing: 1, marginBottom: 4, marginTop: 12, textTransform: "uppercase" }}>Your Pilot {isReal && <span style={{ color: "#2ecc71" }}>(level 3+, 10+ matches)</span>}</div>
       <div style={{ maxHeight: 200, overflowY: "auto", marginBottom: 12 }}>
         {roster.map(a => <AgentCard key={a.id} agent={a} selected={selectedAgent?.id === a.id} onClick={() => setSelectedAgent(a)} compact />)}
       </div>
@@ -1636,7 +1709,7 @@ function MultiplayerLobby({ roster, onBack }) {
       {queueStatus && (
         <div style={{ textAlign: "center", padding: "12px", background: "#0d1117", border: "1px solid #9b59b633", borderRadius: 6, marginTop: 8 }}>
           <div style={{ fontSize: 11, color: "#9b59b6", letterSpacing: 2, marginBottom: 6 }}>SEARCHING FOR OPPONENT...</div>
-          <div style={{ fontSize: 9, color: "#8892a0", marginBottom: 2 }}>Your agent: <span style={{ color: "#c8d0da", fontWeight: 700 }}>{selectedAgent?.name}</span> ({selectedAgent?.elo} elo)</div>
+          <div style={{ fontSize: 9, color: "#8892a0", marginBottom: 2 }}>Your Pilot: <span style={{ color: "#c8d0da", fontWeight: 700 }}>{selectedAgent?.name}</span> ({selectedAgent?.elo} elo)</div>
           <div style={{ fontSize: 9, color: "#8892a0", marginBottom: 2 }}>
             {queueStatus.matching_anyone
               ? "Search range: any opponent"
@@ -1670,7 +1743,7 @@ function clientDiversity(a, b) {
 
 function edgeComboDesc(pa, pb) {
   if (!pa && !pb) return "No edges equipped";
-  if (!pa || !pb) return `${EDGE_SHORT[pa || pb] || "Edge"} on one agent`;
+  if (!pa || !pb) return `${EDGE_SHORT[pa || pb] || "Edge"} on one Pilot`;
   const a = EDGE_SHORT[pa], b = EDGE_SHORT[pb];
   const tag = { rope_a_dope: "defend", press: "force action", momentum: "attack", anchor: "fortress", phantom: "counter", siege: "siege", flux: "chaos" };
   return `${a} + ${b} (${tag[pa] || "?"} + ${tag[pb] || "?"})`;
@@ -2356,6 +2429,19 @@ export default function App() {
   if (appMode === "tagteam") {
     return <TagTeam roster={roster} onBack={() => { setAppMode("match"); loadRoster(); }} loadRoster={loadRoster} loadWallet={loadWallet} />;
   }
+  if (appMode === "arena") {
+    return (
+      <div style={{ minHeight: "100vh", padding: "16px 12px" }}>
+        <div style={{ textAlign: "center", marginBottom: 8 }}>
+          <div style={{ display: "flex", justifyContent: "center", gap: 6, marginBottom: 8 }}>
+            <button onClick={() => setAppMode("match")} style={{ padding: "4px 16px", fontSize: 9, fontWeight: 700, letterSpacing: 2, fontFamily: "inherit", cursor: "pointer", background: "#0d1117", border: "1px solid #2ecc7166", color: "#2ecc71", borderRadius: 3 }}>CHECKERS</button>
+            <button style={{ padding: "4px 16px", fontSize: 9, fontWeight: 700, letterSpacing: 2, fontFamily: "inherit", cursor: "pointer", background: "#161b22", border: "1px solid #e74c3c", color: "#e74c3c", borderRadius: 3 }}>ARENA</button>
+          </div>
+        </div>
+        <Arena agents={roster} />
+      </div>
+    );
+  }
 
   return (
     <div style={{ minHeight: "100vh", padding: "16px 12px" }}>
@@ -2389,6 +2475,7 @@ export default function App() {
           <button onClick={() => setAppMode("tournament")} style={{ padding: "4px 16px", fontSize: 9, fontWeight: 700, letterSpacing: 2, fontFamily: "inherit", cursor: "pointer", background: "#0d1117", border: "1px solid #f39c1266", color: "#f39c12", borderRadius: 3, textTransform: "uppercase" }}>TOURNAMENT</button>
           <button onClick={() => setAppMode("multiplayer")} style={{ padding: "4px 16px", fontSize: 9, fontWeight: 700, letterSpacing: 2, fontFamily: "inherit", cursor: "pointer", background: "#0d1117", border: "1px solid #9b59b666", color: "#9b59b6", borderRadius: 3, textTransform: "uppercase" }}>MULTIPLAYER</button>
           <button onClick={() => setAppMode("tagteam")} style={{ padding: "4px 16px", fontSize: 9, fontWeight: 700, letterSpacing: 2, fontFamily: "inherit", cursor: "pointer", background: "#0d1117", border: "1px solid #1abc9c66", color: "#1abc9c", borderRadius: 3, textTransform: "uppercase" }}>TAG TEAM</button>
+          <button onClick={() => setAppMode("arena")} style={{ padding: "4px 16px", fontSize: 9, fontWeight: 700, letterSpacing: 2, fontFamily: "inherit", cursor: "pointer", background: "#0d1117", border: "1px solid #e74c3c66", color: "#e74c3c", borderRadius: 3, textTransform: "uppercase" }}>ARENA</button>
         </div>
       </div>
 
@@ -2398,8 +2485,8 @@ export default function App() {
             <span style={{ fontSize: 8, fontWeight: 700, letterSpacing: 2, color: "#4a5568", textTransform: "uppercase" }}>How it works</span>
             <button onClick={() => setShowHelp(false)} style={{ fontSize: 8, background: "none", border: "none", color: "#4a5568", cursor: "pointer", fontFamily: "inherit" }}>X</button>
           </div>
-          <div>1. Pick your agent, then choose an opponent — a coach bot, or another agent in Sandbox.</div>
-          <div>2. Each agent has 5 personality sliders: aggression, risk, king priority, edge play, trade-down.</div>
+          <div>1. Pick your Pilot, then choose an opponent — a coach bot, or another Pilot in Sandbox.</div>
+          <div>2. Each Pilot has 5 personality sliders: aggression, risk, king priority, edge play, trade-down.</div>
           <div>3. Optionally bet on the winner, then watch them play it out. Best personality wins.</div>
         </div>
       ) : (
@@ -2484,7 +2571,7 @@ export default function App() {
                    opponent picker stays near the top (critical on mobile / first run). */
                 <div style={{ width: "100%", maxWidth: 380, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "center", border: "1px dashed #1a1f2b", borderRadius: 8, background: "#0a0c10", padding: "26px 16px" }}>
                   <div style={{ textAlign: "center", color: "#3a4450", fontSize: 10, letterSpacing: 1, lineHeight: 1.6 }}>
-                    {canGo ? "▶ Press WATCH or GO — the match plays out here" : "Pick your agent + an opponent — the match plays out here"}
+                    {canGo ? "▶ Press WATCH or GO — the match plays out here" : "Pick your Pilot + an opponent — the match plays out here"}
                   </div>
                 </div>
               )}
@@ -2702,9 +2789,9 @@ export default function App() {
               const loserAgent = loser === "red" ? result.red_agent : result.black_agent;
               const loserCfg = loserAgent || {};
               let suggestion = "Tough loss. Try a different perk or adjust sliders for this matchup.";
-              if ((loserCfg.aggression || 50) > 70 && result.move_count < 60) suggestion = "Your agent overextended. Consider lowering risk tolerance or adding Counter.";
-              else if ((loserCfg.aggression || 50) < 30) suggestion = "Your agent was too passive. Consider raising aggression or adding Surge.";
-              else if (turningMove > 0 && turningMove < result.move_count * 0.4) suggestion = "Your agent fell behind early. Consider a more aggressive opening config.";
+              if ((loserCfg.aggression || 50) > 70 && result.move_count < 60) suggestion = "Your Pilot overextended. Consider lowering risk tolerance or adding Counter.";
+              else if ((loserCfg.aggression || 50) < 30) suggestion = "Your Pilot was too passive. Consider raising aggression or adding Surge.";
+              else if (turningMove > 0 && turningMove < result.move_count * 0.4) suggestion = "Your Pilot fell behind early. Consider a more aggressive opening config.";
               else if (result.move_count > 80) suggestion = "Long match. Consider raising king priority for better endgame play.";
               return (
                 <div style={{ width: "100%", padding: "6px 10px", background: "#0a0c10", border: "1px solid #1a1f2b", borderRadius: 4, fontSize: 8, marginTop: 4 }}>

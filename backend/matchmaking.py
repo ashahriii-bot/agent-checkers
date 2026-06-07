@@ -149,6 +149,107 @@ class MatchmakingQueue:
 queue = MatchmakingQueue()
 
 
+# --- Arena queue (separate from Checkers) ---
+
+@dataclass
+class ArenaQueueEntry:
+    player_id: int
+    display_name: str
+    websocket: WebSocket
+    team: list[dict]        # [{species, aggression, risk_tolerance, target_focus, positioning, sacrifice, agent_id?}]
+    team_elo: float = 1200  # average of agents' elo, or 1200 if custom
+    joined_at: float = 0
+
+
+class ArenaMatchmakingQueue:
+    """Same elo-banded matching as Checkers, but for Arena 3v3 teams."""
+
+    def __init__(self):
+        self.entries: list[ArenaQueueEntry] = []
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _compatible(a: ArenaQueueEntry, b: ArenaQueueEntry) -> bool:
+        return a.player_id != b.player_id
+
+    @staticmethod
+    def _in_band(a: ArenaQueueEntry, b: ArenaQueueEntry, now: float) -> bool:
+        wait = max(now - a.joined_at, now - b.joined_at)
+        band = elo_band_for_wait(wait)
+        if band is None:
+            return True
+        return abs(a.team_elo - b.team_elo) <= band
+
+    @staticmethod
+    def _ordered(a: ArenaQueueEntry, b: ArenaQueueEntry) -> tuple[ArenaQueueEntry, ArenaQueueEntry]:
+        return (a, b) if a.team_elo >= b.team_elo else (b, a)
+
+    async def add(self, entry: ArenaQueueEntry) -> Optional[tuple[ArenaQueueEntry, ArenaQueueEntry]]:
+        async with self._lock:
+            now = time.time()
+            for e in self.entries:
+                if self._compatible(entry, e) and self._in_band(entry, e, now):
+                    self.entries.remove(e)
+                    return self._ordered(entry, e)
+            self.entries.append(entry)
+            return None
+
+    async def pop_ready_match(self) -> Optional[tuple[ArenaQueueEntry, ArenaQueueEntry]]:
+        async with self._lock:
+            now = time.time()
+            n = len(self.entries)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    a, b = self.entries[i], self.entries[j]
+                    if self._compatible(a, b) and self._in_band(a, b, now):
+                        self.entries.remove(a)
+                        self.entries.remove(b)
+                        return self._ordered(a, b)
+            return None
+
+    async def pop_timed_out(self, max_wait: float = MATCH_TIMEOUT_SECONDS) -> list[ArenaQueueEntry]:
+        async with self._lock:
+            now = time.time()
+            timed_out = [e for e in self.entries if now - e.joined_at > max_wait]
+            if timed_out:
+                drop = {id(e) for e in timed_out}
+                self.entries = [e for e in self.entries if id(e) not in drop]
+            return timed_out
+
+    async def remove(self, player_id: int):
+        async with self._lock:
+            self.entries = [e for e in self.entries if e.player_id != player_id]
+
+    async def remove_by_ws(self, ws: WebSocket):
+        async with self._lock:
+            self.entries = [e for e in self.entries if e.websocket != ws]
+
+    async def get_status(self, player_id: int) -> dict:
+        async with self._lock:
+            size = len(self.entries)
+            for i, e in enumerate(self.entries):
+                if e.player_id == player_id:
+                    wait = time.time() - e.joined_at
+                    band = elo_band_for_wait(wait)
+                    return {
+                        "position": i + 1,
+                        "wait_time": int(wait),
+                        "elo_range": band,
+                        "matching_anyone": band is None,
+                        "widen_in": seconds_until_widen(wait),
+                        "players_in_queue": size,
+                    }
+        return {"position": 0, "wait_time": 0, "elo_range": 100,
+                "matching_anyone": False, "widen_in": 15, "players_in_queue": 0}
+
+    @property
+    def size(self) -> int:
+        return len(self.entries)
+
+
+arena_queue = ArenaMatchmakingQueue()
+
+
 # --- online player tracking ---
 
 class OnlineTracker:

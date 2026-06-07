@@ -3,6 +3,7 @@
 import json
 import random
 import re
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -33,6 +34,8 @@ from database import (
     save_match, save_team_match, get_matches, get_match, get_leaderboard, get_agent_leaderboard,
     get_elo, update_elo, update_elo_record,
     create_agent, get_agents, get_agent, update_agent, delete_agent, update_agent_after_match,
+    update_arena_record,
+    create_series, get_series, update_series,
     save_tournament, get_tournaments, get_tournament,
     set_agent_perk, VALID_PERKS,
     get_wallet, place_bet, settle_bet, get_bet_history,
@@ -694,8 +697,11 @@ def _generate_random_agent(used_names: set[str]) -> dict:
 def api_create_agent(req: CreateAgentRequest):
     if not NAME_RE.match(req.name):
         raise HTTPException(400, "name must be 2-24 chars: letters, numbers, spaces, hyphens")
-    agent = create_agent(req.name, req.aggression, req.risk_tolerance,
-                         req.king_priority, req.edge_affinity, req.trade_down)
+    # Universal 250-point budget: coerce to a legal build so no agent is ever
+    # stored over budget (anti-cheat; the forge UI sends valid 250 already).
+    a, r, k, e, t = normalize_list([req.aggression, req.risk_tolerance,
+                                    req.king_priority, req.edge_affinity, req.trade_down])
+    agent = create_agent(req.name, a, r, k, e, t)
     if agent is None:
         raise HTTPException(400, "agent name already taken")
     return agent
@@ -718,9 +724,20 @@ def api_get_agent(agent_id: int):
 def api_update_agent(agent_id: int, req: UpdateAgentRequest):
     if req.name is not None and not NAME_RE.match(req.name):
         raise HTTPException(400, "name must be 2-24 chars: letters, numbers, spaces, hyphens")
-    agent = update_agent(agent_id, name=req.name, aggression=req.aggression,
-                         risk_tolerance=req.risk_tolerance, king_priority=req.king_priority,
-                         edge_affinity=req.edge_affinity, trade_down=req.trade_down)
+    provided = [req.aggression, req.risk_tolerance, req.king_priority, req.edge_affinity, req.trade_down]
+    if any(v is not None for v in provided):
+        # A slider changed: merge with current, then coerce the full set to the
+        # 250 budget so the stored agent stays legal.
+        cur = get_agent(agent_id)
+        if cur is None:
+            raise HTTPException(404, "agent not found")
+        cols = ["aggression", "risk_tolerance", "king_priority", "edge_affinity", "trade_down"]
+        eff = [provided[i] if provided[i] is not None else cur[cols[i]] for i in range(5)]
+        a, r, k, e, t = normalize_list(eff)
+        agent = update_agent(agent_id, name=req.name, aggression=a, risk_tolerance=r,
+                             king_priority=k, edge_affinity=e, trade_down=t)
+    else:
+        agent = update_agent(agent_id, name=req.name)  # name-only edit
     if agent is None:
         raise HTTPException(404, "agent not found or name taken")
     return agent
@@ -1361,15 +1378,17 @@ def _simulate_team_game(req: SimulateRequest):
             if not opt:
                 continue
             try:
-                place_bet("prop", f"{pb.type}:{pb.selection}", pb.amount, opt["odds"], match_id=match_id)
+                pb_info = place_bet("prop", f"{pb.type}:{pb.selection}", pb.amount, opt["odds"], match_id=match_id)
             except ValueError as e:
                 raise HTTPException(400, str(e))
             add_to_jackpot(pb.amount)
-            prop_inputs.append({"type": pb.type, "selection": pb.selection, "amount": pb.amount, "odds": opt["odds"]})
+            prop_inputs.append({"type": pb.type, "selection": pb.selection, "amount": pb.amount,
+                                "odds": opt["odds"], "bet_id": pb_info["bet_id"]})
         prop_results = resolve_team_props(prop_inputs, winner, game["team_dynamics"])
-        for pr in prop_results:
-            if pr["result"] == "win":
-                settle_bet(0, "win", pr["payout"])
+        # Settle each prop against its OWN bet row; props never move the cosmetic
+        # win-streak (affect_streak=False). resolve_team_props returns win/loss only.
+        for pin, pr in zip(prop_inputs, prop_results):
+            settle_bet(pin["bet_id"], pr["result"], pr["payout"], affect_streak=False)
         resp["prop_results"] = prop_results
 
     return resp
@@ -1471,6 +1490,110 @@ def generate_commentary(summary):
         for ln in lines:
             if isinstance(ln, dict) and "move" in ln and "text" in ln:
                 out.append({"move": int(ln["move"]), "text": str(ln["text"])[:120]})
+        return out[:8]
+    except Exception:
+        return []
+
+
+# --- Arena commentary (uses same API key / model as checkers commentary) ------
+
+def build_arena_summary(result_dict: dict) -> dict:
+    """Compact arena match summary for the commentary prompt."""
+    red = result_dict.get("red_team", [])
+    blue = result_dict.get("blue_team", [])
+    drama = result_dict.get("drama_beats", [])
+
+    def _team_desc(team):
+        return ", ".join(
+            f"{c.get('temperament', 'ADAPTIVE')} {c.get('species', '?').upper()}"
+            + (f" (agent: {c['agent_name']})" if c.get("agent_name") else "")
+            for c in team
+        )
+
+    # Collect key moments from drama beats
+    beats = []
+    for d in drama[:5]:
+        dtype = d.get("type", "")
+        cid = d.get("creature_id", "?")
+        rnd = d.get("round", "?")
+        if dtype == "kill":
+            victim = d.get("data", {}).get("victim_id", "?")
+            beats.append(f"Round {rnd}: {cid} kills {victim}")
+        elif dtype == "breach_complete":
+            beats.append(f"Round {rnd}: {cid} breaches the gate")
+        elif dtype == "breach_denied":
+            beats.append(f"Round {rnd}: {cid}'s breach denied")
+        elif dtype == "last_stand":
+            beats.append(f"Round {rnd}: {cid} activates LAST STAND")
+        elif dtype == "ring_out":
+            beats.append(f"Round {rnd}: {cid} claimed by the void")
+
+    return {
+        "red_team": _team_desc(red),
+        "blue_team": _team_desc(blue),
+        "winner": result_dict.get("winner", "draw"),
+        "win_method": result_dict.get("win_method", "unknown"),
+        "total_rounds": result_dict.get("total_rounds", 0),
+        "drama_beats": "; ".join(beats) or "no major drama beats",
+    }
+
+
+def _arena_commentary_prompt(s: dict) -> str:
+    return (
+        "You are a legendary arena sportscaster for THE ARENA, a hex-grid combat game "
+        "where teams of 3 Guardians — each flown by a Pilot with a temperament like "
+        "BERSERKER, HEADHUNTER, TURTLE, STALKER, MARTYR, TACTICIAN, or ADAPTIVE — fight to "
+        "eliminate the enemy team or breach their gate. The Pilot is the AI personality "
+        "calling every move; the Guardian (one of 5 species) is the body it flies.\n\n"
+        "Match data:\n"
+        f"- Red team: {s['red_team']}\n"
+        f"- Blue team: {s['blue_team']}\n"
+        f"- Winner: {s['winner']} by {s['win_method']}\n"
+        f"- Total rounds: {s['total_rounds']}\n"
+        f"- Key moments: {s['drama_beats']}\n\n"
+        "Generate 5-7 commentary lines keyed to specific round numbers. Rules:\n"
+        "- Reference each combatant by its Pilot's TEMPERAMENT + Guardian SPECIES (e.g. 'BERSERKER Razorwing')\n"
+        "- Make temperament matter — a TURTLE Pilot playing cautious, a BERSERKER diving in\n"
+        "- Call out kills, breaches, last stands, and ring outs with energy\n"
+        "- Build tension: early setup → mid clash → climactic finish\n"
+        "- Each line is ONE sentence, max 18 words\n"
+        "- Be hype, conversational, dramatic — like a fight commentator\n\n"
+        "Respond in JSON only, no markdown:\n"
+        '[{"round": 1, "text": "..."}, ...]'
+    )
+
+
+def generate_arena_commentary(result_dict: dict) -> list[dict]:
+    """Call Claude for arena sportscaster commentary. Returns [] if no API key or on error."""
+    if not ANTHROPIC_API_KEY:
+        return []
+    try:
+        summary = build_arena_summary(result_dict)
+        body = {
+            "model": COMMENTARY_MODEL,
+            "max_tokens": 700,
+            "messages": [{"role": "user", "content": _arena_commentary_prompt(summary)}],
+        }
+        req = _urlreq.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=json.dumps(body).encode(),
+            headers={"content-type": "application/json", "x-api-key": ANTHROPIC_API_KEY,
+                     "anthropic-version": "2023-06-01"},
+            method="POST",
+        )
+        with _urlreq.urlopen(req, timeout=15) as r:
+            data = json.load(r)
+        text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text[:4].lower() == "json":
+                text = text[4:]
+            text = text.strip()
+        lines = json.loads(text)
+        out = []
+        for ln in lines:
+            if isinstance(ln, dict) and "round" in ln and "text" in ln:
+                out.append({"round": int(ln["round"]), "text": str(ln["text"])[:140]})
         return out[:8]
     except Exception:
         return []
@@ -1674,21 +1797,21 @@ def simulate_game(req: SimulateRequest):
             if not opt:
                 continue
             try:
-                place_bet("prop", f"{pb.type}:{pb.selection}", pb.amount, opt["odds"], match_id=match_id)
+                pb_info = place_bet("prop", f"{pb.type}:{pb.selection}", pb.amount, opt["odds"], match_id=match_id)
             except ValueError as e:
                 raise HTTPException(400, str(e))
             add_to_jackpot(pb.amount)
             prop_inputs.append({"type": pb.type, "selection": pb.selection, "amount": pb.amount,
-                                "odds": opt["odds"], "line": prop_def.get("line")})
+                                "odds": opt["odds"], "line": prop_def.get("line"),
+                                "bet_id": pb_info["bet_id"]})
 
         prop_results = resolve_props(game["boards"], game["moves"], game["events"], prop_inputs, game["winner"])
 
-        # settle each prop
-        for pr in prop_results:
-            if pr["result"] == "win":
-                settle_bet(0, "win", pr["payout"])  # uses wallet directly
-            elif pr["result"] == "push":
-                settle_bet(0, "win", pr["payout"])  # refund on push
+        # Settle each prop against its OWN bet row (resolve_props returns one result
+        # per input, in order). A win/loss/push is recorded correctly and the
+        # cosmetic win-streak is never moved by a prop (affect_streak=False).
+        for pin, pr in zip(prop_inputs, prop_results):
+            settle_bet(pin["bet_id"], pr["result"], pr["payout"], affect_streak=False)
 
         resp["prop_results"] = prop_results
 
@@ -2252,9 +2375,785 @@ def leaderboard(limit: int = 20):
     return {"agents": get_agent_leaderboard(limit)}
 
 
+# ---------------------------------------------------------------------------
+# Arena
+# ---------------------------------------------------------------------------
+
+from arena_species import Species as ArenaSpecies
+from arena_engine import CreatureConfig, simulate_match as arena_simulate
+from arena_props import calculate_arena_props, resolve_arena_props, ROUNDS_LINE
+from arena_budget import normalize_to_budget, validate_budget, normalize_list
+
+
+class ArenaCreatureIn(BaseModel):
+    species: str
+    agent_id: Optional[int] = None
+    aggression: int = 50
+    risk_tolerance: int = 50
+    target_focus: int = 50
+    positioning: int = 50
+    sacrifice: int = 50
+    upgrade: Optional[str] = None
+    name: Optional[str] = None
+
+
+class ArenaSimulateRequest(BaseModel):
+    red_team: list[ArenaCreatureIn]
+    blue_team: list[ArenaCreatureIn]
+
+
+def _build_arena_configs(team_in: list[ArenaCreatureIn]) -> list[CreatureConfig]:
+    """Turn arena creature inputs into validated CreatureConfigs.
+
+    Saved agents (agent_id set) are re-attuned to the 200 arena budget preserving
+    shape; custom builds are anti-cheat validated (every slider 5-80, sum 200).
+    Shared by /api/arena/simulate and the server-authoritative bet path, so the
+    comp a bet is priced and simulated against is always a legal one.
+    """
+    valid_species = {s.value for s in ArenaSpecies}
+    configs: list[CreatureConfig] = []
+    for c in team_in:
+        if c.species not in valid_species:
+            raise HTTPException(400, f"invalid species: {c.species}")
+        agent_name = (c.name or "").strip()
+        if c.agent_id:
+            # Saved agent (AC sliders are 0-100, unconstrained) -> re-attune to
+            # the arena's 200 budget, preserving shape.
+            agent = get_agent(c.agent_id)
+            if agent:
+                agent_name = agent["name"]
+                norm = normalize_to_budget({
+                    "aggression": agent["aggression"],
+                    "risk_tolerance": agent["risk_tolerance"],
+                    "target_focus": agent.get("king_priority", 50),
+                    "positioning": agent.get("edge_affinity", 50),
+                    "sacrifice": agent.get("trade_down", 50),
+                })
+                c.aggression, c.risk_tolerance = norm["aggression"], norm["risk_tolerance"]
+                c.target_focus, c.positioning, c.sacrifice = norm["target_focus"], norm["positioning"], norm["sacrifice"]
+        else:
+            # Custom build: anti-cheat — must spend exactly 200, every slider 5-80.
+            if not validate_budget({
+                "aggression": c.aggression, "risk_tolerance": c.risk_tolerance,
+                "target_focus": c.target_focus, "positioning": c.positioning, "sacrifice": c.sacrifice,
+            }):
+                raise HTTPException(400, "each custom Pilot must spend exactly 200 points (every slider 5-80)")
+        configs.append(CreatureConfig(
+            species=ArenaSpecies(c.species),
+            agent_name=agent_name,
+            aggression=c.aggression,
+            risk_tolerance=c.risk_tolerance,
+            target_focus=c.target_focus,
+            positioning=c.positioning,
+            sacrifice=c.sacrifice,
+            upgrade=c.upgrade,
+        ))
+    return configs
+
+
+def _arena_price_dict(cfg: CreatureConfig) -> dict:
+    """The plain slider dict calculate_arena_props prices from — derived from the
+    SAME CreatureConfig that gets simulated, so the priced odds and the simulated
+    comp can never diverge."""
+    return {
+        "species": cfg.species.value,
+        "aggression": cfg.aggression,
+        "risk_tolerance": cfg.risk_tolerance,
+        "target_focus": cfg.target_focus,
+        "positioning": cfg.positioning,
+        "sacrifice": cfg.sacrifice,
+    }
+
+
+@app.post("/api/arena/simulate")
+def arena_simulate_game(req: ArenaSimulateRequest):
+    if len(req.red_team) < 1 or len(req.red_team) > 3:
+        raise HTTPException(400, "red_team must have 1-3 creatures")
+    if len(req.blue_team) < 1 or len(req.blue_team) > 3:
+        raise HTTPException(400, "blue_team must have 1-3 creatures")
+
+    red = _build_arena_configs(req.red_team)
+    blue = _build_arena_configs(req.blue_team)
+    result = arena_simulate(red, blue)
+    resp = result.to_dict()
+
+    # Optional AI commentary — no-op (returns []) unless ANTHROPIC_API_KEY is set
+    resp["commentary"] = generate_arena_commentary(resp)
+
+    # Persist the Arena result into each deployed Pilot's record (P5/§8): every
+    # Arena match now counts toward the thing you own.
+    _write_arena_records(resp, req.red_team, req.blue_team)
+
+    return resp
+
+
+def _write_arena_records(resp: dict, red_in: list, blue_in: list) -> None:
+    """Accrue kills/deaths/W-L onto every deployed (agent_id) Pilot from the sim.
+    Creature ids follow `{team}_{index}`, matching deploy order."""
+    winner = resp.get("winner")
+    kills: dict[str, int] = {}
+    dead: set[str] = set()
+    for e in resp.get("events", []):
+        if e.get("type") == "kill":
+            killer = (e.get("data") or {}).get("killer")
+            if killer:
+                kills[killer] = kills.get(killer, 0) + 1
+            victim = e.get("creature_id")
+            if victim:
+                dead.add(victim)
+    for team_in, team in ((red_in, "red"), (blue_in, "blue")):
+        for i, c in enumerate(team_in):
+            if not c.agent_id:
+                continue
+            cid = f"{team}_{i}"
+            outcome = "win" if winner == team else ("loss" if winner in ("red", "blue") else "draw")
+            update_arena_record(c.agent_id, outcome, kills.get(cid, 0), 1 if cid in dead else 0)
+
+
+# --- Arena series (P3, §5.2) ---
+# A series runs the same combat one game at a time so lineups can change between
+# games (Pilot/upgrade swaps, §5.3). The arena_series row is the server-trusted
+# record: it locks each side's Guardian species for the whole series and stores
+# the sealed arena_matches id of every game. Free-play series bets are currently
+# resolved client-side (like the existing prop book); those sealed per-game ids
+# are the basis for SERVER-authoritative settlement when a real-money series
+# market ships (gated on the series audit + pot-split, §7.3/§7.4). First to
+# ceil(N/2) wins.
+
+SERIES_FORMATS = {"bo1": 1, "bo3": 3, "bo5": 5}
+
+
+def _series_games_needed(max_games: int) -> int:
+    """First to ceil(N/2): bo1->1, bo3->2, bo5->3."""
+    return (max_games // 2) + 1
+
+
+# Serializes the per-series read-modify-write in arena_series_next. Sync FastAPI
+# endpoints run concurrently in Starlette's threadpool with separate SQLite
+# connections and no DB-level row lock, so two concurrent "play next game" POSTs
+# could each pass the `status == active` guard and both simulate a game (lost
+# update on the score + a phantom arena_match + inflated Pilot records). This is
+# a single-process app, so one in-process lock around the critical section is
+# enough; the game_index precondition (checked under the lock) makes a duplicate
+# a clean no-op rather than a second game. §5.2/§5.5.
+_series_advance_lock = threading.Lock()
+
+
+class ArenaSeriesStartRequest(BaseModel):
+    format: str = "bo3"
+    red_team: list[ArenaCreatureIn]
+    blue_team: list[ArenaCreatureIn]
+    survival: bool = False  # P5 ruleset (opt-in, built in Phase 7); stored, inert here
+
+
+class ArenaSeriesNextRequest(BaseModel):
+    red_team: list[ArenaCreatureIn]
+    blue_team: list[ArenaCreatureIn]
+    # Idempotency token (§5.5): the number of games the client has already seen,
+    # i.e. the game it expects to play next. The server rejects the POST if the
+    # series has moved past it — so a double-fired "play next game" (12s
+    # auto-advance racing a KEEP click, a retry, or a second tab) can't simulate
+    # and persist a phantom game. Optional for back-compat; the UI always sends it.
+    game_index: Optional[int] = None
+
+
+def _validate_team_sizes(red_team: list, blue_team: list) -> None:
+    if not (1 <= len(red_team) <= 3):
+        raise HTTPException(400, "red_team must have 1-3 Guardians")
+    if not (1 <= len(blue_team) <= 3):
+        raise HTTPException(400, "blue_team must have 1-3 Guardians")
+
+
+def _reject_clones(team_in: list) -> None:
+    """§5.3: each Pilot flies only one Guardian — no duplicate agent_ids in a lineup."""
+    ids = [c.agent_id for c in team_in if c.agent_id]
+    if len(ids) != len(set(ids)):
+        raise HTTPException(400, "each Pilot can fly only one Guardian (no cloning within a lineup)")
+
+
+def _check_ownership(team_in: list, owner: int | None) -> None:
+    """§5.3 hard prerequisite (F1): a player may only fly Pilots they own."""
+    if not owner:
+        return
+    owned = {a["id"] for a in get_agents(owner)}
+    for c in team_in:
+        if c.agent_id and c.agent_id not in owned:
+            raise HTTPException(403, f"Pilot {c.agent_id} is not owned by player {owner}")
+
+
+def _require_owned_pilots(team_in: list) -> None:
+    """Survival (§5.4): every Guardian must be flown by a SAVED Pilot, so benching
+    has a durable identity to ground (custom one-off builds have none)."""
+    if any(c.agent_id is None for c in team_in):
+        raise HTTPException(400, "Survival Series requires every Guardian flown by a saved Pilot")
+
+
+def _reject_benched(team_in: list, benched: list) -> None:
+    """§5.3/§5.4: a benched Pilot is grounded for the rest of the series — it can't
+    be re-fielded."""
+    bset = set(benched or [])
+    for c in team_in:
+        if c.agent_id and c.agent_id in bset:
+            raise HTTPException(400, f"Pilot {c.agent_id} is benched for the rest of the series")
+
+
+def _run_arena_series_game(red_cfgs, blue_cfgs, red_in, blue_in):
+    """Simulate one series game, seal it as the authoritative record, and accrue
+    each deployed Pilot's per-game record. Returns (resp, arena_match_id)."""
+    from database import save_arena_match
+    result = arena_simulate(red_cfgs, blue_cfgs)
+    resp = result.to_dict()
+    resp["commentary"] = generate_arena_commentary(resp)
+    red_ids = [c.agent_id for c in red_in]
+    blue_ids = [c.agent_id for c in blue_in]
+    match_id = save_arena_match(resp, red_agent_ids=red_ids, blue_agent_ids=blue_ids)
+    _write_arena_records(resp, red_in, blue_in)
+    return resp, match_id
+
+
+def _roster_min(max_games: int) -> int:
+    """Survival roster minimum (§5.4): Single 3, Bo3 4, Bo5 5 — field 3 + a buffer."""
+    return 3 + (max_games - 1) // 2
+
+
+def _survival_benched(series: dict, resp: dict, red_in: list) -> list:
+    """Loser-only benching (§5.4): if RED LOST this game, ground every red Pilot
+    whose Guardian died. Winners keep all Pilots; a drawn game grounds no one.
+    (Single-player: only the player's red roster benches; the AI gauntlet does not.)"""
+    if not series.get("survival") or resp.get("winner") != "blue":
+        return []
+    dead = {e.get("creature_id") for e in resp.get("events", [])
+            if e.get("type") == "kill" and e.get("creature_id")}
+    return [c.agent_id for i, c in enumerate(red_in)
+            if c.agent_id and f"red_{i}" in dead]
+
+
+def _advance_series(series: dict, resp: dict, match_id: int, newly_benched=()) -> dict:
+    """Fold a freshly-played game into the series: bump the score, append the
+    sealed-game summary, decide completion (first to ceil(N/2), or higher score
+    once all games are played — drawn games count for neither side), and — in
+    Survival — ground any newly-benched Pilots."""
+    pgr = list(series["per_game_results"])
+    game_no = len(pgr) + 1
+    winner = resp.get("winner")
+    red_score = series["red_score"] + (1 if winner == "red" else 0)
+    blue_score = series["blue_score"] + (1 if winner == "blue" else 0)
+    pgr.append({
+        "game": game_no,
+        "winner": winner,
+        "win_method": resp.get("win_method", ""),
+        "total_rounds": resp.get("total_rounds", 0),
+        "arena_match_id": match_id,
+        "benched": list(newly_benched),  # who this game grounded (for result framing)
+    })
+    needed, max_games = series["games_needed"], series["max_games"]
+    status, swinner = "active", None
+    if red_score >= needed:
+        status, swinner = "complete", "red"
+    elif blue_score >= needed:
+        status, swinner = "complete", "blue"
+    elif len(pgr) >= max_games:
+        status = "complete"
+        swinner = "red" if red_score > blue_score else ("blue" if blue_score > red_score else None)
+    benched = sorted(set(series.get("benched", [])) | set(newly_benched))
+    update_series(series["series_id"], red_score, blue_score, pgr, status, swinner,
+                  benched=benched if series.get("survival") else None)
+    return get_series(series["series_id"])
+
+
+def _series_state(series: dict, latest_game: dict | None = None) -> dict:
+    played = len(series["per_game_results"])
+    out = {
+        "series_id": series["series_id"],
+        "format": series["format"],
+        "games_needed": series["games_needed"],
+        "max_games": series["max_games"],
+        "red_score": series["red_score"],
+        "blue_score": series["blue_score"],
+        "game_index": played,
+        "next_game": (played + 1) if series["status"] == "active" else None,
+        "status": series["status"],
+        "series_winner": series["winner"],
+        "locked_species": {"red": series["red_species"], "blue": series["blue_species"]},
+        "per_game_results": series["per_game_results"],
+        "survival": series["survival"],
+        "benched": series.get("benched", []),
+        "roster_min": _roster_min(series["max_games"]),
+    }
+    # In Survival, surface whether the player still has 3 un-benched owned Pilots to
+    # field the next game (else the series is forfeit — §5.4 attrition).
+    if series["survival"] and series["status"] == "active":
+        owned = {a["id"] for a in get_agents(series["red_owner"] or 1)}
+        out["red_available"] = len(owned - set(series.get("benched", [])))
+        out["red_can_field"] = out["red_available"] >= 3
+    if latest_game is not None:
+        out["game"] = latest_game
+    return out
+
+
+@app.post("/api/arena/series/start")
+def arena_series_start(req: ArenaSeriesStartRequest):
+    fmt = req.format.lower()
+    if fmt not in SERIES_FORMATS:
+        raise HTTPException(400, "format must be bo1, bo3, or bo5")
+    _validate_team_sizes(req.red_team, req.blue_team)
+    _reject_clones(req.red_team)
+    _reject_clones(req.blue_team)
+    _check_ownership(req.red_team, 1)  # single-player: red is owned by player 1
+    max_games = SERIES_FORMATS[fmt]
+    if req.survival:
+        # Survival fields a full 3-Guardian lineup of owned Pilots and needs a bench
+        # (§5.4): field 3, own >= roster_min. (The 3/4/5 roster math assumes 3 fielded.)
+        if len(req.red_team) != 3:
+            raise HTTPException(400, "Survival Series requires a full lineup of 3 Guardians")
+        _require_owned_pilots(req.red_team)
+        roster = len(get_agents(1))
+        if roster < _roster_min(max_games):
+            raise HTTPException(
+                400, f"Survival {fmt.upper()} needs a roster of at least "
+                     f"{_roster_min(max_games)} owned Pilots (you have {roster})")
+    red_cfgs = _build_arena_configs(req.red_team)
+    blue_cfgs = _build_arena_configs(req.blue_team)
+    series = create_series(
+        fmt, _series_games_needed(max_games), max_games,
+        red_species=sorted(c.species.value for c in red_cfgs),
+        blue_species=sorted(c.species.value for c in blue_cfgs),
+        red_owner=1, blue_owner=None, survival=bool(req.survival),
+    )
+    resp, match_id = _run_arena_series_game(red_cfgs, blue_cfgs, req.red_team, req.blue_team)
+    newly = _survival_benched(series, resp, req.red_team)
+    return _series_state(_advance_series(series, resp, match_id, newly), latest_game=resp)
+
+
+@app.post("/api/arena/series/{series_id}/next")
+def arena_series_next(series_id: int, req: ArenaSeriesNextRequest):
+    series = get_series(series_id)
+    if not series:
+        raise HTTPException(404, "series not found")
+    if series["status"] != "active":
+        raise HTTPException(400, "series is already complete")
+    _validate_team_sizes(req.red_team, req.blue_team)
+    _reject_clones(req.red_team)
+    _reject_clones(req.blue_team)
+    _check_ownership(req.red_team, series["red_owner"])
+    red_cfgs = _build_arena_configs(req.red_team)
+    blue_cfgs = _build_arena_configs(req.blue_team)
+    # Guardian species are locked for the whole series (§5.2) — Pilots/upgrades swap, bodies don't.
+    # (red_owner / red_species / blue_species are immutable after create_series, so these
+    # request validations are safe to run before taking the advance lock.)
+    if sorted(c.species.value for c in red_cfgs) != series["red_species"]:
+        raise HTTPException(400, "red Guardian species are locked for the series")
+    if sorted(c.species.value for c in blue_cfgs) != series["blue_species"]:
+        raise HTTPException(400, "blue Guardian species are locked for the series")
+    # Critical section: re-read the series under the lock and only advance if it is
+    # still where this request expects it to be. Serializing get_series..update_series
+    # turns a double-fired advance (12s auto-advance racing a KEEP click / a retry /
+    # a second tab) into ONE game + a 409, instead of two games, a lost score update,
+    # and a phantom arena_match + inflated Pilot records. §5.5.
+    with _series_advance_lock:
+        series = get_series(series_id)
+        if not series or series["status"] != "active":
+            raise HTTPException(409, "series already advanced")
+        played = len(series["per_game_results"])
+        if req.game_index is not None and req.game_index != played:
+            raise HTTPException(
+                409,
+                f"stale advance: series is at game {played}, request expected {req.game_index}",
+            )
+        if series["survival"]:
+            # Owned Pilots only, and no benched Pilot may be re-fielded (§5.4).
+            _require_owned_pilots(req.red_team)
+            _reject_benched(req.red_team, series["benched"])
+        resp, match_id = _run_arena_series_game(red_cfgs, blue_cfgs, req.red_team, req.blue_team)
+        newly = _survival_benched(series, resp, req.red_team)
+        return _series_state(_advance_series(series, resp, match_id, newly), latest_game=resp)
+
+
+@app.post("/api/arena/series/{series_id}/forfeit")
+def arena_series_forfeit(series_id: int):
+    """Concede a Survival series when the roster is depleted (§5.4 attrition): the
+    player can no longer field 3 un-benched Pilots, so blue takes the series. Guarded
+    so it can ONLY be called from a genuinely depleted state (no bet-blue-then-forfeit
+    exploit) and serialized with the advance lock."""
+    with _series_advance_lock:
+        series = get_series(series_id)
+        if not series:
+            raise HTTPException(404, "series not found")
+        if series["status"] != "active":
+            raise HTTPException(400, "series is already complete")
+        if not series["survival"]:
+            raise HTTPException(400, "only Survival Series can be forfeited")
+        owned = {a["id"] for a in get_agents(series["red_owner"] or 1)}
+        if len(owned - set(series["benched"])) >= 3:
+            raise HTTPException(400, "roster is not depleted — field your remaining Pilots")
+        update_series(series["series_id"], series["red_score"], series["blue_score"],
+                      series["per_game_results"], "complete", "blue", benched=series["benched"])
+        return _series_state(get_series(series["series_id"]))
+
+
+@app.get("/api/arena/series/{series_id}")
+def arena_series_get(series_id: int):
+    series = get_series(series_id)
+    if not series:
+        raise HTTPException(404, "series not found")
+    return _series_state(series)
+
+
+class ArenaSeriesPriceRequest(BaseModel):
+    format: str = "bo3"
+    red_team: list[ArenaCreatureIn]
+    blue_team: list[ArenaCreatureIn]
+    red_score: int = 0
+    blue_score: int = 0
+    games_played: int = 0
+
+
+# Live (between-games / pre-series) pricing depth. The standing series audit
+# (scripts/arena_series_audit.py) holds +5% with pricing this coarse, so it is
+# fast enough for a click without sacrificing calibration. §7.3.
+SERIES_PRICE_SIMS = 700
+
+
+@app.post("/api/arena/series/price")
+def arena_series_price(req: ArenaSeriesPriceRequest):
+    """Server-authoritative conditional odds for every series market, from the
+    lineup-conditional Monte-Carlo (§7.3). This is the ONLY priced source for
+    series markets — the static prop tables can't see game-to-game correlation.
+    Free-play only until the series audit ships real-money (§7.3/§7.4)."""
+    fmt = req.format.lower()
+    if fmt not in SERIES_FORMATS:
+        raise HTTPException(400, "format must be bo1, bo3, or bo5")
+    _validate_team_sizes(req.red_team, req.blue_team)
+    red_cfgs = _build_arena_configs(req.red_team)
+    blue_cfgs = _build_arena_configs(req.blue_team)
+    max_games = SERIES_FORMATS[fmt]
+    needed = _series_games_needed(max_games)
+    rs, bs, gp = max(0, req.red_score), max(0, req.blue_score), max(0, req.games_played)
+    # Reject self-inconsistent / already-decided states: there must be at least one
+    # game left to price, and a side can't have more wins than games played. Without
+    # this, the Monte-Carlo plays zero games (next_played==0) and emits degenerate
+    # near-infinite odds. (Pre-series 0/0/0 passes; needed>=1, max_games>=1.)
+    if rs >= needed or bs >= needed or gp >= max_games or rs + bs > gp:
+        raise HTTPException(400, "inconsistent series state for pricing")
+    from arena_series_pricer import price_series, price_to_odds
+    priced = price_series(
+        red_cfgs, blue_cfgs,
+        red_score=rs, blue_score=bs, games_played=gp,
+        games_needed=needed, max_games=max_games, n_sims=SERIES_PRICE_SIMS,
+    )
+    return {
+        "format": fmt, "games_needed": needed, "max_games": max_games,
+        "probabilities": priced["markets"],
+        "odds": price_to_odds(priced),
+        "free_play_only": True,  # §7.4 real-money series is multiplayer pot-split only
+    }
+
+
+@app.get("/api/arena/species")
+def arena_species_list():
+    from arena_species import SPECIES_STATS, SPECIES_UPGRADES, SPECIES_COLORS, SPECIES_ICONS
+    species = []
+    for s in ArenaSpecies:
+        stats = SPECIES_STATS[s]
+        upgrades = SPECIES_UPGRADES[s]
+        species.append({
+            "id": s.value,
+            "name": s.value.capitalize(),
+            "icon": SPECIES_ICONS[s],
+            "color": SPECIES_COLORS[s],
+            "hp": stats.hp,
+            "atk": stats.atk,
+            "def": stats.def_,
+            "spd": stats.spd,
+            "upgrades": [{"level": u.level, "name": u.name, "key": u.key,
+                          "description": u.description} for u in upgrades],
+        })
+    return {"species": species}
+
+
+# --- Arena betting ---
+
+class ArenaPropRequest(BaseModel):
+    red_team: list[ArenaCreatureIn]
+    blue_team: list[ArenaCreatureIn]
+
+
+class ArenaBetRequest(BaseModel):
+    prop_type: str
+    selection: str
+    amount: int = Field(ge=10)
+
+
+class ArenaBetPlaceRequest(BaseModel):
+    """Place an arena prop bet. The full comp is required so the server can
+    recompute the odds (never trusting a client-supplied number) and simulate +
+    seal the match this bet will later be settled against."""
+    red_team: list[ArenaCreatureIn]
+    blue_team: list[ArenaCreatureIn]
+    prop_type: str
+    selection: str
+    amount: int = Field(ge=10)
+    species: Optional[str] = None   # disambiguates which species_survivor prop
+
+
+class ArenaBetResolveRequest(BaseModel):
+    bet_id: int
+
+
+@app.post("/api/arena/props")
+def arena_get_props(req: ArenaPropRequest):
+    """Calculate arena prop bet odds from team compositions. Configs are
+    normalized to the 250 budget first, so the odds match what will actually be
+    simulated (agent-derived builds get re-attuned; legal customs are a no-op)."""
+    def cfg(c) -> dict:
+        if c.agent_id:
+            a = get_agent(c.agent_id)
+            if a:
+                sl = {"aggression": a["aggression"], "risk_tolerance": a["risk_tolerance"],
+                      "target_focus": a.get("king_priority", 50), "positioning": a.get("edge_affinity", 50),
+                      "sacrifice": a.get("trade_down", 50)}
+            else:
+                sl = {"aggression": c.aggression, "risk_tolerance": c.risk_tolerance,
+                      "target_focus": c.target_focus, "positioning": c.positioning, "sacrifice": c.sacrifice}
+        else:
+            sl = {"aggression": c.aggression, "risk_tolerance": c.risk_tolerance,
+                  "target_focus": c.target_focus, "positioning": c.positioning, "sacrifice": c.sacrifice}
+        return {"species": c.species, **normalize_to_budget(sl)}
+
+    red_configs = [cfg(c) for c in req.red_team]
+    blue_configs = [cfg(c) for c in req.blue_team]
+    props = calculate_arena_props(red_configs, blue_configs)
+    return {"props": props}
+
+
+@app.post("/api/arena/bet")
+def arena_place_bet(req: ArenaBetRequest):
+    """DEPRECATED — superseded by /api/arena/bet/place. Stores odds=0 with no
+    linked match, so bets placed here are not resolvable by the hardened
+    /api/arena/bet/resolve. Kept only for backward compatibility; do not use for
+    new clients (see docs/GUARDIANS-AND-ENGINES-SPEC.md §7.1 F2)."""
+    from database import get_db, MIN_BET
+    if req.amount < MIN_BET:
+        raise HTTPException(400, f"minimum bet is {MIN_BET}")
+    # look up odds: we need to validate the prop_type and selection exist
+    # (the caller should have fetched /api/arena/props first to get valid odds)
+    conn = get_db()
+    w = conn.execute("SELECT balance FROM wallet WHERE id = 1").fetchone()
+    bal = w["balance"] if w else 1000
+    if req.amount > bal:
+        conn.close()
+        raise HTTPException(400, "insufficient balance")
+    # For arena bets, we accept the odds from the stored prop types
+    # The frontend sends the prop_type and selection; we calculate odds server-side
+    # to prevent manipulation. Use a default since we don't have team context here.
+    # In practice, the frontend calls /api/arena/props first and shows the odds,
+    # then we re-derive or trust the stored odds. For simplicity, store the bet
+    # and let resolve compute the payout from the odds at bet time.
+    # We'll accept an odds field or default.
+    conn.execute("UPDATE wallet SET balance = balance - ? WHERE id = 1", (req.amount,))
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    # Store with odds=0 initially; the caller should include odds from the props response
+    # We'll set a placeholder; the resolve endpoint uses the stored odds for payout
+    cursor = conn.execute(
+        "INSERT INTO arena_bets (created_at, prop_type, selection, amount, odds) VALUES (?,?,?,?,?)",
+        (now, req.prop_type, req.selection, req.amount, 0.0),
+    )
+    conn.commit()
+    bet_id = cursor.lastrowid
+    new_bal = conn.execute("SELECT balance FROM wallet WHERE id = 1").fetchone()["balance"]
+    conn.close()
+    add_to_jackpot(req.amount)
+    return {"bet_id": bet_id, "prop_type": req.prop_type, "selection": req.selection,
+            "amount": req.amount, "balance": new_bal}
+
+
+@app.post("/api/arena/bet/place")
+def arena_place_bet_with_odds(req: ArenaBetPlaceRequest):
+    """Place an arena prop bet — server-authoritative.
+
+    The client sends the comp plus which prop/selection it wants and how much. The
+    server then (a) recomputes the odds for that comp with `calculate_arena_props`
+    — a client-supplied odds number is ignored entirely — (b) simulates the match
+    and SEALS it as the record this bet resolves against, and (c) deducts the stake
+    and stores the bet keyed to that sealed match. Returns the bet, the SERVER
+    odds, and the sealed match for playback. (Mirrors the main book at
+    `arena_get_props` / main.py prop pricing; see docs/GUARDIANS-AND-ENGINES-SPEC
+    §7.1 F2.)
+    """
+    from database import get_db, MIN_BET, save_arena_match
+    from datetime import datetime, timezone
+
+    if len(req.red_team) < 1 or len(req.red_team) > 3:
+        raise HTTPException(400, "red_team must have 1-3 creatures")
+    if len(req.blue_team) < 1 or len(req.blue_team) > 3:
+        raise HTTPException(400, "blue_team must have 1-3 creatures")
+    if not req.prop_type or not req.selection:
+        raise HTTPException(400, "prop_type and selection required")
+    if req.amount < MIN_BET:
+        raise HTTPException(400, f"minimum bet is {MIN_BET}")
+
+    # Build configs once, then price AND simulate the SAME comp so the odds the
+    # bet is booked at always match the match it is settled against.
+    red_cfgs = _build_arena_configs(req.red_team)
+    blue_cfgs = _build_arena_configs(req.blue_team)
+    red_dicts = [_arena_price_dict(c) for c in red_cfgs]
+    blue_dicts = [_arena_price_dict(c) for c in blue_cfgs]
+
+    # Recompute odds server-side and locate the requested selection.
+    props = calculate_arena_props(red_dicts, blue_dicts)
+    want_species = (req.species or "").lower()
+    prop_def, opt = None, None
+    for p in props:
+        if p["type"] != req.prop_type:
+            continue
+        if req.prop_type == "species_survivor" and p.get("species", "").lower() != want_species:
+            continue
+        opt = next((o for o in p.get("options", []) if o["selection"] == req.selection), None)
+        if opt:
+            prop_def = p
+            break
+    if not prop_def or not opt:
+        raise HTTPException(400, "no such prop_type/selection for this comp")
+    server_odds = opt["odds"]
+    bet_species = prop_def.get("species")   # set only for species_survivor
+    bet_line = prop_def.get("line")         # set only for total_rounds_ou
+
+    conn = get_db()
+    w = conn.execute("SELECT balance FROM wallet WHERE id = 1").fetchone()
+    bal = w["balance"] if w else 1000
+    conn.close()
+    if req.amount > bal:
+        raise HTTPException(400, "insufficient balance")
+
+    # Seal the outcome: the selection is already fixed (it is in this request), so
+    # simulating now means the user cannot bet after seeing the result.
+    result = arena_simulate(red_cfgs, blue_cfgs)
+    match_dict = result.to_dict()
+    red_agent_ids = [c.agent_id for c in req.red_team]
+    blue_agent_ids = [c.agent_id for c in req.blue_team]
+    arena_match_id = save_arena_match(match_dict, red_agent_ids, blue_agent_ids)
+
+    conn = get_db()
+    conn.execute("UPDATE wallet SET balance = balance - ? WHERE id = 1", (req.amount,))
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        """INSERT INTO arena_bets
+           (created_at, prop_type, selection, amount, odds, arena_match_id, species, line)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (now, req.prop_type, req.selection, req.amount, server_odds,
+         arena_match_id, bet_species, bet_line),
+    )
+    conn.commit()
+    bet_id = cursor.lastrowid
+    new_bal = conn.execute("SELECT balance FROM wallet WHERE id = 1").fetchone()["balance"]
+    conn.close()
+    add_to_jackpot(req.amount)
+
+    match_dict["commentary"] = generate_arena_commentary(match_dict)
+    return {"bet_id": bet_id, "prop_type": req.prop_type, "selection": req.selection,
+            "amount": req.amount, "odds": server_odds, "species": bet_species,
+            "arena_match_id": arena_match_id, "balance": new_bal,
+            "match_result": match_dict}
+
+
+@app.post("/api/arena/bet/resolve")
+def arena_resolve_bet(req: ArenaBetResolveRequest):
+    """Resolve an arena bet against its SEALED server-side match record.
+
+    The client supplies only the bet id; the outcome is read from the
+    arena_matches row the bet was keyed to at placement — never from the request —
+    so a bettor can neither price nor adjudicate their own bet. The cosmetic
+    win-streak is never moved by an arena settlement (docs/ECONOMY_AUDIT.md;
+    docs/GUARDIANS-AND-ENGINES-SPEC.md §7.1 F2).
+    """
+    from database import get_db, get_arena_match
+    bet_id = req.bet_id
+    if not bet_id:
+        raise HTTPException(400, "bet_id required")
+
+    conn = get_db()
+    bet_row = conn.execute("SELECT * FROM arena_bets WHERE id = ?", (bet_id,)).fetchone()
+    if not bet_row:
+        conn.close()
+        raise HTTPException(404, "bet not found")
+    if bet_row["resolved"]:
+        conn.close()
+        raise HTTPException(400, "bet already resolved")
+    arena_match_id = bet_row["arena_match_id"]
+    conn.close()
+
+    if not arena_match_id:
+        raise HTTPException(400, "bet is not linked to a sealed match; cannot resolve")
+    match_result = get_arena_match(arena_match_id)
+    if not match_result:
+        raise HTTPException(500, "sealed match record missing")
+
+    # Resolve from the bet's own server-derived fields + the sealed match. `line`
+    # and `species` come from the stored bet, not the request.
+    prop_input = {
+        "type": bet_row["prop_type"],
+        "selection": bet_row["selection"],
+        "amount": bet_row["amount"],
+        "odds": bet_row["odds"],
+        "line": bet_row["line"] if bet_row["line"] is not None else ROUNDS_LINE,
+        "species": bet_row["species"],
+    }
+    resolved = resolve_arena_props([prop_input], match_result)
+    if not resolved:
+        raise HTTPException(500, "could not resolve bet")
+    result = resolved[0]
+    outcome = result["result"]            # "win" | "loss" | "push"
+    payout = result.get("payout", 0)
+    won = outcome == "win"
+
+    conn = get_db()
+    # Atomically CLAIM the bet: only the call that flips resolved 0->1 proceeds to
+    # pay out. The wallet delta below runs in the same transaction as the claim, so
+    # two concurrent /resolve calls for one bet can never both pay (no double-pay).
+    claim = conn.execute(
+        "UPDATE arena_bets SET resolved = 1, won = ?, payout = ? WHERE id = ? AND resolved = 0",
+        (1 if won else 0, payout, bet_id),
+    )
+    if claim.rowcount != 1:
+        conn.rollback()
+        conn.close()
+        raise HTTPException(400, "bet already resolved")
+    # Wallet accounting — same rules as settle_bet's prop path: a push refunds the
+    # stake (neither win nor loss); a loss is recorded; the win-streak is untouched.
+    if outcome == "win":
+        conn.execute("UPDATE wallet SET balance = balance + ?, total_won = total_won + ?, total_bets = total_bets + 1 WHERE id = 1",
+                     (payout, payout))
+        bw = conn.execute("SELECT biggest_win FROM wallet WHERE id = 1").fetchone()
+        if payout > bw["biggest_win"]:
+            conn.execute("UPDATE wallet SET biggest_win = ? WHERE id = 1", (payout,))
+    elif outcome == "push":
+        if payout > 0:
+            conn.execute("UPDATE wallet SET balance = balance + ? WHERE id = 1", (payout,))
+    else:  # loss — stake already deducted at placement; record it
+        conn.execute("UPDATE wallet SET total_lost = total_lost + ?, total_bets = total_bets + 1 WHERE id = 1",
+                     (bet_row["amount"],))
+    conn.commit()
+    final_w = conn.execute("SELECT balance FROM wallet WHERE id = 1").fetchone()
+    conn.close()
+
+    return {
+        "bet_id": bet_id,
+        "prop_type": bet_row["prop_type"],
+        "selection": bet_row["selection"],
+        "amount": bet_row["amount"],
+        "odds": bet_row["odds"],
+        "result": outcome,
+        "actual": result.get("actual"),
+        "payout": payout,
+        "won": won,
+        "balance": final_w["balance"],
+    }
+
+
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": "0.5.0"}
+    return {"status": "ok", "version": "0.6.0"}
 
 
 # --- serve React build in production ---
