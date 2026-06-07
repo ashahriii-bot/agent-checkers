@@ -332,6 +332,23 @@ export default function Arena3D({
       const edges = new THREE.LineSegments(hexEdgeGeo, edgeMat);
       edges.rotation.x = -Math.PI / 2;
       group.add(edges);
+      // P3 gate clarity: each gate reads as an OBJECTIVE — a glowing portal ring +
+      // upward energy beam in the owner's color, always visible. The words
+      // (DEFEND / BREACH / how-to-win) live in the HTML layer, per the mobile-safe
+      // "no text in the 3D scene" rule (§6.4).
+      if (gate) {
+        const gcol = gate === "red" ? 0xe74c3c : 0x3498db;
+        const ringGeo = track(new THREE.TorusGeometry(HEX_SIZE * 0.58, 0.05, 8, 36));
+        const ringMat = new THREE.MeshBasicMaterial({ color: gcol, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false });
+        const ring = new THREE.Mesh(ringGeo, ringMat);
+        ring.rotation.x = -Math.PI / 2; ring.position.y = TILE_TOP + 0.04;
+        group.add(ring); disposables.add(ringMat);
+        const beamGeo = track(new THREE.CylinderGeometry(HEX_SIZE * 0.34, HEX_SIZE * 0.46, 7, 18, 1, true));
+        const beamMat = new THREE.MeshBasicMaterial({ color: gcol, transparent: true, opacity: 0.13, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
+        const beam = new THREE.Mesh(beamGeo, beamMat);
+        beam.position.y = TILE_TOP + 3.5;
+        group.add(beam); disposables.add(beamMat);
+      }
       scene.add(group);
       disposables.add(mat); disposables.add(edgeMat);
       hexMeshes.set(key, {

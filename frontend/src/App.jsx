@@ -1211,15 +1211,19 @@ function RosterPanel({ side, color, selectedAgent, onSelect, roster, disabled, m
     const cfg = ckNormalize({ aggression: agent.aggression, risk_tolerance: agent.risk_tolerance, king_priority: agent.king_priority, edge_affinity: agent.edge_affinity, trade_down: agent.trade_down });
     setEditConfig(cfg); setEditName(agent.name); setSuggestions([]); setEditingAgent(agent); setMode("editor");
   };
-  // Budget-bound: raising one slider drains the others, total stays 250.
-  const handleSliderChange = (key, val) => { const next = ckRedistribute(editConfig, key, val); setEditConfig(next); if (!editingAgent) refreshSuggestions(next); };
+  // Budget-bound: raising one slider drains the others, total stays 200. Personality
+  // is forged ONCE on create — locked on edit (it only shifts via evolution drift).
+  const handleSliderChange = (key, val) => { if (editingAgent) return; const next = ckRedistribute(editConfig, key, val); setEditConfig(next); refreshSuggestions(next); };
   const handleSave = async () => {
     if (!editName.trim()) return;
     setSaving(true);
     try {
       const url = editingAgent ? `${API}/agents/${editingAgent.id}` : `${API}/agents`;
       const method = editingAgent ? "PUT" : "POST";
-      const res = await fetch(url, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: editName, ...editConfig }) });
+      // On edit, send ONLY the name — the personality is locked, so we never resend
+      // sliders (guarantees no config-change → no elo/record reset).
+      const body = editingAgent ? { name: editName } : { name: editName, ...editConfig };
+      const res = await fetch(url, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       if (!res.ok) { const e = await res.json(); alert(e.detail || "save failed"); return; }
       const result = await res.json();
       onRosterChange(); onSelect(result); setMode("roster");
@@ -1271,10 +1275,12 @@ function RosterPanel({ side, color, selectedAgent, onSelect, roster, disabled, m
     return (
       <div style={{ background: "#0d1117", border: "1px solid #1a1f2b", borderRadius: 8, padding: 10, width: "100%" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-          <span style={{ fontSize: 9, letterSpacing: 2, textTransform: "uppercase", fontWeight: 700, color: "#8892a0" }}>{editingAgent ? "EDIT PILOT" : "NEW PILOT"}</span>
+          <span style={{ fontSize: 9, letterSpacing: 2, textTransform: "uppercase", fontWeight: 700, color: "#8892a0" }}>{editingAgent ? "RENAME PILOT" : "⚡ FORGE A PILOT"}</span>
           <button onClick={() => setMode("roster")} style={{ fontSize: 8, background: "none", border: "1px solid #21262d", color: "#4a5568", borderRadius: 3, padding: "1px 6px", cursor: "pointer", fontFamily: "inherit" }}>CANCEL</button>
         </div>
-        {editingAgent && <div style={{ fontSize: 7, color: "#e67e22", background: "rgba(230,126,34,0.1)", border: "1px solid rgba(230,126,34,0.2)", borderRadius: 3, padding: "2px 6px", marginBottom: 6 }}>changing config resets elo and record to 0</div>}
+        {editingAgent
+          ? <div style={{ fontSize: 7, color: "#9fd0ff", background: "rgba(63,160,255,0.08)", border: "1px solid rgba(63,160,255,0.22)", borderRadius: 3, padding: "3px 6px", marginBottom: 6, lineHeight: 1.5 }}>🔒 This Pilot's personality is locked in. Rename it freely — the traits below only shift as it learns through play (drift every 20 matches).</div>
+          : <div style={{ fontSize: 7, color: "#f39c12", background: "rgba(243,156,18,0.08)", border: "1px solid rgba(243,156,18,0.22)", borderRadius: 3, padding: "3px 6px", marginBottom: 6, lineHeight: 1.5 }}>⚡ This personality is permanent — forge it with intent. After you save, it changes only as your Pilot evolves. Build a roster, not a settings panel.</div>}
         <input value={editName} onChange={(e) => setEditName(e.target.value)} placeholder="Pilot name..."
           style={{ width: "100%", padding: "5px 8px", fontSize: 11, fontWeight: 700, background: "#161b22", border: "1px solid #21262d", borderRadius: 4, color: "#c8d0da", fontFamily: "inherit", marginBottom: 6, boxSizing: "border-box" }} />
         {!editingAgent && suggestions.length > 0 && (
@@ -1295,11 +1301,11 @@ function RosterPanel({ side, color, selectedAgent, onSelect, roster, disabled, m
               <div style={{ height: 3, background: "#161b22", borderRadius: 2, overflow: "hidden" }}>
                 <div style={{ width: `${Math.min(100, total / AGENT_BUDGET * 100)}%`, height: "100%", background: color, transition: "width 0.18s ease-out" }} />
               </div>
-              <div style={{ fontSize: 6, color: "#4a5568", marginTop: 2, fontStyle: "italic" }}>Spend 200 points. Raising one trait drains the others — trade-offs make the Pilot.</div>
+              <div style={{ fontSize: 6, color: "#4a5568", marginTop: 2, fontStyle: "italic" }}>{editingAgent ? "Locked at the forge — these evolve only through play." : "Spend 200 points. Raising one trait drains the others — trade-offs make the Pilot."}</div>
             </div>
           );
         })()}
-        {SLIDER_KEYS.map(s => <Slider key={s.key} sliderKey={s.key} label={s.key.replace("_", " ")} value={editConfig[s.key]} color={color} onChange={(v) => handleSliderChange(s.key, v)} disabled={false} showDesc={true} min={SL_MIN} max={SL_MAX} />)}
+        {SLIDER_KEYS.map(s => <Slider key={s.key} sliderKey={s.key} label={s.key.replace("_", " ")} value={editConfig[s.key]} color={color} onChange={(v) => handleSliderChange(s.key, v)} disabled={!!editingAgent} showDesc={true} min={SL_MIN} max={SL_MAX} />)}
         <div style={{ fontSize: 8, color: "#8892a0", marginTop: 2, padding: "2px 0" }}>ARCHETYPE: <span style={{ fontWeight: 700 }}>{detectArchetype(editConfig)}</span></div>
         <OverextWarning config={editConfig} />
         <button onClick={handleSave} disabled={saving || !editName.trim()} style={{
@@ -1307,7 +1313,7 @@ function RosterPanel({ side, color, selectedAgent, onSelect, roster, disabled, m
           background: editName.trim() ? "linear-gradient(135deg, #2ecc71, #27ae60)" : "#21262d",
           color: editName.trim() ? "#fff" : "#4a5568", fontWeight: 700, fontSize: 10, letterSpacing: 2, textTransform: "uppercase",
           cursor: editName.trim() ? "pointer" : "not-allowed", fontFamily: "inherit",
-        }}>{saving ? "SAVING..." : editingAgent ? "SAVE CHANGES" : "SAVE PILOT"}</button>
+        }}>{saving ? "SAVING..." : editingAgent ? "SAVE NAME" : "⚡ FORGE PILOT"}</button>
       </div>
     );
   }
@@ -2815,17 +2821,41 @@ export default function App() {
                 )}
               </div>
             ))}
-            {/* evolution notification */}
-            {isFinished && result.evolution && (
-              <div style={{ width: "100%", padding: "5px 10px", background: "rgba(155,89,182,0.1)", border: "1px solid rgba(155,89,182,0.3)", borderRadius: 4, fontSize: 8 }}>
-                <div style={{ fontSize: 7, color: "#9b59b6", letterSpacing: 1, textTransform: "uppercase", marginBottom: 2 }}>🧬 Evolution · {result.evolution.matches_analyzed} bouts analyzed</div>
-                <div style={{ fontSize: 9, fontWeight: 700, color: "#c8d0da", marginBottom: 2 }}>{result.evolution.agent_name} evolved</div>
-                {Object.entries(result.evolution.changes).map(([s, c]) => (
-                  <div key={s} style={{ color: "#8892a0" }}>{s.replace("_", " ")}: {c.from} → {c.to} <span style={{ color: (c.to - c.from) > 0 ? "#2ecc71" : "#e74c3c" }}>({(c.to - c.from) > 0 ? "+" : ""}{c.to - c.from})</span></div>
-                ))}
-                <div style={{ fontSize: 7, color: "#6b7280", marginTop: 2, fontStyle: "italic" }}>Sliders nudged toward what's been winning over the last {result.evolution.matches_analyzed} competitive bouts.</div>
-              </div>
-            )}
+            {/* Growth report (P4): statistical drift narrativized as character development.
+                Cadence = the 20-match evolution window. This is the ONLY way a Pilot's
+                locked personality changes (ties to the P1 forge-once rule). */}
+            {isFinished && result.evolution && (() => {
+              const ev = result.evolution;
+              const NARR = {
+                aggression: ["learned restraint — fewer reckless pushes", "grew bolder — it presses harder now"],
+                risk_tolerance: ["started playing it safer", "embraced risk — gambling for tempo"],
+                king_priority: ["cares less about crowning", "guards its kings more fiercely"],
+                edge_affinity: ["fights for the center now", "hugs the edges for safety"],
+                trade_down: ["hoards its pieces", "trades freely to simplify"],
+              };
+              const lines = Object.entries(ev.changes).map(([s, c]) => {
+                const d = c.to - c.from;
+                return { s, d, from: c.from, to: c.to, verb: NARR[s] ? NARR[s][d > 0 ? 1 : 0] : `${s.replace("_", " ")} shifted` };
+              }).sort((a, b) => Math.abs(b.d) - Math.abs(a.d));
+              const headline = lines.length ? lines[0].verb : "refined its instincts";
+              return (
+                <div style={{ width: "100%", padding: "9px 12px", background: "linear-gradient(135deg, rgba(155,89,182,0.16), rgba(46,204,113,0.05))", border: "1px solid rgba(155,89,182,0.45)", borderRadius: 6, marginTop: 4 }}>
+                  <div style={{ fontSize: 7, color: "#b07cd6", letterSpacing: 2, textTransform: "uppercase", marginBottom: 3 }}>🧬 GROWTH REPORT · {ev.matches_analyzed} bouts of experience</div>
+                  <div style={{ fontSize: 12, fontWeight: 800, color: "#e8d5f5", marginBottom: 1 }}>{ev.agent_name} is learning</div>
+                  <div style={{ fontSize: 9, color: "#c8d0da", fontStyle: "italic", marginBottom: 6 }}>“It {headline}.”</div>
+                  {lines.map(l => (
+                    <div key={l.s} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 8, padding: "1px 0" }}>
+                      <span style={{ color: "#8892a0" }}>{l.s.replace("_", " ")}</span>
+                      <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <span style={{ color: "#6b7280" }}>{l.from} → {l.to}</span>
+                        <span style={{ color: l.d > 0 ? "#2ecc71" : "#e74c3c", fontWeight: 700, width: 26, textAlign: "right" }}>{l.d > 0 ? "+" : ""}{l.d}</span>
+                      </span>
+                    </div>
+                  ))}
+                  <div style={{ fontSize: 7, color: "#6b7280", marginTop: 5, fontStyle: "italic" }}>Your Pilot adapts on its own, nudged toward what's been winning — the only way its forged personality ever changes.</div>
+                </div>
+              );
+            })()}
             {/* prop bet results */}
             {isFinished && result.prop_results && result.prop_results.length > 0 && (
               <div style={{ width: "100%", padding: "4px 8px", background: "#0a0c10", border: "1px solid #1a1f2b", borderRadius: 4, fontSize: 8, marginTop: 4 }}>

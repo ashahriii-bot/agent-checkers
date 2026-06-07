@@ -671,6 +671,7 @@ function CreaturePortrait({ species, size, selected, style: extraStyle, px: pxOv
 function AgentCard({ creature, color, onChange, onRemove, speciesList, agents, lockSpecies = false, lockRoster = false, benchedIds = [] }) {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [presetsOpen, setPresetsOpen] = useState(false);
+  const [showTraits, setShowTraits] = useState(false);  // P2: numbers hidden until asked for
   const [ticks, setTicks] = useState([]);
   const [walledSlider, setWalledSlider] = useState(null);
   const [wallKey, setWallKey] = useState(0);
@@ -918,28 +919,44 @@ function AgentCard({ creature, color, onChange, onRemove, speciesList, agents, l
           .map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
       </select>
 
-      {/* Archetype presets */}
+      {/* Saved Pilot career line — identity, always shown (P4 visible growth) */}
+      {hasAgent && (() => {
+        const pilot = agents.find(a => a.id === creature.agent_id);
+        if (!pilot) return null;
+        const played = (pilot.arena_wins || 0) + (pilot.arena_losses || 0);
+        return (
+          <div style={{ fontSize: 7, color: accent, fontWeight: 700, marginBottom: 6 }}>
+            Lv {pilot.level || 1} · {played > 0 ? `${pilot.arena_wins}–${pilot.arena_losses} · ${pilot.arena_kills || 0} kills` : "no Arena record yet"}
+          </div>
+        );
+      })()}
+
+      {/* Progressive disclosure (P2): the numbers hide behind one tap. A new player
+          sees a clean Pilot (name · temperament · Guardian · upgrade); the curious
+          open the traits. Saved Pilots are locked — VIEW only. */}
+      <button onClick={() => setShowTraits(s => !s)}
+        style={{ background: "none", border: "none", color: showTraits ? accent : "#6a7480", fontSize: 7, letterSpacing: 1, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", padding: "3px 0" }}>
+        {showTraits ? "▾ HIDE TRAITS" : (hasAgent ? "▸ VIEW TRAITS" : "⚙ CUSTOMIZE TRAITS")}
+      </button>
+
+      {showTraits && (<>
+      {/* Archetype presets (custom builds only) */}
       {!hasAgent && (
-        <div style={{ marginBottom: 6 }}>
-          <button onClick={() => setPresetsOpen(o => !o)}
-            style={{ background: "none", border: "none", color: "#4a5568", fontSize: 7, letterSpacing: 1, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", padding: 0 }}>
-            {presetsOpen ? "▾" : "▸"} ARCHETYPES
-          </button>
-          {presetsOpen && (
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 4 }}>
-              {PRESETS.map(p => {
-                const pc = TEMPERAMENT_COLORS[p.temperament] || "#8892a0";
-                return (
-                  <button key={p.temperament} onClick={() => applyPreset(p)}
-                    style={{ display: "inline-flex", alignItems: "center", gap: 3, padding: "2px 6px", borderRadius: 10,
-                      border: `1px solid ${pc}44`, background: pc + "12", color: pc, fontSize: 7, fontWeight: 700,
-                      letterSpacing: 0.5, cursor: "pointer", fontFamily: "inherit" }}>
-                    {TEMPERAMENT_ICONS[p.temperament]} {p.temperament}
-                  </button>
-                );
-              })}
-            </div>
-          )}
+        <div style={{ marginBottom: 6, marginTop: 4 }}>
+          <div style={{ fontSize: 6, color: "#4a5568", letterSpacing: 1, fontWeight: 700, marginBottom: 4 }}>QUICK ARCHETYPES — one tap to start</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+            {PRESETS.map(p => {
+              const pc = TEMPERAMENT_COLORS[p.temperament] || "#8892a0";
+              return (
+                <button key={p.temperament} onClick={() => applyPreset(p)}
+                  style={{ display: "inline-flex", alignItems: "center", gap: 3, padding: "2px 6px", borderRadius: 10,
+                    border: `1px solid ${pc}44`, background: pc + "12", color: pc, fontSize: 7, fontWeight: 700,
+                    letterSpacing: 0.5, cursor: "pointer", fontFamily: "inherit" }}>
+                  {TEMPERAMENT_ICONS[p.temperament]} {p.temperament}
+                </button>
+              );
+            })}
+          </div>
         </div>
       )}
 
@@ -952,18 +969,7 @@ function AgentCard({ creature, color, onChange, onRemove, speciesList, agents, l
         <div style={{ height: 3, background: "#0d1117", borderRadius: 2, overflow: "hidden", marginBottom: 6 }}>
           <div style={{ width: `${Math.min(100, total / ARENA_BUDGET * 100)}%`, height: "100%", background: accent, transition: "width 0.18s ease-out" }} />
         </div>
-        {hasAgent && (() => {
-          const pilot = agents.find(a => a.id === creature.agent_id);
-          const played = pilot ? (pilot.arena_wins || 0) + (pilot.arena_losses || 0) : 0;
-          return (
-            <div style={{ fontSize: 7, color: "#4a5568", marginBottom: 5 }}>
-              {pilot && <span style={{ color: accent, fontWeight: 700 }}>
-                Lv {pilot.level || 1} · {played > 0 ? `${pilot.arena_wins}–${pilot.arena_losses} · ${pilot.arena_kills || 0} kills` : "no Arena record yet"}
-              </span>}
-              {pilot ? " — " : ""}saved Pilot. Switch to Custom to sculpt.
-            </div>
-          );
-        })()}
+        {hasAgent && <div style={{ fontSize: 7, color: "#4a5568", marginBottom: 5 }}>🔒 Locked personality — switch to a Custom Pilot to sculpt your own.</div>}
         <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
           {SLIDER_META.map(({ key, label, color: sc }) => {
             const locked = !!locks[key];
@@ -994,6 +1000,7 @@ function AgentCard({ creature, color, onChange, onRemove, speciesList, agents, l
           })}
         </div>
       </div>
+      </>)}
     </div>
   );
 }
@@ -1100,7 +1107,7 @@ function EventLog({ events, currentIdx, creatures }) {
 
 // ----- TEAM STATUS PANEL (during match) -----
 
-function TeamPanel({ team, creatures, teamColor }) {
+function TeamPanel({ team, creatures, teamColor, gateUnderBreach = false }) {
   if (!creatures || creatures.length === 0) return null;
   const teamCreatures = creatures.filter(c => c.team === team);
   if (teamCreatures.length === 0) return null;
@@ -1109,6 +1116,20 @@ function TeamPanel({ team, creatures, teamColor }) {
     <div style={{ background: "#0d1117", border: `1px solid ${teamColor}22`, borderRadius: 6, padding: 6, width: "100%" }}>
       <div style={{ fontSize: 7, letterSpacing: 2, fontWeight: 700, color: teamColor, marginBottom: 4 }}>
         {team.toUpperCase()} TEAM
+      </div>
+      {/* Gate objective status (P3): each team has a home gate (the glowing portal);
+          the enemy wins by breaching it. */}
+      <div style={{
+        display: "flex", alignItems: "center", justifyContent: "space-between", gap: 4,
+        padding: "2px 5px", marginBottom: 5, borderRadius: 4,
+        border: `1px solid ${gateUnderBreach ? "#f39c12" : teamColor + "33"}`,
+        background: gateUnderBreach ? "rgba(243,156,18,0.12)" : "transparent",
+        animation: gateUnderBreach ? "breachRingPulse 1.2s ease-in-out infinite" : "none",
+      }}>
+        <span style={{ fontSize: 7, fontWeight: 700, color: teamColor, letterSpacing: 0.5 }}>⚡ {team.toUpperCase()} GATE</span>
+        <span style={{ fontSize: 6, fontWeight: 700, color: gateUnderBreach ? "#f39c12" : "#4a5568", letterSpacing: 0.5 }}>
+          {gateUnderBreach ? "⚠ UNDER BREACH" : "● secure"}
+        </span>
       </div>
       {teamCreatures.map(c => {
         const hpPct = c.hp / c.max_hp;
@@ -1552,6 +1573,142 @@ function SeriesComplete({ series, onNew, betResults }) {
   );
 }
 
+// --- Help / onboarding overlay (P3 how-to-win + P5 contextual help) ---
+const HELP_TABS = [
+  { key: "win", label: "HOW TO WIN" },
+  { key: "board", label: "THE BOARD" },
+  { key: "guardians", label: "GUARDIANS" },
+  { key: "pilots", label: "PILOTS" },
+  { key: "abilities", label: "ABILITIES" },
+];
+
+const SPECIES_BLURB = {
+  ironjaw: "Slow armoured wall. Soaks damage and holds the line — your gate's best defender.",
+  razorwing: "Fragile flying assassin. Swoops in for huge hits, but dies fast. High risk, high reward.",
+  embercaster: "Ranged artillery. Hits hard from a distance; vulnerable up close.",
+  warden: "Defensive anchor. Shields allies and contests the gate.",
+  hexwright: "Disruptor. Displaces and glitches enemies — the counter to a gate breach.",
+};
+
+const TEMPERAMENT_BLURB = {
+  BERSERKER: "All-out aggression — charges in and trades freely.",
+  HEADHUNTER: "Hunts kills — focuses the weakest enemy.",
+  STALKER: "Patient — picks its moment, avoids bad trades.",
+  TURTLE: "Defensive — holds position and soaks damage.",
+  MARTYR: "Sacrificial — spends itself to set up the team.",
+  TACTICIAN: "Calculated — plays for position and tempo.",
+  ADAPTIVE: "Balanced — reads the fight and adjusts.",
+};
+
+const ABILITY_BLURB = [
+  ["⚡", "Breach", "Stand on the enemy GATE and channel. Fill the meter and you win — even while outnumbered."],
+  ["🦅", "Swoop", "Razorwing flies up to 2 hexes, then strikes the next turn (a telegraphed dive)."],
+  ["💥", "Blast", "Embercaster's ranged hit — damage from across the board."],
+  ["🛡️", "Aegis / Bulwark", "Warden shields itself or allies and protects the gate."],
+  ["🌀", "Displace / Glitch", "Hexwright shoves or scrambles an enemy — the way to stop a breach."],
+  ["😡", "Provoke", "Forces an enemy to attack the provoker instead of its target."],
+  ["💀", "Last Stand", "A near-dead Guardian fights harder for one final turn."],
+  ["🔻", "Collapse", "From round 9 the edge hexes fall away — don't get rung out."],
+];
+
+function HelpOverlay({ tab, setTab, onClose, speciesList = [] }) {
+  const Section = ({ children }) => <div style={{ lineHeight: 1.6, fontSize: 9, color: "#c8d0da" }}>{children}</div>;
+  const speciesOrder = ["ironjaw", "razorwing", "embercaster", "warden", "hexwright"];
+  return (
+    <div onClick={onClose} style={{
+      position: "fixed", inset: 0, zIndex: 60, display: "flex", alignItems: "center", justifyContent: "center",
+      background: "rgba(4,6,10,0.78)", fontFamily: "'JetBrains Mono', monospace", padding: 12,
+    }}>
+      <div onClick={(e) => e.stopPropagation()} style={{
+        width: "100%", maxWidth: 460, maxHeight: "86vh", display: "flex", flexDirection: "column",
+        background: "linear-gradient(160deg,#0d1117,#11161f)", border: "1px solid #2a3340", borderRadius: 12,
+        boxShadow: "0 12px 48px rgba(0,0,0,0.6)", overflow: "hidden",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 14px", borderBottom: "1px solid #21262d" }}>
+          <span style={{ fontSize: 11, fontWeight: 900, letterSpacing: 3, color: "#9fd0ff" }}>HOW THE ARENA WORKS</span>
+          <button onClick={onClose} style={{ background: "none", border: "1px solid #21262d", color: "#8892a0", borderRadius: 4, padding: "2px 9px", fontSize: 11, cursor: "pointer", fontFamily: "inherit" }}>✕</button>
+        </div>
+        <div style={{ display: "flex", gap: 4, padding: "8px 10px", borderBottom: "1px solid #21262d", flexWrap: "wrap" }}>
+          {HELP_TABS.map(t => (
+            <button key={t.key} onClick={() => setTab(t.key)} style={{
+              padding: "3px 9px", borderRadius: 4, fontSize: 8, fontWeight: 700, letterSpacing: 1, cursor: "pointer", fontFamily: "inherit",
+              border: `1px solid ${tab === t.key ? "#3aa0ff" : "#21262d"}`, background: tab === t.key ? "#3aa0ff1a" : "transparent",
+              color: tab === t.key ? "#9fd0ff" : "#6a7480",
+            }}>{t.label}</button>
+          ))}
+        </div>
+        <div style={{ padding: "14px 16px", overflowY: "auto" }}>
+          {tab === "win" && (
+            <Section>
+              <div style={{ fontSize: 8, color: "#6a7480", letterSpacing: 2, marginBottom: 8 }}>TWO WAYS TO WIN EACH MATCH</div>
+              <div style={{ display: "flex", gap: 10, alignItems: "flex-start", marginBottom: 12, padding: "8px 10px", borderRadius: 8, border: "1px solid #e74c3c44", background: "#e74c3c10" }}>
+                <span style={{ fontSize: 22 }}>☠</span>
+                <div><b style={{ color: "#e74c3c" }}>ELIMINATE</b><br />Destroy <b>all</b> of the enemy's Guardians.</div>
+              </div>
+              <div style={{ display: "flex", gap: 10, alignItems: "flex-start", marginBottom: 12, padding: "8px 10px", borderRadius: 8, border: "1px solid #3aa0ff44", background: "#3aa0ff10" }}>
+                <span style={{ fontSize: 22 }}>⚡</span>
+                <div><b style={{ color: "#9fd0ff" }}>BREACH THE GATE</b><br />Get a Guardian onto the enemy's <b>GATE</b> — the glowing portal in their colour — and channel until the meter fills. A breach wins even if you're losing the fight.</div>
+              </div>
+              <div style={{ fontSize: 8, color: "#8892a0", marginTop: 4 }}>Each side defends its own gate (the red portal is RED's home; the blue portal is BLUE's). Push theirs, protect yours.</div>
+            </Section>
+          )}
+          {tab === "board" && (
+            <Section>
+              <p><b style={{ color: "#9fd0ff" }}>⬡ The arena</b> is a small hex board. You don't move pieces — you tuned the Pilots; now they fight on their own.</p>
+              <p><b style={{ color: "#e74c3c" }}>⚡ Gates</b> are the two glowing portals (one per side). Reaching the enemy gate and channelling = a breach win.</p>
+              <p><b style={{ color: "#f39c12" }}>🔻 Collapse</b> — from round 9 the outer hexes fall away, shrinking the arena. A Guardian caught on a collapsing hex is rung out. Stalling doesn't work.</p>
+              <p><b style={{ color: "#ffd700" }}>💀 Last Stand</b> — a Guardian about to die gets one defiant final turn.</p>
+            </Section>
+          )}
+          {tab === "guardians" && (
+            <Section>
+              <div style={{ fontSize: 8, color: "#6a7480", marginBottom: 8 }}>The 5 bodies a Pilot can fly. Pick the body for the job.</div>
+              {speciesOrder.map(s => {
+                const live = speciesList.find(x => x.id === s);
+                return (
+                  <div key={s} style={{ display: "flex", gap: 8, alignItems: "flex-start", marginBottom: 9 }}>
+                    <span style={{ fontSize: 16, width: 22, textAlign: "center" }}>{SPECIES_ICONS[s]}</span>
+                    <div style={{ flex: 1 }}>
+                      <b style={{ color: SPECIES_BORDER_COLORS[s] }}>{s.charAt(0).toUpperCase() + s.slice(1)}</b>
+                      <span style={{ fontSize: 7, color: "#6a7480" }}> · {SPECIES_ROLES[s]}{live ? ` · HP ${live.hp} ATK ${live.atk} DEF ${live.def} SPD ${live.spd}` : ""}</span>
+                      <div style={{ fontSize: 8, color: "#8892a0" }}>{SPECIES_BLURB[s]}</div>
+                    </div>
+                  </div>
+                );
+              })}
+            </Section>
+          )}
+          {tab === "pilots" && (
+            <Section>
+              <div style={{ fontSize: 8, color: "#6a7480", marginBottom: 8 }}>A <b>Pilot</b> is the AI brain (its 5 personality traits). Its <b>temperament</b> is the playstyle those traits add up to:</div>
+              {Object.keys(TEMPERAMENT_BLURB).map(t => (
+                <div key={t} style={{ display: "flex", gap: 8, alignItems: "baseline", marginBottom: 7 }}>
+                  <span style={{ width: 18, textAlign: "center" }}>{TEMPERAMENT_ICONS[t] || "•"}</span>
+                  <div><b style={{ color: TEMPERAMENT_COLORS[t] || "#c8d0da" }}>{t}</b> <span style={{ fontSize: 8, color: "#8892a0" }}>— {TEMPERAMENT_BLURB[t]}</span></div>
+                </div>
+              ))}
+              <div style={{ fontSize: 8, color: "#6a7480", marginTop: 8, fontStyle: "italic" }}>You set a Pilot's personality once, at the Forge. After that it only shifts as the Pilot learns through play.</div>
+            </Section>
+          )}
+          {tab === "abilities" && (
+            <Section>
+              {ABILITY_BLURB.map(([icon, name, desc]) => (
+                <div key={name} style={{ display: "flex", gap: 8, alignItems: "flex-start", marginBottom: 8 }}>
+                  <span style={{ fontSize: 14, width: 20, textAlign: "center" }}>{icon}</span>
+                  <div><b style={{ color: "#c8d0da" }}>{name}</b> <span style={{ fontSize: 8, color: "#8892a0" }}>— {desc}</span></div>
+                </div>
+              ))}
+            </Section>
+          )}
+        </div>
+        <div style={{ padding: "8px 14px", borderTop: "1px solid #21262d", textAlign: "center" }}>
+          <button onClick={onClose} style={{ padding: "6px 22px", borderRadius: 6, border: "1px solid #2ecc71", background: "rgba(46,204,113,0.1)", color: "#2ecc71", fontWeight: 800, fontSize: 10, letterSpacing: 2, cursor: "pointer", fontFamily: "inherit" }}>GOT IT</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function Arena({ agents = [] }) {
   const [speciesList, setSpeciesList] = useState([]);
   const [arenaMode, setArenaMode] = useState("sandbox"); // "sandbox" or "multiplayer"
@@ -1591,6 +1748,13 @@ export default function Arena({ agents = [] }) {
   const [seriesBets, setSeriesBets] = useState([]);
   const [seriesBetResults, setSeriesBetResults] = useState(null);
   const seriesSettledRef = useRef(false);
+  // Help/onboarding overlay (P3/P5) — opens once automatically on the first match.
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [helpTab, setHelpTab] = useState("win");
+  const helpAutoShownRef = useRef(false);
+  // First-visit welcome strip (P6) — orients the deploy screen before the first FIGHT.
+  const [welcomed, setWelcomed] = useState(() => { try { return !!localStorage.getItem("ac_arena_welcomed"); } catch { return true; } });
+  const dismissWelcome = () => { setWelcomed(true); try { localStorage.setItem("ac_arena_welcomed", "1"); } catch {} };
   // Synchronous in-flight guards for the series-mutating POSTs. React commits
   // `loading` asynchronously, so the disabled button / `loading` checks don't stop
   // a timer-driven call and a click from both firing first. A ref set before the
@@ -2031,6 +2195,19 @@ export default function Arena({ agents = [] }) {
     });
   }, [series, agents]);
 
+  // P3/P6: on a player's very first match (per browser), pop the HOW-TO-WIN card so
+  // the dual win condition is understood before confusion sets in. Once only.
+  useEffect(() => {
+    if (events.length === 0 || helpAutoShownRef.current) return;
+    helpAutoShownRef.current = true;
+    try {
+      if (!localStorage.getItem("ac_arena_help_seen")) {
+        setHelpTab("win"); setHelpOpen(true);
+        localStorage.setItem("ac_arena_help_seen", "1");
+      }
+    } catch { /* localStorage unavailable — skip auto-show */ }
+  }, [events.length]);
+
   // Show a banner for a duration, then clear it
   const showBanner = useCallback((type, label, sub, floats, duration = 2000) => {
     if (bannerTimerRef.current) clearTimeout(bannerTimerRef.current);
@@ -2397,15 +2574,47 @@ export default function Arena({ agents = [] }) {
               {m.toUpperCase()}
             </button>
           ))}
+          {/* Always-available help (P5) */}
+          <button onClick={() => { setHelpTab("win"); setHelpOpen(true); }}
+            title="How the Arena works"
+            style={{
+              padding: "3px 12px", borderRadius: 4, fontSize: 8, fontWeight: 700, fontFamily: "inherit",
+              letterSpacing: 1, cursor: "pointer", border: "1px solid #3aa0ff44", background: "#3aa0ff12",
+              color: "#9fd0ff", transition: "all 0.2s ease",
+            }}>❔ HOW TO PLAY</button>
         </div>
       </div>
+
+      {helpOpen && <HelpOverlay tab={helpTab} setTab={setHelpTab} onClose={() => setHelpOpen(false)} speciesList={speciesList} />}
+
+      {/* First-visit welcome (P6): orient a brand-new player in one glance before
+          they ever touch a slider. Dismissible, once per browser. */}
+      {!inMatch && !welcomed && arenaMode === "sandbox" && (
+        <div style={{
+          width: "100%", maxWidth: 460, padding: "10px 14px", borderRadius: 10,
+          border: "1px solid #3aa0ff44", background: "linear-gradient(135deg,#0d1117,#101a2a)",
+          fontFamily: "'JetBrains Mono', monospace",
+        }}>
+          <div style={{ fontSize: 10, fontWeight: 800, color: "#9fd0ff", letterSpacing: 1, marginBottom: 5 }}>👋 WELCOME TO THE ARENA</div>
+          <div style={{ fontSize: 9, color: "#c8d0da", lineHeight: 1.6, marginBottom: 7 }}>
+            You don't move pieces — you <b>design the Pilots</b>, then watch them fight on their own.
+            <br />① Keep a preset Pilot (or tweak one) &nbsp;② hit <b style={{ color: "#2ecc71" }}>FIGHT</b> &nbsp;③ win two ways: <b style={{ color: "#e74c3c" }}>☠ wipe them out</b> or <b style={{ color: "#9fd0ff" }}>⚡ breach their gate</b>.
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={() => { setHelpTab("win"); setHelpOpen(true); }}
+              style={{ padding: "5px 14px", borderRadius: 6, border: "1px solid #3aa0ff", background: "#3aa0ff18", color: "#9fd0ff", fontWeight: 700, fontSize: 9, letterSpacing: 1, cursor: "pointer", fontFamily: "inherit" }}>SHOW ME HOW</button>
+            <button onClick={dismissWelcome}
+              style={{ padding: "5px 14px", borderRadius: 6, border: "1px solid #2ecc71", background: "rgba(46,204,113,0.1)", color: "#2ecc71", fontWeight: 700, fontSize: 9, letterSpacing: 1, cursor: "pointer", fontFamily: "inherit" }}>LET'S GO ▸</button>
+          </div>
+        </div>
+      )}
 
       {/* Main layout: panels flanking the board */}
       <div style={{ display: "flex", flexDirection: isNarrow ? "column" : "row", gap: 12, width: "100%", justifyContent: "center", alignItems: isNarrow ? "stretch" : "flex-start" }}>
         {/* Left panel: Red draft or team status */}
         <div style={{ width: isNarrow ? "100%" : 220, maxWidth: isNarrow ? 420 : "none", margin: isNarrow ? "0 auto" : 0, flexShrink: 0 }}>
           {inMatch ? (
-            <TeamPanel team="red" creatures={allCreatures.concat(allBodies.map(b => ({ ...b, alive: false })))} teamColor="#e74c3c" />
+            <TeamPanel team="red" creatures={allCreatures.concat(allBodies.map(b => ({ ...b, alive: false })))} teamColor="#e74c3c" gateUnderBreach={!!(breachData && breachData.gate === RED_GATE)} />
           ) : (
             <CreatureDraft
               team="red" color="#e74c3c" label={arenaMode === "multiplayer" ? "DEPLOY YOUR PILOTS" : "RED TEAM"}
@@ -2674,7 +2883,7 @@ export default function Arena({ agents = [] }) {
         {/* Right panel: Blue draft or team status */}
         <div style={{ width: isNarrow ? "100%" : 220, maxWidth: isNarrow ? 420 : "none", margin: isNarrow ? "0 auto" : 0, flexShrink: 0 }}>
           {inMatch ? (
-            <TeamPanel team="blue" creatures={allCreatures.concat(allBodies.map(b => ({ ...b, alive: false })))} teamColor="#3498db" />
+            <TeamPanel team="blue" creatures={allCreatures.concat(allBodies.map(b => ({ ...b, alive: false })))} teamColor="#3498db" gateUnderBreach={!!(breachData && breachData.gate === BLUE_GATE)} />
           ) : arenaMode === "multiplayer" ? (
             <div style={{ padding: 16, textAlign: "center" }}>
               <div style={{ fontSize: 10, letterSpacing: 2, fontWeight: 700, color: "#3498db", marginBottom: 12 }}>OPPONENT</div>
